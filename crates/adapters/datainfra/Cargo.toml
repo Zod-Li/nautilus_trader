@@ -1,0 +1,90 @@
+[package]
+name = "nautilus-datainfra"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "DataInfra (ClickHouse Arrow + Kafka + Calendar) adapter for the Nautilus trading engine"
+categories.workspace = true
+keywords.workspace = true
+documentation.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+name = "nautilus_datainfra"
+crate-type = ["rlib"]
+
+[features]
+default = ["high-precision"]
+extension-module = [
+  "nautilus-common/extension-module",
+  "nautilus-core/extension-module",
+  "nautilus-data/extension-module",
+  "nautilus-model/extension-module",
+  "nautilus-network/extension-module",
+  "nautilus-persistence/extension-module",
+  "nautilus-serialization/extension-module",
+  "python",
+  "pyo3/extension-module",
+]
+python = [
+  "nautilus-common/python",
+  "nautilus-core/python",
+  "nautilus-data/python",
+  "nautilus-model/python",
+  "nautilus-network/python",
+  "nautilus-persistence/python",
+  "nautilus-serialization/python",
+  "nautilus-system/python",
+  "pyo3",
+  "pyo3-stub-gen",
+]
+high-precision = [
+  "nautilus-model/high-precision",
+  "nautilus-serialization/high-precision",
+]
+
+[dependencies]
+nautilus-common = { workspace = true, features = ["live"] }
+nautilus-core = { workspace = true }
+nautilus-data = { workspace = true }
+nautilus-model = { workspace = true }
+nautilus-network = { workspace = true }
+nautilus-persistence = { workspace = true }
+nautilus-serialization = { workspace = true, features = ["arrow"] }
+nautilus-system = { workspace = true, optional = true }
+
+ahash = { workspace = true }
+anyhow = { workspace = true }
+arrow = { workspace = true }
+async-trait = { workspace = true }
+bon = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+futures-util = { workspace = true }
+http = { workspace = true }
+indexmap = { workspace = true }
+jiff = { workspace = true }
+log = { workspace = true }
+parking_lot = { workspace = true }
+parquet = { workspace = true }
+rust_decimal = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+url = { workspace = true }
+ustr = { workspace = true }
+uuid = { workspace = true }
+
+pyo3 = { workspace = true, optional = true }
+pyo3-stub-gen = { workspace = true, optional = true }
+
+[dev-dependencies]
+rstest = { workspace = true }
+rust_decimal_macros = { workspace = true }
