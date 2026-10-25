@@ -22,12 +22,21 @@ crate-type = ["rlib", "cdylib"]
 
 [features]
 default = ["adapters"]
+quant-adapters = [
+  "dep:nautilus-alpaca",
+  "dep:nautilus-datainfra",
+  "dep:nautilus-interactive-brokers",
+  "dep:nautilus-okx",
+  "dep:nautilus-sandbox",
+]
 adapters = [
+  "dep:nautilus-alpaca",
   "dep:nautilus-architect-ax",
   "dep:nautilus-binance",
   "dep:nautilus-bybit",
   "dep:nautilus-coinbase",
   "dep:nautilus-databento",
+  "dep:nautilus-datainfra",
   "dep:nautilus-deribit",
   "dep:nautilus-derive",
   "dep:nautilus-dydx",
@@ -57,6 +66,7 @@ defi = [
   "nautilus-persistence/defi",
 ]
 extension-module = [
+  "nautilus-alpaca?/extension-module",
   "nautilus-analysis/extension-module",
   "nautilus-architect-ax?/extension-module",
   "nautilus-backtest/extension-module",
@@ -71,6 +81,7 @@ extension-module = [
   "nautilus-cryptography/extension-module",
   "nautilus-data/extension-module",
   "nautilus-databento?/extension-module",
+  "nautilus-datainfra?/extension-module",
   "nautilus-deribit?/extension-module",
   "nautilus-derive?/extension-module",
   "nautilus-dydx?/extension-module",
@@ -99,11 +110,13 @@ high-precision = [
   "nautilus-model/high-precision",
   "nautilus-serialization/high-precision",
   "nautilus-testkit/high-precision",
+  "nautilus-alpaca?/high-precision",
   "nautilus-betfair?/high-precision",
   "nautilus-binance?/high-precision",
   "nautilus-coinbase?/high-precision",
   "nautilus-bybit?/high-precision",
   "nautilus-databento?/high-precision",
+  "nautilus-datainfra?/high-precision",
   "nautilus-deribit?/high-precision",
   "nautilus-derive?/high-precision",
   "nautilus-dydx?/high-precision",
@@ -156,6 +169,7 @@ nautilus-testkit = { workspace = true, default-features = false, features = [
 nautilus-trading = { workspace = true, features = ["python"] }
 
 # Adapters
+nautilus-alpaca = { workspace = true, optional = true, features = ["python"] }
 nautilus-architect-ax = { workspace = true, optional = true, features = [
   "python",
 ] }
@@ -171,6 +185,7 @@ nautilus-databento = { workspace = true, optional = true, features = [
   "python",
   "live",
 ] }
+nautilus-datainfra = { workspace = true, optional = true, features = ["python"] }
 nautilus-deribit = { workspace = true, optional = true, features = ["python"] }
 nautilus-derive = { workspace = true, optional = true, features = ["python"] }
 nautilus-dydx = { workspace = true, optional = true, features = ["python"] }

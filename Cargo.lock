@@ -5396,6 +5396,45 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "034a0ad7deebf0c2abcf2435950a6666c3c15ea9d8fad0c0f48efa8a7f843fed"
 
 [[package]]
+name = "nautilus-alpaca"
+version = "0.67.0"
+dependencies = [
+ "ahash",
+ "anyhow",
+ "async-trait",
+ "bon",
+ "bytes",
+ "futures-util",
+ "http",
+ "indexmap 2.14.2",
+ "jiff",
+ "log",
+ "nautilus-common",
+ "nautilus-core",
+ "nautilus-execution",
+ "nautilus-live",
+ "nautilus-model",
+ "nautilus-network",
+ "nautilus-system",
+ "parking_lot 0.13.0",
+ "pyo3",
+ "pyo3-stub-gen",
+ "rstest",
+ "rust_decimal",
+ "rust_decimal_macros",
+ "serde",
+ "serde_json",
+ "serde_urlencoded",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-tungstenite 0.30.0",
+ "url",
+ "ustr",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
 name = "nautilus-analysis"
 version = "0.67.0"
 dependencies = [
@@ -5979,6 +6018,46 @@ dependencies = [
  "tokio-util",
  "ustr",
  "zeroize",
+]
+
+[[package]]
+name = "nautilus-datainfra"
+version = "0.67.0"
+dependencies = [
+ "ahash",
+ "anyhow",
+ "arrow 59.3.1",
+ "async-trait",
+ "bon",
+ "bytes",
+ "futures",
+ "futures-util",
+ "http",
+ "indexmap 2.14.2",
+ "jiff",
+ "log",
+ "nautilus-common",
+ "nautilus-core",
+ "nautilus-data",
+ "nautilus-model",
+ "nautilus-network",
+ "nautilus-persistence",
+ "nautilus-serialization",
+ "nautilus-system",
+ "parking_lot 0.13.0",
+ "parquet 59.3.1",
+ "pyo3",
+ "pyo3-stub-gen",
+ "rstest",
+ "rust_decimal",
+ "rust_decimal_macros",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "url",
+ "ustr",
+ "uuid",
 ]
 
 [[package]]
@@ -6774,6 +6853,7 @@ name = "nautilus-pyo3"
 version = "0.67.0"
 dependencies = [
  "mimalloc",
+ "nautilus-alpaca",
  "nautilus-analysis",
  "nautilus-architect-ax",
  "nautilus-backtest",
@@ -6788,6 +6868,7 @@ dependencies = [
  "nautilus-cryptography",
  "nautilus-data",
  "nautilus-databento",
+ "nautilus-datainfra",
  "nautilus-deribit",
  "nautilus-derive",
  "nautilus-dydx",

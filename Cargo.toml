@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
   "crates",
+  "crates/adapters/alpaca",
   "crates/adapters/architect_ax",
   "crates/adapters/betfair",
   "crates/adapters/binance",
@@ -10,6 +11,7 @@ members = [
   "crates/adapters/coinapi",
   "crates/adapters/coinbase",
   "crates/adapters/databento",
+  "crates/adapters/datainfra",
   "crates/adapters/deribit",
   "crates/adapters/derive",
   "crates/adapters/dydx",
@@ -93,6 +95,7 @@ nautilus-trading = { path = "crates/trading", version = "0.67.0" }
 #
 # Note: default-features = false keeps high-precision selection explicit
 # -----------------------------------------------------------------------------
+nautilus-alpaca = { path = "crates/adapters/alpaca", version = "0.67.0", default-features = false }
 nautilus-architect-ax = { path = "crates/adapters/architect_ax", version = "0.67.0" }
 nautilus-betfair = { path = "crates/adapters/betfair", version = "0.67.0", default-features = false }
 nautilus-binance = { path = "crates/adapters/binance", version = "0.67.0", default-features = false }
@@ -101,6 +104,7 @@ nautilus-bybit = { path = "crates/adapters/bybit", version = "0.67.0", default-f
 nautilus-coinapi = { path = "crates/adapters/coinapi", version = "0.67.0", default-features = false }
 nautilus-coinbase = { path = "crates/adapters/coinbase", version = "0.67.0", default-features = false }
 nautilus-databento = { path = "crates/adapters/databento", version = "0.67.0", default-features = false }
+nautilus-datainfra = { path = "crates/adapters/datainfra", version = "0.67.0", default-features = false }
 nautilus-deribit = { path = "crates/adapters/deribit", version = "0.67.0", default-features = false }
 nautilus-derive = { path = "crates/adapters/derive", version = "0.67.0", default-features = false }
 nautilus-dydx = { path = "crates/adapters/dydx", version = "0.67.0", default-features = false }

@@ -208,6 +208,22 @@ fn _libnautilus(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Adapters
     ////////////////////////////////////////////////////////////////////////////////
 
+    #[cfg(any(feature = "adapters", feature = "quant-adapters"))]
+    {
+        let n = "alpaca";
+        let submodule = pyo3::wrap_pymodule!(nautilus_alpaca::python::alpaca);
+        m.add_wrapped(submodule)?;
+        sys_modules.set_item(format!("{module_name}.{n}"), m.getattr(n)?)?;
+    }
+
+    #[cfg(any(feature = "adapters", feature = "quant-adapters"))]
+    {
+        let n = "datainfra";
+        let submodule = pyo3::wrap_pymodule!(nautilus_datainfra::python::datainfra);
+        m.add_wrapped(submodule)?;
+        sys_modules.set_item(format!("{module_name}.{n}"), m.getattr(n)?)?;
+    }
+
     #[cfg(feature = "adapters")]
     {
         let n = "architect_ax";
@@ -312,7 +328,7 @@ fn _libnautilus(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         sys_modules.set_item(format!("{module_name}.{n}"), m.getattr(n)?)?;
     }
 
-    #[cfg(feature = "adapters")]
+    #[cfg(any(feature = "adapters", feature = "quant-adapters"))]
     {
         let n = "interactive_brokers";
         let submodule =
@@ -321,7 +337,7 @@ fn _libnautilus(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         sys_modules.set_item(format!("{module_name}.{n}"), m.getattr(n)?)?;
     }
 
-    #[cfg(feature = "adapters")]
+    #[cfg(any(feature = "adapters", feature = "quant-adapters"))]
     {
         let n = "okx";
         let submodule = pyo3::wrap_pymodule!(nautilus_okx::python::okx);
@@ -337,7 +353,7 @@ fn _libnautilus(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         sys_modules.set_item(format!("{module_name}.{n}"), m.getattr(n)?)?;
     }
 
-    #[cfg(feature = "adapters")]
+    #[cfg(any(feature = "adapters", feature = "quant-adapters"))]
     {
         let n = "sandbox";
         let submodule = pyo3::wrap_pymodule!(nautilus_sandbox::python::sandbox);
