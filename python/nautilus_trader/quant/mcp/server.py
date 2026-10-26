@@ -33,6 +33,7 @@ from evolution_engine.capital.sizing import (
 )
 from evolution_engine.config_center.schema import SystemConfig
 from evolution_engine.db.dsn import resolve_database_dsn
+from market_data_service.pipeline.us_equity_universe import get_gics_sector_map
 from nautilus_trader.quant.contracts.models import (
     ArchetypeStrategyConfig,
     MarketableLimitCollar,
@@ -424,7 +425,14 @@ class NautilusMcpServer:
             params = dict(raw_item["params"])
             raw_env = dict(raw_item["risk_envelope"])
             conviction = float(raw_item.get("conviction", 0.85))
-            sector = str(raw_item.get("sector", "TECHNOLOGY")).strip().upper()
+            raw_sector = str(raw_item.get("sector") or "").strip().upper()
+            if not raw_sector:
+                raw_sector = get_gics_sector_map([sym], dsn=self._dsn).get(sym, "UNCLASSIFIED")
+            if not raw_sector or raw_sector in ("UNCLASSIFIED", "UNKNOWN"):
+                raise McpPlanLockRejectedError(
+                    f"Cannot lock plan for {sym} with unverified or missing GICS sector: {raw_sector!r}"
+                )
+            sector = raw_sector
 
             strat_cfg = self._build_strategy_config(sym, arch_id, params)
             req_env = self._build_risk_envelope(sym, raw_env)
@@ -737,49 +745,98 @@ class NautilusMcpServer:
             secondary_instrument_id=(str(sec_id).strip() if sec_id is not None else None),
         )
 
-    @staticmethod
     def _build_risk_envelope(
+        self,
         symbol: str,
         raw_envelope: Optional[Dict[str, Any]],
         bars: Optional[Sequence[Bar]] = None,
     ) -> PlanRiskEnvelope:
-        default_valid_until = datetime.now(timezone.utc) + timedelta(days=30)
+        risk_cfg = self._system_config.risk
+        exec_cfg = self._system_config.execution
+        default_collar_pct = Decimal(str(exec_cfg.limit_collar_pct))
+        default_collar_atr = Decimal(str(exec_cfg.limit_collar_atr))
+        risk_per_trade_frac = Decimal(str(risk_cfg.risk_per_trade_pct)) / Decimal("100")
+        max_single_name_frac = Decimal(str(risk_cfg.max_single_name_pct)) / Decimal("100")
+        default_valid_until = datetime.now(timezone.utc) + timedelta(
+            days=max(1, int(exec_cfg.entry_ttl_bars))
+        )
+
+        # Compute empirical price & ATR distribution from bars when available
+        bar_closes: List[float] = []
+        bar_highs: List[float] = []
+        bar_lows: List[float] = []
+        if bars:
+            for b in bars:
+                if str(b.bar_type.instrument_id).startswith(symbol):
+                    bar_closes.append(float(b.close))
+                    bar_highs.append(float(b.high))
+                    bar_lows.append(float(b.low))
+
+        emp_last_px = bar_closes[-1] if bar_closes else 0.0
+        emp_atr = (
+            rolling_atr(bar_highs, bar_lows, bar_closes, min(14, len(bar_closes)))
+            if len(bar_closes) >= 2
+            else 0.0
+        )
+
         if raw_envelope is not None:
             side = PlanSide(str(raw_envelope.get("side", "long")).strip().lower())
-            target_qty = Decimal(str(raw_envelope.get("target_qty", "50")))
+            raw_target_qty = raw_envelope.get("target_qty")
+            if raw_target_qty is None:
+                raise ValueError(f"risk_envelope for {symbol} missing required 'target_qty'")
+            target_qty = Decimal(str(raw_target_qty))
             approved_qty_cap = Decimal(
                 str(raw_envelope.get("approved_qty_cap", target_qty))
             )
-            target_notional = Decimal(
-                str(
-                    raw_envelope.get(
-                        "target_notional_usd",
-                        raw_envelope.get("max_notional_usd", "10000.00"),
+            raw_notional = raw_envelope.get(
+                "target_notional_usd",
+                raw_envelope.get("max_notional_usd"),
+            )
+            if raw_notional is None:
+                if emp_last_px <= 0.0:
+                    raise ValueError(
+                        f"risk_envelope for {symbol} missing 'target_notional_usd' and no bars available"
                     )
-                )
+                target_notional = Decimal(f"{float(target_qty) * emp_last_px:.2f}")
+            else:
+                target_notional = Decimal(str(raw_notional))
+
+            raw_risk_budget = raw_envelope.get("max_risk_budget_usd")
+            if raw_risk_budget is None:
+                max_risk_budget = (
+                    self._capital_basis_usd * risk_per_trade_frac
+                ).quantize(Decimal("0.01"))
+            else:
+                max_risk_budget = Decimal(str(raw_risk_budget))
+
+            raw_stop = raw_envelope.get(
+                "initial_stop_price",
+                raw_envelope.get("stop_loss_price"),
             )
-            max_risk_budget = Decimal(
-                str(raw_envelope.get("max_risk_budget_usd", "1000.00"))
-            )
-            initial_stop = Decimal(
-                str(
-                    raw_envelope.get(
-                        "initial_stop_price",
-                        raw_envelope.get("stop_loss_price", "90.00"),
+            if raw_stop is None:
+                if emp_last_px <= 0.0 or emp_atr <= 0.0:
+                    raise ValueError(
+                        f"risk_envelope for {symbol} missing 'initial_stop_price' and no empirical ATR available"
                     )
+                initial_stop = Decimal(
+                    f"{max(0.01, emp_last_px - emp_atr if side == PlanSide.LONG else emp_last_px + emp_atr):.2f}"
                 )
-            )
+            else:
+                initial_stop = Decimal(str(raw_stop))
+
             tp_raw = raw_envelope.get("take_profit_price")
             take_profit = Decimal(str(tp_raw)) if tp_raw is not None else None
-            collar_raw = raw_envelope.get("collar") or {
-                "limit_collar_pct": "0.50",
-                "limit_collar_atr": "0.25",
-            }
-            collar = (
-                collar_raw
-                if isinstance(collar_raw, MarketableLimitCollar)
-                else MarketableLimitCollar.from_dict(collar_raw)
-            )
+            collar_raw = raw_envelope.get("collar")
+            if collar_raw is None:
+                collar = MarketableLimitCollar(
+                    limit_collar_pct=default_collar_pct,
+                    limit_collar_atr=default_collar_atr,
+                )
+            elif isinstance(collar_raw, MarketableLimitCollar):
+                collar = collar_raw
+            else:
+                collar = MarketableLimitCollar.from_dict(collar_raw)
+
             vu_raw = raw_envelope.get("valid_until")
             if isinstance(vu_raw, datetime):
                 valid_until = vu_raw if vu_raw.tzinfo else vu_raw.replace(tzinfo=timezone.utc)
@@ -803,30 +860,32 @@ class NautilusMcpServer:
                 valid_until=valid_until,
             )
 
-        last_px = 100.0
-        if bars:
-            closes = [
-                float(b.close)
-                for b in bars
-                if str(b.bar_type.instrument_id).startswith(symbol)
-            ]
-            if closes:
-                last_px = closes[-1]
+        if emp_last_px <= 0.0:
+            raise ValueError(
+                f"Cannot derive empirical PlanRiskEnvelope for {symbol} without raw_envelope or historical bars"
+            )
 
-        stop_px = max(0.01, last_px * 0.90)
-        tp_px = last_px * 1.15
-        notional = max(1000.0, min(15000.0, 50.0 * last_px))
+        stop_dist = max(emp_atr, emp_last_px * float(risk_per_trade_frac))
+        stop_px = max(0.01, emp_last_px - stop_dist)
+        tp_px = emp_last_px + stop_dist
+        max_risk_usd = float(self._capital_basis_usd * risk_per_trade_frac)
+        max_pos_usd = float(self._capital_basis_usd * max_single_name_frac)
+        derived_qty = max(
+            1,
+            int(min(max_risk_usd / max(stop_dist, 1e-6), max_pos_usd / emp_last_px)),
+        )
+        notional = float(derived_qty) * emp_last_px
         return PlanRiskEnvelope(
             side=PlanSide.LONG,
-            target_qty=Decimal("50"),
-            approved_qty_cap=Decimal("50"),
+            target_qty=Decimal(str(derived_qty)),
+            approved_qty_cap=Decimal(str(derived_qty)),
             target_notional_usd=Decimal(f"{notional:.2f}"),
-            max_risk_budget_usd=Decimal("1000.00"),
+            max_risk_budget_usd=Decimal(f"{max_risk_usd:.2f}"),
             initial_stop_price=Decimal(f"{stop_px:.2f}"),
             take_profit_price=Decimal(f"{tp_px:.2f}"),
             collar=MarketableLimitCollar(
-                limit_collar_pct=Decimal("0.50"),
-                limit_collar_atr=Decimal("0.25"),
+                limit_collar_pct=default_collar_pct,
+                limit_collar_atr=default_collar_atr,
             ),
             valid_until=default_valid_until,
         )
@@ -864,8 +923,9 @@ class NautilusMcpServer:
         req_env: PlanRiskEnvelope,
         raw_env: Dict[str, Any],
     ) -> float:
-        if "entry_price" in raw_env and raw_env["entry_price"] is not None:
-            return float(raw_env["entry_price"])
+        for key in ("entry_price", "reference_price"):
+            if key in raw_env and raw_env[key] is not None:
+                return float(raw_env[key])
         if (
             "entry_price_band_low" in raw_env
             and "entry_price_band_high" in raw_env
@@ -880,8 +940,12 @@ class NautilusMcpServer:
             implied = float(req_env.target_notional_usd / req_env.target_qty)
             if implied > 0.0:
                 return implied
-        return float(req_env.initial_stop_price) * (
-            1.05 if req_env.side == PlanSide.LONG else 0.95
+        if req_env.take_profit_price is not None and req_env.take_profit_price > Decimal("0"):
+            return 0.5 * (
+                float(req_env.initial_stop_price) + float(req_env.take_profit_price)
+            )
+        raise McpPlanLockRejectedError(
+            f"Cannot resolve entry reference price for {symbol}: missing reference_price and target_notional_usd"
         )
 
     def _load_bars_for_symbol(

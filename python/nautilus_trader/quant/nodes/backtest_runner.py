@@ -651,6 +651,8 @@ class IsomorphicBacktestRunner:
                 walk_forward=walk_forward,
             )
         finally:
+            if plan_gate is not None:
+                plan_gate.close()
             engine.dispose()
             if cleanup_plan_id is not None and repo is not None:
                 self._cleanup_ephemeral_plan(repo.dsn, cleanup_plan_id)
@@ -1010,7 +1012,7 @@ class IsomorphicBacktestRunner:
             conn.close()
 
     @staticmethod
-    def _cleanup_ephemeral_date_plans(dsn: str, trading_date: date) -> None:
+    def _delete_ephemeral_plans_where(dsn: str, plan_subquery: str, params: Tuple[Any, ...]) -> None:
         conn = psycopg2.connect(dsn)
         try:
             with conn:
@@ -1020,55 +1022,36 @@ class IsomorphicBacktestRunner:
                     cur.execute("ALTER TABLE trading_plan_items DISABLE TRIGGER USER")
                     try:
                         cur.execute(
-                            """
+                            f"""
                             DELETE FROM protective_orders
                             WHERE item_id IN (
-                                SELECT i.item_id
-                                FROM trading_plan_items i
-                                JOIN trading_plans p ON p.plan_id = i.plan_id
-                                WHERE p.trading_date = %s AND p.market = 'US_EQUITY'
+                                SELECT item_id FROM trading_plan_items
+                                WHERE plan_id IN ({plan_subquery})
                             )
                             """,
-                            (trading_date,),
+                            params,
                         )
                         cur.execute(
-                            """
+                            f"""
                             DELETE FROM trading_plan_tranches
                             WHERE item_id IN (
-                                SELECT i.item_id
-                                FROM trading_plan_items i
-                                JOIN trading_plans p ON p.plan_id = i.plan_id
-                                WHERE p.trading_date = %s AND p.market = 'US_EQUITY'
+                                SELECT item_id FROM trading_plan_items
+                                WHERE plan_id IN ({plan_subquery})
                             )
                             """,
-                            (trading_date,),
+                            params,
                         )
                         cur.execute(
-                            """
-                            DELETE FROM trading_plan_events
-                            WHERE plan_id IN (
-                                SELECT plan_id FROM trading_plans
-                                WHERE trading_date = %s AND market = 'US_EQUITY'
-                            )
-                            """,
-                            (trading_date,),
+                            f"DELETE FROM trading_plan_events WHERE plan_id IN ({plan_subquery})",
+                            params,
                         )
                         cur.execute(
-                            """
-                            DELETE FROM trading_plan_items
-                            WHERE plan_id IN (
-                                SELECT plan_id FROM trading_plans
-                                WHERE trading_date = %s AND market = 'US_EQUITY'
-                            )
-                            """,
-                            (trading_date,),
+                            f"DELETE FROM trading_plan_items WHERE plan_id IN ({plan_subquery})",
+                            params,
                         )
                         cur.execute(
-                            """
-                            DELETE FROM trading_plans
-                            WHERE trading_date = %s AND market = 'US_EQUITY'
-                            """,
-                            (trading_date,),
+                            f"DELETE FROM trading_plans WHERE plan_id IN ({plan_subquery})",
+                            params,
                         )
                     finally:
                         cur.execute("ALTER TABLE trading_plan_items ENABLE TRIGGER USER")
@@ -1080,53 +1063,20 @@ class IsomorphicBacktestRunner:
             conn.close()
 
     @staticmethod
+    def _cleanup_ephemeral_date_plans(dsn: str, trading_date: date) -> None:
+        IsomorphicBacktestRunner._delete_ephemeral_plans_where(
+            dsn,
+            "SELECT plan_id FROM trading_plans WHERE trading_date = %s AND market = 'US_EQUITY'",
+            (trading_date,),
+        )
+
+    @staticmethod
     def _cleanup_ephemeral_plan(dsn: str, plan_id: UUID) -> None:
-        conn = psycopg2.connect(dsn)
-        try:
-            with conn:
-                with conn.cursor() as cur:
-                    cur.execute("ALTER TABLE trading_plan_events DISABLE TRIGGER USER")
-                    cur.execute("ALTER TABLE trading_plans DISABLE TRIGGER USER")
-                    cur.execute("ALTER TABLE trading_plan_items DISABLE TRIGGER USER")
-                    try:
-                        cur.execute(
-                            """
-                            DELETE FROM protective_orders
-                            WHERE item_id IN (
-                                SELECT item_id FROM trading_plan_items WHERE plan_id = %s
-                            )
-                            """,
-                            (plan_id,),
-                        )
-                        cur.execute(
-                            """
-                            DELETE FROM trading_plan_tranches
-                            WHERE item_id IN (
-                                SELECT item_id FROM trading_plan_items WHERE plan_id = %s
-                            )
-                            """,
-                            (plan_id,),
-                        )
-                        cur.execute(
-                            "DELETE FROM trading_plan_events WHERE plan_id = %s",
-                            (plan_id,),
-                        )
-                        cur.execute(
-                            "DELETE FROM trading_plan_items WHERE plan_id = %s",
-                            (plan_id,),
-                        )
-                        cur.execute(
-                            "DELETE FROM trading_plans WHERE plan_id = %s",
-                            (plan_id,),
-                        )
-                    finally:
-                        cur.execute("ALTER TABLE trading_plan_items ENABLE TRIGGER USER")
-                        cur.execute("ALTER TABLE trading_plans ENABLE TRIGGER USER")
-                        cur.execute("ALTER TABLE trading_plan_events ENABLE TRIGGER USER")
-        except Exception:
-            pass
-        finally:
-            conn.close()
+        IsomorphicBacktestRunner._delete_ephemeral_plans_where(
+            dsn,
+            "SELECT %s::uuid",
+            (str(plan_id),),
+        )
 
 
 @dataclass(frozen=True)

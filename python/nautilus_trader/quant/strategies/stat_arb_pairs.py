@@ -17,6 +17,7 @@ from nautilus_trader.quant.strategies.base import (
     BaseArchetypeStrategyConfig,
 )
 from nautilus_trader.quant.strategies.empirical import (
+    empirical_quantile_value,
     empirical_rank_quantile,
     quantile_to_float,
     rolling_atr,
@@ -303,7 +304,18 @@ class StatArbPairsStrategy(BaseArchetypeStrategy):
         ):
             return
 
-        clamped_beta = max(0.1, min(5.0, abs(beta)))
+        abs_beta_window = [
+            abs(b)
+            for b in self._hedge_betas[-min(len(self._hedge_betas), cfg.lookback_window) :]
+            if abs(b) > 0.0
+        ]
+        px_ratio = prim_px / max(sec_px, 1e-6)
+        if len(abs_beta_window) >= 2:
+            lower_beta = empirical_quantile_value(abs_beta_window, max(0.0, 1.0 - entry_q))
+            upper_beta = empirical_quantile_value(abs_beta_window, min(1.0, entry_q))
+            clamped_beta = max(lower_beta, min(upper_beta, abs(beta)))
+        else:
+            clamped_beta = abs(beta) if abs(beta) > 0.0 else px_ratio
         hedge_qty = max(
             Decimal("1"),
             (cfg.trade_qty * Decimal(f"{clamped_beta:.4f}")).to_integral_value(),

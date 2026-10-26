@@ -25,7 +25,10 @@ use nautilus_core::{UUID4, UnixNanos};
 use nautilus_model::{
     enums::{AccountType, OrderSide, OrderType, PositionSide, TimeInForce, TriggerType},
     events::AccountState,
-    identifiers::{AccountId, ClientOrderId, InstrumentId, OrderListId, PositionId, Symbol, Venue, VenueOrderId},
+    identifiers::{
+        AccountId, ClientOrderId, InstrumentId, OrderListId, PositionId, Symbol, TradeId, Venue,
+        VenueOrderId,
+    },
     instruments::{Equity, InstrumentAny},
     reports::{OrderStatusReport, PositionStatusReport},
     types::{AccountBalance, Currency, Money, Price, Quantity},
@@ -113,6 +116,34 @@ pub fn parse_instrument_id(symbol: &str, venue_str: &str) -> AlpacaResult<Instru
     let ven = Venue::new_checked(venue_str.trim())
         .map_err(|e| AlpacaError::Parse(format!("invalid venue '{venue_str}': {e}")))?;
     Ok(InstrumentId::new(sym, ven))
+}
+
+/// Formats a venue trade or order identifier into a valid [`TradeId`] (`<= 36` ASCII characters).
+///
+/// Preserves `{prefix}{raw_id}` verbatim when `<= 36` characters (e.g. `"FILL-VEN-REC-BRK"`),
+/// and compacts hyphenated 36-char UUIDs (`"F-{32_hex_chars}"`, 34 chars) when the prefixed
+/// form would exceed [`TradeId`]'s 36-byte capacity.
+///
+/// # Errors
+///
+/// Returns [`AlpacaError::Parse`] if the resulting identifier is empty or contains non-ASCII characters.
+pub fn parse_alpaca_trade_id(prefix: &str, raw_id: &str) -> AlpacaResult<TradeId> {
+    let trimmed = raw_id.trim();
+    let candidate = format!("{prefix}{trimmed}");
+    let bounded = if candidate.len() <= 36 {
+        candidate
+    } else {
+        let compact_id: String = trimmed.chars().filter(|c| *c != '-').collect();
+        let short_prefix = if prefix.is_empty() { "" } else { "F-" };
+        let compact_candidate = format!("{short_prefix}{compact_id}");
+        if compact_candidate.len() <= 36 {
+            compact_candidate
+        } else {
+            compact_candidate[..36].to_string()
+        }
+    };
+    TradeId::new_checked(&bounded)
+        .map_err(|e| AlpacaError::Parse(format!("invalid TradeId '{bounded}': {e}")))
 }
 
 /// Converts an [`AlpacaAccountResponse`] into a Nautilus [`AccountState`].

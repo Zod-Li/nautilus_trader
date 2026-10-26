@@ -186,7 +186,7 @@ impl AlpacaWsClient {
 
         let ws_config = WebSocketConfig {
             url: self.config.ws_url.clone(),
-            headers: self.config.credential.to_http_headers().into_iter().collect(),
+            headers: Vec::new(),
             heartbeat_interval_secs: Some(30),
             heartbeat_payload: None,
             connect_timeout_ms: Some(self.config.timeout_secs.saturating_mul(1_000)),

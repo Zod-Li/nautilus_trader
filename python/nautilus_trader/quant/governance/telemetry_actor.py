@@ -60,6 +60,21 @@ class _AsyncTelemetryDbWorker:
         self._queue.put((lambda _cur: None, done))
         done.wait(timeout=max(0.05, float(timeout_secs)))
 
+    def close(self) -> None:
+        self._queue.put(None)
+        if self._thread.is_alive() and threading.current_thread() is not self._thread:
+            self._thread.join(timeout=2.0)
+        self._close_conn()
+
+    def _close_conn(self) -> None:
+        conn = self._conn
+        self._conn = None
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
     def _ensure_conn(self) -> Any:
         if self._conn is None or getattr(self._conn, "closed", 1) != 0:
             self._conn = psycopg2.connect(
@@ -70,47 +85,55 @@ class _AsyncTelemetryDbWorker:
         return self._conn
 
     def _run_loop(self) -> None:
-        while True:
-            item = self._queue.get()
-            if item is None:
-                break
-            batch = [item]
+        try:
             while True:
                 try:
-                    nxt = self._queue.get_nowait()
-                    if nxt is None:
-                        break
-                    batch.append(nxt)
+                    item = self._queue.get(timeout=0.5)
                 except queue.Empty:
-                    break
-
-            try:
-                conn = self._ensure_conn()
-                with conn:
-                    with conn.cursor() as cur:
-                        for fn, _ in batch:
-                            fn(cur)
-            except Exception as exc:
-                logger.error("Telemetry async write-behind batch failed: %s", exc)
-                if self._on_db_error_callback is not None:
-                    try:
-                        self._on_db_error_callback(
-                            "POSTGRES_TELEMETRY",
-                            f"TELEMETRY_DB_WRITE_FAILED: {exc}",
-                        )
-                    except Exception:
-                        pass
-                try:
-                    if self._conn is not None:
-                        self._conn.close()
-                except Exception:
-                    pass
-                self._conn = None
-            finally:
-                for _, done_ev in batch:
-                    if done_ev is not None:
-                        done_ev.set()
+                    self._close_conn()
+                    continue
+                if item is None:
                     self._queue.task_done()
+                    break
+                batch = [item]
+                should_exit = False
+                while True:
+                    try:
+                        nxt = self._queue.get_nowait()
+                        if nxt is None:
+                            self._queue.task_done()
+                            should_exit = True
+                            break
+                        batch.append(nxt)
+                    except queue.Empty:
+                        break
+
+                try:
+                    conn = self._ensure_conn()
+                    with conn:
+                        with conn.cursor() as cur:
+                            for fn, _ in batch:
+                                fn(cur)
+                except Exception as exc:
+                    logger.error("Telemetry async write-behind batch failed: %s", exc)
+                    if self._on_db_error_callback is not None:
+                        try:
+                            self._on_db_error_callback(
+                                "POSTGRES_TELEMETRY",
+                                f"TELEMETRY_DB_WRITE_FAILED: {exc}",
+                            )
+                        except Exception as cb_exc:
+                            logger.error("Telemetry DB error callback failed: %s", cb_exc)
+                    self._close_conn()
+                finally:
+                    for _, done_ev in batch:
+                        if done_ev is not None:
+                            done_ev.set()
+                        self._queue.task_done()
+                if should_exit:
+                    break
+        finally:
+            self._close_conn()
 from nautilus_trader.common import DataActor, DataActorConfig
 from nautilus_trader.model import (
     ActorId,
@@ -257,6 +280,18 @@ class ProtectiveOcoMonitor:
     @property
     def broker(self) -> str:
         return self._broker
+
+    def close(self) -> None:
+        try:
+            self._async_writer.close()
+        except Exception:
+            pass
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def get_position_qty(self, symbol: str) -> Decimal:
         norm = _normalize_symbol(symbol)
@@ -699,7 +734,7 @@ class PostgresTelemetryActorConfig(DataActorConfig):
         market: str = "US_EQUITY",
         trading_date: Optional[date] = None,
         connect_timeout_secs: int = 3,
-        enforce_protective_oco_on_position_events: bool = False,
+        enforce_protective_oco_on_position_events: bool = True,
         log_events: bool = True,
         log_commands: bool = True,
     ):
@@ -724,7 +759,7 @@ class PostgresTelemetryActorConfig(DataActorConfig):
         market: str = "US_EQUITY",
         trading_date: Optional[date] = None,
         connect_timeout_secs: int = 3,
-        enforce_protective_oco_on_position_events: bool = False,
+        enforce_protective_oco_on_position_events: bool = True,
         log_events: bool = True,
         log_commands: bool = True,
     ) -> None:
@@ -845,6 +880,18 @@ class PostgresTelemetryActor(DataActor):
     def on_stop(self) -> None:
         self.sync_from_cache()
 
+    def close(self) -> None:
+        try:
+            self._oco_monitor.close()
+        except Exception:
+            pass
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
     def on_bar(self, bar: Any) -> None:
         self.sync_from_cache()
 
@@ -900,6 +947,15 @@ class PostgresTelemetryActor(DataActor):
         )
         is_reduce_only = bool(getattr(order, "is_reduce_only", False))
         parent_order_id = str(getattr(order, "parent_order_id", "") or "")
+        exec_params = getattr(order, "exec_algorithm_params", None) or {}
+        stop_loss_raw = (
+            exec_params.get("stop_loss_price")
+            if isinstance(exec_params, dict)
+            else None
+        )
+        stop_loss_px = (
+            _to_decimal(stop_loss_raw, "0") if stop_loss_raw is not None else None
+        )
         meta = {
             "client_order_id": cid,
             "venue_order_id": str(getattr(order, "venue_order_id", "") or ""),
@@ -911,6 +967,7 @@ class PostgresTelemetryActor(DataActor):
             "quantity": qty,
             "limit_price": limit_px,
             "trigger_price": trigger_px,
+            "stop_loss_price": stop_loss_px,
             "is_reduce_only": is_reduce_only,
             "parent_order_id": parent_order_id,
         }
@@ -988,6 +1045,17 @@ class PostgresTelemetryActor(DataActor):
             or cached_meta.get("parent_order_id")
             or ""
         )
+        ev_exec_params = getattr(event, "exec_algorithm_params", None) or {}
+        ev_stop_raw = (
+            ev_exec_params.get("stop_loss_price")
+            if isinstance(ev_exec_params, dict)
+            else None
+        )
+        stop_loss_px = (
+            _to_decimal(ev_stop_raw, "0")
+            if ev_stop_raw is not None
+            else cached_meta.get("stop_loss_price")
+        )
         merged = {
             "client_order_id": cid,
             "venue_order_id": vid,
@@ -999,6 +1067,7 @@ class PostgresTelemetryActor(DataActor):
             "quantity": qty,
             "limit_price": limit_px,
             "trigger_price": trigger_px,
+            "stop_loss_price": stop_loss_px,
             "is_reduce_only": is_reduce_only,
             "parent_order_id": parent_order_id,
         }
@@ -1084,6 +1153,18 @@ class PostgresTelemetryActor(DataActor):
                 symbol=meta["symbol"],
                 covered_qty=meta["quantity"],
                 stop_price=stop_px,
+                broker_order_id=meta["venue_order_id"] or meta["client_order_id"],
+                status="ACTIVE",
+            )
+        elif (
+            not meta.get("is_reduce_only", False)
+            and meta.get("stop_loss_price") is not None
+            and _to_decimal(meta.get("stop_loss_price"), "0") > Decimal("0")
+        ):
+            self._oco_monitor.register_protective_order(
+                symbol=meta["symbol"],
+                covered_qty=meta["quantity"],
+                stop_price=meta["stop_loss_price"],
                 broker_order_id=meta["venue_order_id"] or meta["client_order_id"],
                 status="ACTIVE",
             )
@@ -1262,6 +1343,18 @@ class PostgresTelemetryActor(DataActor):
 
         self._async_writer.submit(_task)
         self._processed_event_ids.add(event_id)
+        if (
+            not meta.get("is_reduce_only", False)
+            and meta.get("stop_loss_price") is not None
+            and _to_decimal(meta.get("stop_loss_price"), "0") > Decimal("0")
+        ):
+            self._oco_monitor.register_protective_order(
+                symbol=meta["symbol"],
+                covered_qty=max(meta["quantity"], cum_qty),
+                stop_price=meta["stop_loss_price"],
+                broker_order_id=vid or cid,
+                status="ACTIVE",
+            )
 
     def on_position_opened(self, event: PositionOpened) -> None:
         self._handle_position_lifecycle_event(event, "POSITION_OPENED", is_closed=False)
@@ -1274,30 +1367,20 @@ class PostgresTelemetryActor(DataActor):
     def on_position_closed(self, event: PositionClosed) -> None:
         self._handle_position_lifecycle_event(event, "POSITION_CLOSED", is_closed=True)
 
-    def _handle_position_lifecycle_event(
+    def _submit_position_upsert_task(
         self,
-        event: Any,
+        *,
+        symbol: str,
+        strategy_id: str,
+        pos_id: str,
+        side: str,
+        qty: Decimal,
+        avg_px_open: Decimal,
+        realized_pnl: Decimal,
+        ts_bar: int,
         plan_event_type: str,
-        is_closed: bool,
+        event_id: str,
     ) -> None:
-        inst_id = str(getattr(event, "instrument_id", "") or "")
-        symbol = _normalize_symbol(inst_id or getattr(event, "symbol", ""))
-        strategy_id = str(getattr(event, "strategy_id", "") or "")
-        pos_id = str(getattr(event, "position_id", "") or "")
-        event_id = str(
-            getattr(event, "event_id", "") or f"{plan_event_type}:{pos_id}:{symbol}"
-        )
-        side_raw = str(getattr(event, "entry", None) or getattr(event, "side", "LONG"))
-        side = "short" if ("SHORT" in side_raw.upper() or "SELL" in side_raw.upper()) else "long"
-        qty = (
-            Decimal("0")
-            if is_closed
-            else abs(_to_decimal(getattr(event, "quantity", None), "0"))
-        )
-        avg_px_open = _to_decimal(getattr(event, "avg_px_open", None), "0")
-        realized_pnl = _to_decimal(getattr(event, "realized_pnl", None), "0")
-        ts_event = int(getattr(event, "ts_event", 0) or 0)
-
         def _task(cur: Any) -> None:
             cost_basis = float(qty * avg_px_open)
             cur.execute(
@@ -1336,7 +1419,7 @@ class PostgresTelemetryActor(DataActor):
                     float(avg_px_open),
                     cost_basis,
                     float(realized_pnl),
-                    ts_event,
+                    ts_bar,
                 ),
             )
             self._insert_plan_event_in_tx(
@@ -1359,6 +1442,43 @@ class PostgresTelemetryActor(DataActor):
 
         self._async_writer.submit(_task)
         self._processed_event_ids.add(event_id)
+
+    def _handle_position_lifecycle_event(
+        self,
+        event: Any,
+        plan_event_type: str,
+        is_closed: bool,
+    ) -> None:
+        inst_id = str(getattr(event, "instrument_id", "") or "")
+        symbol = _normalize_symbol(inst_id or getattr(event, "symbol", ""))
+        strategy_id = str(getattr(event, "strategy_id", "") or "")
+        pos_id = str(getattr(event, "position_id", "") or "")
+        event_id = str(
+            getattr(event, "event_id", "") or f"{plan_event_type}:{pos_id}:{symbol}"
+        )
+        side_raw = str(getattr(event, "entry", None) or getattr(event, "side", "LONG"))
+        side = "short" if ("SHORT" in side_raw.upper() or "SELL" in side_raw.upper()) else "long"
+        qty = (
+            Decimal("0")
+            if is_closed
+            else abs(_to_decimal(getattr(event, "quantity", None), "0"))
+        )
+        avg_px_open = _to_decimal(getattr(event, "avg_px_open", None), "0")
+        realized_pnl = _to_decimal(getattr(event, "realized_pnl", None), "0")
+        ts_event = int(getattr(event, "ts_event", 0) or 0)
+
+        self._submit_position_upsert_task(
+            symbol=symbol,
+            strategy_id=strategy_id,
+            pos_id=pos_id,
+            side=side,
+            qty=qty,
+            avg_px_open=avg_px_open,
+            realized_pnl=realized_pnl,
+            ts_bar=ts_event,
+            plan_event_type=plan_event_type,
+            event_id=event_id,
+        )
         if is_closed:
             self._oco_monitor.verify_position_coverage(symbol=symbol, pos_qty=Decimal("0"))
         elif self._enforce_oco_on_pos or self._oco_monitor.get_coverage(symbol) is not None:
@@ -1397,67 +1517,18 @@ class PostgresTelemetryActor(DataActor):
         side_raw = str(getattr(pos, "side", "LONG"))
         side = "short" if "SHORT" in side_raw.upper() else "long"
 
-        def _task(cur: Any) -> None:
-            cost_basis = float(qty * avg_px_open)
-            cur.execute(
-                """
-                INSERT INTO trading_positions (
-                    broker, environment, symbol, strategy_id, side,
-                    qty, avg_entry_price, cost_basis, current_price,
-                    market_value, realized_pl, last_bar_ts, updated_at
-                ) VALUES (
-                    %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s,
-                    %s, %s, %s, NOW()
-                )
-                ON CONFLICT (broker, symbol) DO UPDATE SET
-                    environment = EXCLUDED.environment,
-                    strategy_id = EXCLUDED.strategy_id,
-                    side = EXCLUDED.side,
-                    qty = EXCLUDED.qty,
-                    avg_entry_price = EXCLUDED.avg_entry_price,
-                    cost_basis = EXCLUDED.cost_basis,
-                    current_price = EXCLUDED.current_price,
-                    market_value = EXCLUDED.market_value,
-                    realized_pl = EXCLUDED.realized_pl,
-                    last_bar_ts = EXCLUDED.last_bar_ts,
-                    updated_at = NOW()
-                """,
-                (
-                    self._broker,
-                    self._environment,
-                    symbol,
-                    strategy_id,
-                    side,
-                    float(qty),
-                    float(avg_px_open),
-                    cost_basis,
-                    float(avg_px_open),
-                    cost_basis,
-                    float(realized_pnl),
-                    ts_last,
-                ),
-            )
-            self._insert_plan_event_in_tx(
-                cur=cur,
-                symbol=symbol,
-                event_type=plan_event_type,
-                actor=f"nautilus:telemetry:{strategy_id or 'actor'}",
-                reason=f"{plan_event_type} for {symbol} qty={qty} avg_px={avg_px_open}",
-                event_id=synth_event_id,
-                payload={
-                    "event_id": synth_event_id,
-                    "position_id": pos_id,
-                    "symbol": symbol,
-                    "side": side,
-                    "qty": str(qty),
-                    "avg_px_open": str(avg_px_open),
-                    "realized_pnl": str(realized_pnl),
-                },
-            )
-
-        self._async_writer.submit(_task)
-        self._processed_event_ids.add(synth_event_id)
+        self._submit_position_upsert_task(
+            symbol=symbol,
+            strategy_id=strategy_id,
+            pos_id=pos_id,
+            side=side,
+            qty=qty,
+            avg_px_open=avg_px_open,
+            realized_pnl=realized_pnl,
+            ts_bar=ts_last,
+            plan_event_type=plan_event_type,
+            event_id=synth_event_id,
+        )
 
     def _upsert_order_and_plan_event(
         self,

@@ -200,7 +200,8 @@ class NautilusLiveNodeAssembler:
         plan_items: Optional[Sequence[PlanItemContract]] = None,
         listen_timeout_secs: float = 0.0,
         use_limit_orders: bool = False,
-        submit_protective_stop: bool = False,
+        submit_protective_stop: bool = True,
+        enforce_protective_oco_on_position_events: bool = True,
     ) -> AssembledLiveNodeBundle:
         """Constructs a `LiveNode` wired with `DataInfra`, `Alpaca`, `PlanGate`, `TelemetryActor`, and `Strategy`s."""
         locked_items = (
@@ -219,11 +220,11 @@ class NautilusLiveNodeAssembler:
             TraderId(self._trader_id),
             self._environment,
         )
-        builder.with_reconciliation(self._reconciliation_enabled)
-        builder.with_reconciliation_lookback_mins(self._reconciliation_lookback_mins)
         builder.with_data_engine_config(LiveDataEngineConfig())
         builder.with_exec_engine_config(LiveExecutionEngineConfig())
         builder.with_risk_engine_config(LiveRiskEngineConfig())
+        builder.with_reconciliation(self._reconciliation_enabled)
+        builder.with_reconciliation_lookback_mins(self._reconciliation_lookback_mins)
         if self._cache_config is not None:
             builder.with_cache_config(self._cache_config)
 
@@ -281,7 +282,9 @@ class NautilusLiveNodeAssembler:
                 market=self._market,
                 trading_date=trading_date,
                 environment=env_label,
-                enforce_protective_oco_on_position_events=bool(submit_protective_stop),
+                enforce_protective_oco_on_position_events=bool(
+                    enforce_protective_oco_on_position_events
+                ),
             ),
             oco_monitor=oco_monitor,
         )
@@ -365,32 +368,8 @@ class IsomorphicParityReport:
 
 
 def _reset_plan_state_for_parity_pass(dsn: str, trading_date: date) -> None:
-    conn = psycopg2.connect(dsn)
-    try:
-        with conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "UPDATE system_flags SET active = FALSE WHERE flag = 'ENTRY_FREEZE'"
-                )
-                cur.execute("ALTER TABLE trading_plan_items DISABLE TRIGGER USER")
-                try:
-                    cur.execute(
-                        """
-                        UPDATE trading_plan_items i
-                        SET filled_qty = 0,
-                            reserved_notional_usd = 0,
-                            status = 'ARMED'
-                        FROM trading_plans p
-                        WHERE p.plan_id = i.plan_id
-                          AND p.trading_date = %s
-                          AND p.market = 'US_EQUITY'
-                        """,
-                        (trading_date,),
-                    )
-                finally:
-                    cur.execute("ALTER TABLE trading_plan_items ENABLE TRIGGER USER")
-    finally:
-        conn.close()
+    IsomorphicBacktestRunner._clear_entry_freeze_if_ephemeral(dsn)
+    IsomorphicBacktestRunner._reset_locked_items_for_replay(dsn, trading_date)
 
 
 def _capture_pipeline_order_intents(
@@ -420,6 +399,8 @@ def _capture_pipeline_order_intents(
     engine = BacktestEngine(
         BacktestEngineConfig(bypass_logging=True, run_analysis=False)
     )
+    plan_gate: Optional[PlanGateExecAlgorithm] = None
+    telemetry_actor: Optional[PostgresTelemetryActor] = None
     try:
         engine.add_venue(
             venue=Venue(venue_str),
@@ -506,6 +487,10 @@ def _capture_pipeline_order_intents(
             )
         return tuple(intents)
     finally:
+        if plan_gate is not None:
+            plan_gate.close()
+        if telemetry_actor is not None:
+            telemetry_actor.close()
         engine.dispose()
 
 
@@ -577,6 +562,8 @@ def verify_backtest_to_live_parity(
                 f"LiveNode strategy config mismatch: {live_strat_cfg} != {plan_item.strategy_config}"
             )
     finally:
+        bundle.plan_gate.close()
+        bundle.telemetry_actor.close()
         bundle.node.dispose()
 
     bt_intents = _capture_pipeline_order_intents(

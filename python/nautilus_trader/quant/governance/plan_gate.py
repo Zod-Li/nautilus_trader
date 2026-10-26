@@ -160,6 +160,15 @@ class PlanGateBackend(Protocol):
         """Release reserved entry quantity when a previously admitted order is canceled or rejected."""
         ...
 
+    def set_entry_freeze(
+        self,
+        active: bool,
+        reason: str = "",
+        updated_by: str = "nautilus:plan_gate",
+    ) -> None:
+        """Update the `ENTRY_FREEZE` state in the admission gate."""
+        ...
+
 
 def evaluate_entry_against_envelope(
     request: PlanGateOrderRequest,
@@ -200,7 +209,13 @@ class SnapshotPlanGateBackend:
     def entry_freeze(self) -> bool:
         return self._rust_engine.entry_freeze
 
-    def set_entry_freeze(self, active: bool, reason: str = "") -> None:
+    def set_entry_freeze(
+        self,
+        active: bool,
+        reason: str = "",
+        updated_by: str = "nautilus:plan_gate",
+    ) -> None:
+        _ = updated_by
         self._rust_engine.set_entry_freeze(bool(active), str(reason))
 
     def upsert_plan_item(self, item: PlanItemContract) -> None:
@@ -278,10 +293,10 @@ class _AsyncPlanGateDbWorker:
         )
         self._thread.start()
 
-    def enqueue_mutations(self, raw_mutations: Sequence[str]) -> None:
+    def enqueue_mutations(self, raw_mutations: Sequence[Any]) -> None:
         for raw in raw_mutations:
             try:
-                parsed = json.loads(raw)
+                parsed = dict(raw) if isinstance(raw, Mapping) else json.loads(raw)
                 self._queue.put_nowait(parsed)
             except Exception as exc:
                 logger.error("Failed to enqueue PlanGate mutation: %s", exc)
@@ -290,6 +305,21 @@ class _AsyncPlanGateDbWorker:
         done = threading.Event()
         self._queue.put({"kind": "__FLUSH__", "event": done})
         done.wait(timeout=max(0.05, float(timeout_secs)))
+
+    def close(self) -> None:
+        self._queue.put(None)
+        if self._thread.is_alive() and threading.current_thread() is not self._thread:
+            self._thread.join(timeout=2.0)
+        self._close_write_conn()
+
+    def _close_write_conn(self) -> None:
+        conn = self._write_conn
+        self._write_conn = None
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
     def _ensure_conn(self) -> Any:
         if self._write_conn is None or getattr(self._write_conn, "closed", 1) != 0:
@@ -301,54 +331,62 @@ class _AsyncPlanGateDbWorker:
         return self._write_conn
 
     def _run_loop(self) -> None:
-        while True:
-            item = self._queue.get()
-            if item is None:
-                break
-            if item.get("kind") == "__FLUSH__":
-                ev = item.get("event")
-                if ev is not None:
-                    ev.set()
-                self._queue.task_done()
-                continue
-
-            batch = [item]
-            flush_events: List[threading.Event] = []
+        try:
             while True:
                 try:
-                    nxt = self._queue.get_nowait()
-                    if nxt is None:
-                        break
-                    if nxt.get("kind") == "__FLUSH__":
-                        ev = nxt.get("event")
-                        if ev is not None:
-                            flush_events.append(ev)
-                        self._queue.task_done()
-                        continue
-                    batch.append(nxt)
+                    item = self._queue.get(timeout=0.5)
                 except queue.Empty:
-                    break
-
-            try:
-                conn = self._ensure_conn()
-                with conn:
-                    with conn.cursor() as cur:
-                        for mutation in batch:
-                            self._apply_mutation(cur, mutation)
-            except Exception as exc:
-                logger.error("PlanGate async write-behind failed (triggering ENTRY_FREEZE): %s", exc)
-                try:
-                    if self._write_conn is not None:
-                        self._write_conn.close()
-                except Exception:
-                    pass
-                self._write_conn = None
-                self._rust_engine.set_entry_freeze(True, f"ASYNC_DB_WRITER_FAILURE: {exc}")
-            finally:
-                for _ in batch:
+                    self._close_write_conn()
+                    continue
+                if item is None:
                     self._queue.task_done()
-                for ev in flush_events:
-                    ev.set()
+                    break
+                if item.get("kind") == "__FLUSH__":
+                    ev = item.get("event")
+                    if ev is not None:
+                        ev.set()
+                    self._queue.task_done()
+                    continue
+
+                batch = [item]
+                flush_events: List[threading.Event] = []
+                should_exit = False
+                while True:
+                    try:
+                        nxt = self._queue.get_nowait()
+                        if nxt is None:
+                            self._queue.task_done()
+                            should_exit = True
+                            break
+                        if nxt.get("kind") == "__FLUSH__":
+                            ev = nxt.get("event")
+                            if ev is not None:
+                                flush_events.append(ev)
+                            self._queue.task_done()
+                            continue
+                        batch.append(nxt)
+                    except queue.Empty:
+                        break
+
+                try:
+                    conn = self._ensure_conn()
+                    with conn:
+                        with conn.cursor() as cur:
+                            for mutation in batch:
+                                self._apply_mutation(cur, mutation)
+                except Exception as exc:
+                    logger.error("PlanGate async write-behind failed (triggering ENTRY_FREEZE): %s", exc)
+                    self._close_write_conn()
+                    self._rust_engine.set_entry_freeze(True, f"ASYNC_DB_WRITER_FAILURE: {exc}")
+                finally:
+                    for _ in batch:
+                        self._queue.task_done()
+                    for ev in flush_events:
+                        ev.set()
+                if should_exit:
+                    break
+        finally:
+            self._close_write_conn()
 
     def _apply_mutation(self, cur: Any, mutation: Mapping[str, Any]) -> None:
         kind = mutation.get("kind")
@@ -463,6 +501,35 @@ class _AsyncPlanGateDbWorker:
                     """,
                     (Decimal(str(mutation["quantity"])), self._trading_date, self._market, mutation["symbol"]),
                 )
+        elif kind == "SET_ENTRY_FREEZE":
+            active_val = bool(mutation.get("active", True))
+            reason_val = str(mutation.get("reason") or "")
+            updated_by_val = str(mutation.get("updated_by") or "nautilus:plan_gate")
+            cur.execute(
+                """
+                INSERT INTO system_flags (
+                    flag, active, reason, set_by, updated_at
+                ) VALUES (
+                    'ENTRY_FREEZE', %s, %s, %s, NOW()
+                )
+                ON CONFLICT (flag) DO UPDATE SET
+                    active = EXCLUDED.active,
+                    reason = EXCLUDED.reason,
+                    set_by = EXCLUDED.set_by,
+                    updated_at = NOW()
+                """,
+                (active_val, reason_val, updated_by_val),
+            )
+            cur.execute(
+                """
+                INSERT INTO system_flag_events (
+                    flag, active, reason, set_by, ts
+                ) VALUES (
+                    'ENTRY_FREEZE', %s, %s, %s, NOW()
+                )
+                """,
+                (active_val, reason_val, updated_by_val),
+            )
 
 
 class PostgresPlanGateBackend:
@@ -501,12 +568,57 @@ class PostgresPlanGateBackend:
     def rust_engine(self) -> RustPlanGateEngine:
         return self._rust_engine
 
+    @property
+    def entry_freeze(self) -> bool:
+        return self._rust_engine.entry_freeze
+
+    def set_entry_freeze(
+        self,
+        active: bool,
+        reason: str = "",
+        updated_by: str = "nautilus:plan_gate",
+    ) -> None:
+        """Atomically updates `ENTRY_FREEZE` in $O(1)$ Rust memory and persists to `system_flags`."""
+        self._rust_engine.set_entry_freeze(bool(active), str(reason))
+        self._async_writer.enqueue_mutations(
+            [
+                {
+                    "kind": "SET_ENTRY_FREEZE",
+                    "active": bool(active),
+                    "reason": str(reason),
+                    "updated_by": str(updated_by or "nautilus:plan_gate"),
+                }
+            ]
+        )
+        if self._eager_flush:
+            self._async_writer.flush(timeout_secs=2.0)
+
     def flush(self, timeout_secs: float = 5.0) -> None:
         """Waits for all queued asynchronous DB writes to complete."""
         pending = self._rust_engine.drain_pending_mutations(1024)
         if pending:
             self._async_writer.enqueue_mutations(pending)
         self._async_writer.flush(timeout_secs=timeout_secs)
+
+    def close(self) -> None:
+        """Flushes pending writes and closes background DB and LISTEN connections."""
+        try:
+            self._async_writer.close()
+        except Exception:
+            pass
+        conn = self._listen_conn
+        self._listen_conn = None
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def _initialize_sync_and_triggers(self) -> None:
         try:
@@ -518,30 +630,46 @@ class PostgresPlanGateBackend:
             conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
             with conn.cursor() as cur:
                 cur.execute(
+                    """
+                    SELECT COUNT(*) AS cnt
+                    FROM pg_trigger
+                    WHERE tgname IN (
+                        'trg_notify_plan_gate_flags',
+                        'trg_notify_plan_gate_plans',
+                        'trg_notify_plan_gate_items'
+                    )
+                    """
+                )
+                row = cur.fetchone()
+                if not row or int(row.get("cnt", 0)) < 3:
+                    cur.execute(
+                        f"""
+                        CREATE OR REPLACE FUNCTION notify_nautilus_plan_gate_change()
+                        RETURNS trigger AS $$
+                        BEGIN
+                            PERFORM pg_notify('{NOTIFY_CHANNEL}', TG_TABLE_NAME);
+                            RETURN NULL;
+                        END;
+                        $$ LANGUAGE plpgsql;
+
+                        DROP TRIGGER IF EXISTS trg_notify_plan_gate_flags ON system_flags;
+                        CREATE TRIGGER trg_notify_plan_gate_flags
+                        AFTER INSERT OR UPDATE OR DELETE ON system_flags
+                        FOR EACH STATEMENT EXECUTE FUNCTION notify_nautilus_plan_gate_change();
+
+                        DROP TRIGGER IF EXISTS trg_notify_plan_gate_plans ON trading_plans;
+                        CREATE TRIGGER trg_notify_plan_gate_plans
+                        AFTER INSERT OR UPDATE OR DELETE ON trading_plans
+                        FOR EACH STATEMENT EXECUTE FUNCTION notify_nautilus_plan_gate_change();
+
+                        DROP TRIGGER IF EXISTS trg_notify_plan_gate_items ON trading_plan_items;
+                        CREATE TRIGGER trg_notify_plan_gate_items
+                        AFTER INSERT OR UPDATE OR DELETE ON trading_plan_items
+                        FOR EACH STATEMENT EXECUTE FUNCTION notify_nautilus_plan_gate_change();
+                        """
+                    )
+                cur.execute(
                     f"""
-                    CREATE OR REPLACE FUNCTION notify_nautilus_plan_gate_change()
-                    RETURNS trigger AS $$
-                    BEGIN
-                        PERFORM pg_notify('{NOTIFY_CHANNEL}', TG_TABLE_NAME);
-                        RETURN NULL;
-                    END;
-                    $$ LANGUAGE plpgsql;
-
-                    DROP TRIGGER IF EXISTS trg_notify_plan_gate_flags ON system_flags;
-                    CREATE TRIGGER trg_notify_plan_gate_flags
-                    AFTER INSERT OR UPDATE OR DELETE ON system_flags
-                    FOR EACH STATEMENT EXECUTE FUNCTION notify_nautilus_plan_gate_change();
-
-                    DROP TRIGGER IF EXISTS trg_notify_plan_gate_plans ON trading_plans;
-                    CREATE TRIGGER trg_notify_plan_gate_plans
-                    AFTER INSERT OR UPDATE OR DELETE ON trading_plans
-                    FOR EACH STATEMENT EXECUTE FUNCTION notify_nautilus_plan_gate_change();
-
-                    DROP TRIGGER IF EXISTS trg_notify_plan_gate_items ON trading_plan_items;
-                    CREATE TRIGGER trg_notify_plan_gate_items
-                    AFTER INSERT OR UPDATE OR DELETE ON trading_plan_items
-                    FOR EACH STATEMENT EXECUTE FUNCTION notify_nautilus_plan_gate_change();
-
                     LISTEN {NOTIFY_CHANNEL};
                     LISTEN nautilus_plan_locked;
                     LISTEN system_flags_changed;
@@ -764,6 +892,11 @@ class PlanGateExecAlgorithm(ExecutionAlgorithm):
     @property
     def decisions(self) -> Mapping[str, PlanGateDecision]:
         return dict(self._decisions)
+
+    def close(self) -> None:
+        close_fn = getattr(self._backend, "close", None)
+        if callable(close_fn):
+            close_fn()
 
     def on_order(self, order: Any) -> None:
         """Intercept a single routed order and either submit, spawn collared limit, or deny."""

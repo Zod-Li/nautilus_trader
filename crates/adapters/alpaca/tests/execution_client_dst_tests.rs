@@ -1753,3 +1753,106 @@ async fn test_reconciliation_order_fill_position_reports_and_mass_status_dst() {
 
     http_server.await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_generate_fill_reports_and_mass_status_with_uuid_order_id_and_empty_order_class_dst() {
+    let http_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let http_addr = http_listener.local_addr().unwrap();
+    let http_base_url = format!("http://{http_addr}");
+
+    let orders_payload = r#"[
+        {
+            "id":"1278e1ce-166b-4fbf-b64b-4559beb263bf",
+            "client_order_id":"CID-UUID-SIMPLE-1",
+            "created_at":"2026-03-31T13:30:00Z",
+            "submitted_at":"2026-03-31T13:30:01Z",
+            "filled_at":"2026-03-31T13:30:05Z",
+            "symbol":"AAPL",
+            "qty":"25",
+            "filled_qty":"25",
+            "filled_avg_price":"215.25",
+            "order_class":"",
+            "type":"market",
+            "side":"buy",
+            "time_in_force":"day",
+            "status":"filled"
+        }
+    ]"#;
+
+    let positions_payload = r#"[]"#;
+
+    let http_server = tokio::spawn(async move {
+        // 1. generate_fill_reports -> GET /v2/orders?status=all
+        // 2..=4. generate_mass_status -> GET /v2/orders?status=all (x2) + GET /v2/positions (x1)
+        for _ in 0..4 {
+            let (mut sock, _) = http_listener.accept().await.unwrap();
+            let (_method, path, _) = read_http_request(&mut sock).await;
+            if path.starts_with("/v2/orders") {
+                write_http_response(&mut sock, "200 OK", orders_payload).await;
+            } else if path.starts_with("/v2/positions") {
+                write_http_response(&mut sock, "200 OK", positions_payload).await;
+            } else {
+                write_http_response(&mut sock, "404 Not Found", "{}").await;
+            }
+        }
+    });
+
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let config = make_test_config(&http_base_url, "ws://127.0.0.1:9/stream");
+    let client = AlpacaExecutionClient::new(
+        TraderId::from("TRADER-001"),
+        ClientId::from(ALPACA_VENUE),
+        AccountId::from("ALPACA-001"),
+        config,
+        cache,
+    )
+    .unwrap()
+    .with_ws_enabled(false);
+
+    let ts_init = UnixNanos::from(1_700_000_000_000_000_000u64);
+
+    let fill_cmd = GenerateFillReportsBuilder::default()
+        .ts_init(ts_init)
+        .build()
+        .unwrap();
+    let fill_reports = client
+        .generate_fill_reports(fill_cmd)
+        .await
+        .expect("generate_fill_reports must succeed for 36-char UUID order id and empty order_class");
+    assert_eq!(fill_reports.len(), 1);
+    assert_eq!(
+        fill_reports[0].venue_order_id,
+        VenueOrderId::from("1278e1ce-166b-4fbf-b64b-4559beb263bf")
+    );
+    assert_eq!(
+        fill_reports[0].trade_id,
+        TradeId::from("F-1278e1ce166b4fbfb64b4559beb263bf")
+    );
+    assert!(fill_reports[0].trade_id.as_str().len() <= 36);
+
+    let mass_status = client
+        .generate_mass_status(None)
+        .await
+        .expect("generate_mass_status must succeed for 36-char UUID order id and empty order_class")
+        .expect("ExecutionMassStatus must be Some");
+    let order_reports_map = mass_status.order_reports();
+    assert_eq!(order_reports_map.len(), 1);
+    let order_report = order_reports_map
+        .get(&VenueOrderId::from("1278e1ce-166b-4fbf-b64b-4559beb263bf"))
+        .expect("order report must be indexed by UUID VenueOrderId");
+    assert_eq!(order_report.contingency_type, None);
+
+    let fill_reports_map = mass_status.fill_reports();
+    assert_eq!(fill_reports_map.len(), 1);
+    let fills = fill_reports_map
+        .get(&VenueOrderId::from("1278e1ce-166b-4fbf-b64b-4559beb263bf"))
+        .expect("fill report must be indexed by UUID VenueOrderId");
+    assert_eq!(fills.len(), 1);
+    assert_eq!(
+        fills[0].trade_id,
+        TradeId::from("F-1278e1ce166b4fbfb64b4559beb263bf")
+    );
+    assert!(fills[0].trade_id.as_str().len() <= 36);
+
+    http_server.await.unwrap();
+}

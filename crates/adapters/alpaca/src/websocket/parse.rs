@@ -29,7 +29,7 @@ use super::messages::{AlpacaTradeEventKind, AlpacaTradeUpdatePayload};
 use crate::{
     error::{AlpacaError, AlpacaResult},
     http::parse::{
-        decimal_to_price, decimal_to_quantity, parse_order_status_report,
+        decimal_to_price, decimal_to_quantity, parse_alpaca_trade_id, parse_order_status_report,
         parse_rfc3339_to_unix_nanos,
     },
 };
@@ -177,8 +177,7 @@ pub fn parse_trade_update_payload(
             .filter(|s| !s.is_empty())
             .map(ToString::to_string)
             .unwrap_or_else(|| format!("{venue_order_id}-{}", ts_event.as_u64()));
-        let t_id = TradeId::new_checked(&exec_id_str)
-            .map_err(|e| AlpacaError::Parse(format!("invalid execution_id '{exec_id_str}': {e}")))?;
+        let t_id = parse_alpaca_trade_id("", &exec_id_str)?;
 
         let liquidity_side = match order_type {
             OrderType::Limit => LiquiditySide::Maker,

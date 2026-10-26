@@ -82,7 +82,7 @@ use crate::{
         },
         parse::{
             DEFAULT_EQUITY_PRICE_PRECISION, DEFAULT_EQUITY_SIZE_PRECISION, decimal_to_price,
-            decimal_to_quantity, parse_account_state, parse_instrument_id,
+            decimal_to_quantity, parse_account_state, parse_alpaca_trade_id, parse_instrument_id,
             parse_order_status_report, parse_position_status_report, parse_rfc3339_to_unix_nanos,
         },
     },
@@ -1295,7 +1295,7 @@ impl ExecutionClient for AlpacaExecutionClient {
             let last_qty = decimal_to_quantity(resp.filled_qty, DEFAULT_EQUITY_SIZE_PRECISION)?;
             let last_px = decimal_to_price(avg_px_dec, DEFAULT_EQUITY_PRICE_PRECISION)?;
             let commission = Money::from_decimal(Decimal::ZERO, Currency::USD())?;
-            let trade_id = TradeId::new_checked(format!("FILL-{}", resp.id.trim()))?;
+            let trade_id = parse_alpaca_trade_id("FILL-", resp.id.trim())?;
 
             fills.push(FillReport::new(
                 self.core.account_id,
