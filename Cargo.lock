@@ -6886,6 +6886,7 @@ dependencies = [
  "nautilus-persistence",
  "nautilus-polymarket",
  "nautilus-portfolio",
+ "nautilus-quant-execution",
  "nautilus-risk",
  "nautilus-sandbox",
  "nautilus-serialization",
@@ -6896,6 +6897,26 @@ dependencies = [
  "pyo3",
  "pyo3-stub-gen",
  "rstest",
+]
+
+[[package]]
+name = "nautilus-quant-execution"
+version = "0.67.0"
+dependencies = [
+ "ahash",
+ "anyhow",
+ "nautilus-common",
+ "nautilus-core",
+ "nautilus-model",
+ "parking_lot 0.13.0",
+ "pyo3",
+ "pyo3-stub-gen",
+ "rstest",
+ "rust_decimal",
+ "rust_decimal_macros",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
 ]
 
 [[package]]

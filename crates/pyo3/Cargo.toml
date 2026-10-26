@@ -27,6 +27,7 @@ quant-adapters = [
   "dep:nautilus-datainfra",
   "dep:nautilus-interactive-brokers",
   "dep:nautilus-okx",
+  "dep:nautilus-quant-execution",
   "dep:nautilus-sandbox",
 ]
 adapters = [
@@ -46,6 +47,7 @@ adapters = [
   "dep:nautilus-lighter",
   "dep:nautilus-okx",
   "dep:nautilus-polymarket",
+  "dep:nautilus-quant-execution",
   "dep:nautilus-sandbox",
   "dep:nautilus-tardis",
 ]
@@ -97,6 +99,7 @@ extension-module = [
   "nautilus-okx?/extension-module",
   "nautilus-portfolio/extension-module",
   "nautilus-polymarket?/extension-module",
+  "nautilus-quant-execution?/extension-module",
   "nautilus-sandbox?/extension-module",
   "nautilus-persistence/extension-module",
   "nautilus-risk/extension-module",
@@ -125,6 +128,7 @@ high-precision = [
   "nautilus-lighter?/high-precision",
   "nautilus-okx?/high-precision",
   "nautilus-polymarket?/high-precision",
+  "nautilus-quant-execution?/high-precision",
   "nautilus-sandbox?/high-precision",
   "nautilus-tardis?/high-precision",
 ]
@@ -201,6 +205,7 @@ nautilus-okx = { workspace = true, optional = true, features = ["python"] }
 nautilus-polymarket = { workspace = true, optional = true, features = [
   "python",
 ] }
+nautilus-quant-execution = { workspace = true, optional = true, features = ["python"] }
 nautilus-sandbox = { workspace = true, optional = true, features = ["python"] }
 nautilus-tardis = { workspace = true, optional = true, features = [
   "python",

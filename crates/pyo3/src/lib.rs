@@ -224,6 +224,14 @@ fn _libnautilus(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
         sys_modules.set_item(format!("{module_name}.{n}"), m.getattr(n)?)?;
     }
 
+    #[cfg(any(feature = "adapters", feature = "quant-adapters"))]
+    {
+        let n = "quant_execution";
+        let submodule = pyo3::wrap_pymodule!(nautilus_quant_execution::python::quant_execution);
+        m.add_wrapped(submodule)?;
+        sys_modules.set_item(format!("{module_name}.{n}"), m.getattr(n)?)?;
+    }
+
     #[cfg(feature = "adapters")]
     {
         let n = "architect_ax";

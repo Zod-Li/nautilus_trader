@@ -214,7 +214,7 @@ impl CalendarTransport for HttpCalendarTransport {
         market: &str,
         at_ts_utc: Option<i64>,
     ) -> DataInfraResult<CalendarSessionStatus> {
-        let candidate_paths = ["/api/v1/calendar/session-status", "/v1/calendar/session-status"];
+        let candidate_paths = ["/v1/calendar/session-status"];
         let mut last_err: Option<DataInfraError> = None;
 
         for path in candidate_paths {
