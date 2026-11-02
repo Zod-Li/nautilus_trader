@@ -33,7 +33,10 @@ use std::{cell::RefCell, rc::Rc, sync::Arc, time::Duration};
 use futures_util::{SinkExt, StreamExt};
 use nautilus_alpaca::{
     ALPACA_VENUE, AlpacaCredential, AlpacaEnvironment, AlpacaExecClientConfig,
-    AlpacaExecutionClient, AlpacaExecutionClientFactory,
+    AlpacaExecutionClient, AlpacaExecutionClientFactory, AlpacaExecutionUpdate,
+    websocket::{
+        AlpacaWsFrameClassification, classify_alpaca_ws_frame, parse_trade_update_payload,
+    },
 };
 use nautilus_common::{
     cache::Cache,
@@ -1258,12 +1261,12 @@ async fn test_modify_cancel_cancel_all_and_batch_cancel_orders_dst() {
         assert_eq!((m3.as_str(), p3.as_str()), ("DELETE", "/v2/orders/VEN-MOD-2"));
         write_http_response(&mut s3, "204 No Content", "").await;
 
-        // 4. CancelAllOrders: GET /v2/orders?status=open followed by DELETE /v2/orders/VEN-ALL-1
+        // 4. CancelAllOrders: GET /v2/orders?status=open&limit=500 followed by DELETE /v2/orders/VEN-ALL-1
         let (mut s4, _) = http_listener.accept().await.unwrap();
         let (m4, p4, _) = read_http_request(&mut s4).await;
         assert_eq!(
             (m4.as_str(), p4.as_str()),
-            ("GET", "/v2/orders?status=open")
+            ("GET", "/v2/orders?status=open&limit=500")
         );
         write_http_response(
             &mut s4,
@@ -1618,12 +1621,13 @@ async fn test_reconciliation_order_fill_position_reports_and_mass_status_dst() {
     ]"#;
 
     let http_server = tokio::spawn(async move {
-        // Serve 6 requests:
+        // Serve 9 requests:
         // 1. generate_order_status_reports -> GET /v2/orders?status=all
         // 2. generate_fill_reports -> GET /v2/orders?status=all
         // 3. generate_position_status_reports -> GET /v2/positions
-        // 4..=6. generate_mass_status -> concurrent GET /v2/orders?status=all (x2) + GET /v2/positions (x1)
-        for _ in 0..6 {
+        // 4..=6. generate_mass_status (same client -> 0 duplicate fills)
+        // 7..=9. generate_mass_status (fresh client -> 1 fill report)
+        for _ in 0..9 {
             let (mut sock, _) = http_listener.accept().await.unwrap();
             let (_method, path, _) = read_http_request(&mut sock).await;
             if path.starts_with("/v2/orders") {
@@ -1642,8 +1646,8 @@ async fn test_reconciliation_order_fill_position_reports_and_mass_status_dst() {
         TraderId::from("TRADER-001"),
         ClientId::from(ALPACA_VENUE),
         AccountId::from("ALPACA-001"),
-        config,
-        cache,
+        config.clone(),
+        cache.clone(),
     )
     .unwrap()
     .with_ws_enabled(false);
@@ -1726,8 +1730,27 @@ async fn test_reconciliation_order_fill_position_reports_and_mass_status_dst() {
     assert_eq!(pos_reports[1].position_side, PositionSide::Short);
     assert_eq!(pos_reports[1].quantity, Quantity::from("10"));
 
-    // 4. generate_mass_status
-    let mass_status = client
+    // 4a. generate_mass_status on same client must NOT duplicate the already-claimed fill
+    let repeat_mass_status = client
+        .generate_mass_status(None)
+        .await
+        .expect("generate_mass_status must succeed")
+        .expect("ExecutionMassStatus must be Some");
+    assert_eq!(repeat_mass_status.order_reports().len(), 4);
+    assert_eq!(repeat_mass_status.fill_reports().len(), 0);
+    assert_eq!(repeat_mass_status.position_reports().len(), 2);
+
+    // 4b. generate_mass_status on fresh client claims the fill report
+    let fresh_client = AlpacaExecutionClient::new(
+        TraderId::from("TRADER-001"),
+        ClientId::from(ALPACA_VENUE),
+        AccountId::from("ALPACA-001"),
+        config,
+        cache,
+    )
+    .unwrap()
+    .with_ws_enabled(false);
+    let mass_status = fresh_client
         .generate_mass_status(None)
         .await
         .expect("generate_mass_status must succeed")
@@ -1740,7 +1763,7 @@ async fn test_reconciliation_order_fill_position_reports_and_mass_status_dst() {
     assert_eq!(mass_status.position_reports().len(), 2);
 
     // Verify venue_order_ids replacement history recorded from `replaces` field
-    let vid_history = client
+    let vid_history = fresh_client
         .venue_order_ids(&mass_status)
         .expect("replaced order must be tracked in venue_order_ids");
     assert_eq!(
@@ -1803,8 +1826,8 @@ async fn test_generate_fill_reports_and_mass_status_with_uuid_order_id_and_empty
         TraderId::from("TRADER-001"),
         ClientId::from(ALPACA_VENUE),
         AccountId::from("ALPACA-001"),
-        config,
-        cache,
+        config.clone(),
+        cache.clone(),
     )
     .unwrap()
     .with_ws_enabled(false);
@@ -1830,7 +1853,16 @@ async fn test_generate_fill_reports_and_mass_status_with_uuid_order_id_and_empty
     );
     assert!(fill_reports[0].trade_id.as_str().len() <= 36);
 
-    let mass_status = client
+    let mass_client = AlpacaExecutionClient::new(
+        TraderId::from("TRADER-001"),
+        ClientId::from(ALPACA_VENUE),
+        AccountId::from("ALPACA-001"),
+        config,
+        cache,
+    )
+    .unwrap()
+    .with_ws_enabled(false);
+    let mass_status = mass_client
         .generate_mass_status(None)
         .await
         .expect("generate_mass_status must succeed for 36-char UUID order id and empty order_class")
@@ -1853,6 +1885,906 @@ async fn test_generate_fill_reports_and_mass_status_with_uuid_order_id_and_empty
         TradeId::from("F-1278e1ce166b4fbfb64b4559beb263bf")
     );
     assert!(fills[0].trade_id.as_str().len() <= 36);
+
+    http_server.await.unwrap();
+}
+
+// =================================================================================================
+// 5. Ticket 04 (P0-EXEC-05, P1-EXEC-08): Idempotent Submit Recovery, Stopped Event & Cross-Path Fill Dedup
+// =================================================================================================
+
+fn decode_ws_frame_to_update(raw_json: &str) -> AlpacaExecutionUpdate {
+    let classified = classify_alpaca_ws_frame(raw_json.as_bytes())
+        .expect("classify_alpaca_ws_frame must succeed");
+    match classified {
+        AlpacaWsFrameClassification::TradeUpdate(payload) => parse_trade_update_payload(
+            &payload,
+            AccountId::from("ALPACA-001"),
+            ALPACA_VENUE,
+            2,
+            0,
+            UnixNanos::from(1_700_000_000_000_000_000u64),
+        )
+        .expect("parse_trade_update_payload must succeed"),
+        other => panic!("expected TradeUpdate, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_submit_order_and_order_list_idempotent_recovery_and_ws_fill_dedup_dst() {
+    let http_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let http_addr = http_listener.local_addr().unwrap();
+    let http_base_url = format!("http://{http_addr}");
+
+    let http_server = tokio::spawn(async move {
+        // 1. Order 1 (`CID-IDEMP-ACC`): POST /v2/orders returns 500, GET /v2/orders:by_client_order_id returns 200 accepted
+        let (mut s1, _) = http_listener.accept().await.unwrap();
+        let (m1, p1, _) = read_http_request(&mut s1).await;
+        assert_eq!((m1.as_str(), p1.as_str()), ("POST", "/v2/orders"));
+        write_http_response(
+            &mut s1,
+            "500 Internal Server Error",
+            r#"{"message":"gateway timeout after broker commit"}"#,
+        )
+        .await;
+
+        let (mut s2, _) = http_listener.accept().await.unwrap();
+        let (m2, p2, _) = read_http_request(&mut s2).await;
+        assert_eq!(
+            (m2.as_str(), p2.as_str()),
+            (
+                "GET",
+                "/v2/orders:by_client_order_id?client_order_id=CID-IDEMP-ACC"
+            )
+        );
+        write_http_response(
+            &mut s2,
+            "200 OK",
+            r#"{"id":"VEN-IDEMP-ACC","client_order_id":"CID-IDEMP-ACC","created_at":"2026-03-31T14:30:00Z","submitted_at":"2026-03-31T14:30:00.100Z","symbol":"AAPL","qty":"100","filled_qty":"0","order_class":"simple","type":"limit","side":"buy","time_in_force":"day","limit_price":"200.00","status":"accepted"}"#,
+        )
+        .await;
+
+        // 2. Order 2 (`CID-IDEMP-FILLED`): POST /v2/orders returns 422 duplicate client_order_id,
+        // GET /v2/orders:by_client_order_id returns 200 filled (100 @ 210.50)
+        let (mut s3, _) = http_listener.accept().await.unwrap();
+        let (m3, p3, _) = read_http_request(&mut s3).await;
+        assert_eq!((m3.as_str(), p3.as_str()), ("POST", "/v2/orders"));
+        write_http_response(
+            &mut s3,
+            "422 Unprocessable Entity",
+            r#"{"code":42210000,"message":"client_order_id already exists"}"#,
+        )
+        .await;
+
+        let (mut s4, _) = http_listener.accept().await.unwrap();
+        let (m4, p4, _) = read_http_request(&mut s4).await;
+        assert_eq!(
+            (m4.as_str(), p4.as_str()),
+            (
+                "GET",
+                "/v2/orders:by_client_order_id?client_order_id=CID-IDEMP-FILLED"
+            )
+        );
+        write_http_response(
+            &mut s4,
+            "200 OK",
+            r#"{"id":"VEN-IDEMP-FILLED","client_order_id":"CID-IDEMP-FILLED","created_at":"2026-03-31T14:31:00Z","submitted_at":"2026-03-31T14:31:00.100Z","filled_at":"2026-03-31T14:31:00.500Z","symbol":"NVDA","qty":"100","filled_qty":"100","filled_avg_price":"210.50","order_class":"simple","type":"market","side":"buy","time_in_force":"day","status":"filled"}"#,
+        )
+        .await;
+
+        // 3. OrderList (`CID-IDEMP-BRK-P` + TP + SL): POST /v2/orders returns 502,
+        // GET /v2/orders:by_client_order_id returns 200 bracket parent + legs
+        let (mut s5, _) = http_listener.accept().await.unwrap();
+        let (m5, p5, _) = read_http_request(&mut s5).await;
+        assert_eq!((m5.as_str(), p5.as_str()), ("POST", "/v2/orders"));
+        write_http_response(
+            &mut s5,
+            "502 Bad Gateway",
+            r#"{"message":"bad gateway"}"#,
+        )
+        .await;
+
+        let (mut s6, _) = http_listener.accept().await.unwrap();
+        let (m6, p6, _) = read_http_request(&mut s6).await;
+        assert_eq!(
+            (m6.as_str(), p6.as_str()),
+            (
+                "GET",
+                "/v2/orders:by_client_order_id?client_order_id=CID-IDEMP-BRK-P"
+            )
+        );
+        write_http_response(
+            &mut s6,
+            "200 OK",
+            r#"{
+                "id":"VEN-IDEMP-BRK-P",
+                "client_order_id":"CID-IDEMP-BRK-P",
+                "created_at":"2026-03-31T14:32:00Z",
+                "submitted_at":"2026-03-31T14:32:00.100Z",
+                "symbol":"MSFT",
+                "qty":"40",
+                "filled_qty":"0",
+                "order_class":"bracket",
+                "type":"limit",
+                "side":"buy",
+                "time_in_force":"day",
+                "limit_price":"410.00",
+                "status":"accepted",
+                "legs":[
+                    {
+                        "id":"VEN-IDEMP-BRK-TP",
+                        "client_order_id":"CID-IDEMP-BRK-TP",
+                        "created_at":"2026-03-31T14:32:00Z",
+                        "symbol":"MSFT",
+                        "qty":"40",
+                        "filled_qty":"0",
+                        "order_class":"bracket",
+                        "type":"limit",
+                        "side":"sell",
+                        "time_in_force":"day",
+                        "limit_price":"430.00",
+                        "status":"held"
+                    },
+                    {
+                        "id":"VEN-IDEMP-BRK-SL",
+                        "client_order_id":"CID-IDEMP-BRK-SL",
+                        "created_at":"2026-03-31T14:32:00Z",
+                        "symbol":"MSFT",
+                        "qty":"40",
+                        "filled_qty":"0",
+                        "order_class":"bracket",
+                        "type":"stop",
+                        "side":"sell",
+                        "time_in_force":"day",
+                        "stop_price":"395.00",
+                        "status":"held"
+                    }
+                ]
+            }"#,
+        )
+        .await;
+
+        // 4. Genuine pre-trade 422 (`existing open order would result in wash trade`) -> no probe, emits OrderRejected
+        let (mut s7, _) = http_listener.accept().await.unwrap();
+        let (m7, p7, _) = read_http_request(&mut s7).await;
+        assert_eq!((m7.as_str(), p7.as_str()), ("POST", "/v2/orders"));
+        write_http_response(
+            &mut s7,
+            "422 Unprocessable Entity",
+            r#"{"code":42210000,"message":"existing open order would result in wash trade"}"#,
+        )
+        .await;
+
+        // 5. 422 (`client_order_id already exists`) where GET /v2/orders:by_client_order_id returns 404 -> emits OrderRejected
+        let (mut s8, _) = http_listener.accept().await.unwrap();
+        let (m8, p8, _) = read_http_request(&mut s8).await;
+        assert_eq!((m8.as_str(), p8.as_str()), ("POST", "/v2/orders"));
+        write_http_response(
+            &mut s8,
+            "422 Unprocessable Entity",
+            r#"{"code":42210000,"message":"client_order_id already exists"}"#,
+        )
+        .await;
+
+        let (mut s9, _) = http_listener.accept().await.unwrap();
+        let (m9, p9, _) = read_http_request(&mut s9).await;
+        assert_eq!(
+            (m9.as_str(), p9.as_str()),
+            (
+                "GET",
+                "/v2/orders:by_client_order_id?client_order_id=CID-DUP-404"
+            )
+        );
+        write_http_response(
+            &mut s9,
+            "404 Not Found",
+            r#"{"code":40410000,"message":"order not found"}"#,
+        )
+        .await;
+    });
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+    replace_exec_event_sender(tx);
+
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let config = make_test_config(&http_base_url, "ws://127.0.0.1:9/stream");
+    let client = AlpacaExecutionClient::new(
+        TraderId::from("TRADER-001"),
+        ClientId::from(ALPACA_VENUE),
+        AccountId::from("ALPACA-001"),
+        config,
+        cache.clone(),
+    )
+    .unwrap()
+    .with_ws_enabled(false);
+
+    // --- Case 1: 500 recovered via get_order_by_client_id (`status: "accepted"`) ---
+    let ord_acc = make_limit_order(
+        "CID-IDEMP-ACC",
+        "AAPL",
+        OrderSide::Buy,
+        "100",
+        "200.00",
+        None,
+        None,
+        None,
+        None,
+    );
+    cache
+        .borrow_mut()
+        .add_order(ord_acc.clone(), None, Some(ClientId::from(ALPACA_VENUE)), false)
+        .unwrap();
+    client.submit_order(make_submit_order_cmd(&ord_acc)).unwrap();
+
+    let ev_acc = drain_events(&mut rx);
+    assert_eq!(
+        ev_acc.len(),
+        2,
+        "recovered accepted order must emit Submitted + Accepted and never Rejected"
+    );
+    assert!(matches!(
+        ev_acc[0],
+        ExecutionEvent::Order(OrderEventAny::Submitted(ref s))
+            if s.client_order_id == ClientOrderId::from("CID-IDEMP-ACC")
+    ));
+    assert!(matches!(
+        ev_acc[1],
+        ExecutionEvent::Order(OrderEventAny::Accepted(ref a))
+            if a.client_order_id == ClientOrderId::from("CID-IDEMP-ACC")
+                && a.venue_order_id == VenueOrderId::from("VEN-IDEMP-ACC")
+    ));
+
+    // --- Case 2: 422 duplicate recovered via get_order_by_client_id (`status: "filled"`) + delayed WS fill dedup ---
+    let ord_filled = make_market_order(
+        "CID-IDEMP-FILLED",
+        "NVDA",
+        OrderSide::Buy,
+        "100",
+        None,
+        None,
+        None,
+        None,
+    );
+    cache
+        .borrow_mut()
+        .add_order(
+            ord_filled.clone(),
+            None,
+            Some(ClientId::from(ALPACA_VENUE)),
+            false,
+        )
+        .unwrap();
+    client
+        .submit_order(make_submit_order_cmd(&ord_filled))
+        .unwrap();
+
+    let ev_filled = drain_events(&mut rx);
+    assert_eq!(
+        ev_filled.len(),
+        3,
+        "recovered filled order must emit Submitted -> Accepted -> Filled and never Rejected"
+    );
+    assert!(matches!(
+        ev_filled[0],
+        ExecutionEvent::Order(OrderEventAny::Submitted(ref s))
+            if s.client_order_id == ClientOrderId::from("CID-IDEMP-FILLED")
+    ));
+    assert!(matches!(
+        ev_filled[1],
+        ExecutionEvent::Order(OrderEventAny::Accepted(ref a))
+            if a.client_order_id == ClientOrderId::from("CID-IDEMP-FILLED")
+                && a.venue_order_id == VenueOrderId::from("VEN-IDEMP-FILLED")
+    ));
+    match &ev_filled[2] {
+        ExecutionEvent::Order(OrderEventAny::Filled(f)) => {
+            assert_eq!(f.client_order_id, ClientOrderId::from("CID-IDEMP-FILLED"));
+            assert_eq!(f.venue_order_id, VenueOrderId::from("VEN-IDEMP-FILLED"));
+            assert_eq!(f.last_qty, Quantity::from("100"));
+            assert_eq!(f.last_px, Price::from("210.50"));
+        }
+        other => panic!("expected OrderFilled on recovered filled order, got {other:?}"),
+    }
+
+    // Delayed WebSocket `fill` frame arrives after `submit_order` already reconciled the fill
+    let delayed_ws_fill = build_ws_trade_update_frame(
+        "fill",
+        "VEN-IDEMP-FILLED",
+        "CID-IDEMP-FILLED",
+        "NVDA",
+        "buy",
+        "market",
+        "filled",
+        "100",
+        "100",
+        Some("210.50"),
+        Some("210.50"),
+        Some("100"),
+        Some("100"),
+        Some("EXEC-DELAYED-WS-1"),
+    );
+    client.ingest_execution_update(decode_ws_frame_to_update(&delayed_ws_fill));
+    assert!(
+        drain_events(&mut rx).is_empty(),
+        "delayed WebSocket fill after submit_order fill recovery must be suppressed (0 duplicate OrderFilled)"
+    );
+
+    // --- Case 3: Bracket `submit_order_list` recovered after 502 via get_order_by_client_id ---
+    let brk_list_id = OrderListId::from("OL-IDEMP-BRK");
+    let brk_p = make_limit_order(
+        "CID-IDEMP-BRK-P",
+        "MSFT",
+        OrderSide::Buy,
+        "40",
+        "410.00",
+        Some(ContingencyType::Oto),
+        Some(brk_list_id),
+        Some(vec![
+            ClientOrderId::from("CID-IDEMP-BRK-TP"),
+            ClientOrderId::from("CID-IDEMP-BRK-SL"),
+        ]),
+        None,
+    );
+    let brk_tp = make_limit_order(
+        "CID-IDEMP-BRK-TP",
+        "MSFT",
+        OrderSide::Sell,
+        "40",
+        "430.00",
+        Some(ContingencyType::Oco),
+        Some(brk_list_id),
+        Some(vec![ClientOrderId::from("CID-IDEMP-BRK-SL")]),
+        Some(ClientOrderId::from("CID-IDEMP-BRK-P")),
+    );
+    let brk_sl = make_stop_market_order(
+        "CID-IDEMP-BRK-SL",
+        "MSFT",
+        OrderSide::Sell,
+        "40",
+        "395.00",
+        Some(ContingencyType::Oco),
+        Some(brk_list_id),
+        Some(vec![ClientOrderId::from("CID-IDEMP-BRK-TP")]),
+        Some(ClientOrderId::from("CID-IDEMP-BRK-P")),
+    );
+    let brk_orders = vec![brk_p, brk_tp, brk_sl];
+    let brk_order_list = OrderList::new(
+        brk_list_id,
+        InstrumentId::from("MSFT.ALPACA"),
+        StrategyId::from("STRAT-001"),
+        vec![
+            ClientOrderId::from("CID-IDEMP-BRK-P"),
+            ClientOrderId::from("CID-IDEMP-BRK-TP"),
+            ClientOrderId::from("CID-IDEMP-BRK-SL"),
+        ],
+        UnixNanos::from(1_700_000_000_000_000_000u64),
+    );
+    {
+        let mut c = cache.borrow_mut();
+        for o in &brk_orders {
+            c.add_order(o.clone(), None, Some(ClientId::from(ALPACA_VENUE)), false)
+                .unwrap();
+        }
+        c.add_order_list(brk_order_list.clone()).unwrap();
+    }
+    let brk_cmd = SubmitOrderList::new(
+        TraderId::from("TRADER-001"),
+        Some(ClientId::from(ALPACA_VENUE)),
+        StrategyId::from("STRAT-001"),
+        brk_order_list,
+        brk_orders.iter().map(|o| o.init_event().clone()).collect(),
+        None,
+        None,
+        None,
+        UUID4::new(),
+        UnixNanos::from(1_700_000_000_000_000_000u64),
+        None,
+    );
+    client.submit_order_list(brk_cmd).unwrap();
+
+    let ev_brk = drain_events(&mut rx);
+    assert_eq!(ev_brk.len(), 6, "3 Submitted + 3 Accepted on bracket recovery");
+    assert!(matches!(
+        ev_brk[3],
+        ExecutionEvent::Order(OrderEventAny::Accepted(ref a))
+            if a.client_order_id == ClientOrderId::from("CID-IDEMP-BRK-P")
+                && a.venue_order_id == VenueOrderId::from("VEN-IDEMP-BRK-P")
+    ));
+    assert!(matches!(
+        ev_brk[4],
+        ExecutionEvent::Order(OrderEventAny::Accepted(ref a))
+            if a.client_order_id == ClientOrderId::from("CID-IDEMP-BRK-TP")
+                && a.venue_order_id == VenueOrderId::from("VEN-IDEMP-BRK-TP")
+    ));
+    assert!(matches!(
+        ev_brk[5],
+        ExecutionEvent::Order(OrderEventAny::Accepted(ref a))
+            if a.client_order_id == ClientOrderId::from("CID-IDEMP-BRK-SL")
+                && a.venue_order_id == VenueOrderId::from("VEN-IDEMP-BRK-SL")
+    ));
+
+    // --- Case 4: Genuine pre-trade 422 (`wash trade`) -> OrderRejected ---
+    let ord_wash = make_market_order(
+        "CID-GENUINE-WASH",
+        "AAPL",
+        OrderSide::Buy,
+        "10",
+        None,
+        None,
+        None,
+        None,
+    );
+    cache
+        .borrow_mut()
+        .add_order(ord_wash.clone(), None, Some(ClientId::from(ALPACA_VENUE)), false)
+        .unwrap();
+    client.submit_order(make_submit_order_cmd(&ord_wash)).unwrap();
+
+    let ev_wash = drain_events(&mut rx);
+    assert_eq!(ev_wash.len(), 2);
+    assert!(matches!(
+        ev_wash[1],
+        ExecutionEvent::Order(OrderEventAny::Rejected(ref r))
+            if r.client_order_id == ClientOrderId::from("CID-GENUINE-WASH")
+                && r.reason.as_str().contains("wash trade")
+    ));
+
+    // --- Case 5: 422 where GET /v2/orders:by_client_order_id returns 404 -> OrderRejected ---
+    let ord_404 = make_market_order(
+        "CID-DUP-404",
+        "AAPL",
+        OrderSide::Buy,
+        "10",
+        None,
+        None,
+        None,
+        None,
+    );
+    cache
+        .borrow_mut()
+        .add_order(ord_404.clone(), None, Some(ClientId::from(ALPACA_VENUE)), false)
+        .unwrap();
+    client.submit_order(make_submit_order_cmd(&ord_404)).unwrap();
+
+    let ev_404 = drain_events(&mut rx);
+    assert_eq!(ev_404.len(), 2);
+    assert!(matches!(
+        ev_404[1],
+        ExecutionEvent::Order(OrderEventAny::Rejected(ref r))
+            if r.client_order_id == ClientOrderId::from("CID-DUP-404")
+    ));
+
+    http_server.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_ws_stopped_event_emits_order_accepted_and_never_canceled_dst() {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+    replace_exec_event_sender(tx);
+
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let config = make_test_config("http://127.0.0.1:9", "ws://127.0.0.1:9/stream");
+    let client = AlpacaExecutionClient::new(
+        TraderId::from("TRADER-001"),
+        ClientId::from(ALPACA_VENUE),
+        AccountId::from("ALPACA-001"),
+        config,
+        cache.clone(),
+    )
+    .unwrap()
+    .with_ws_enabled(false);
+
+    let stop_order = make_stop_market_order(
+        "CID-WS-STOPPED",
+        "AAPL",
+        OrderSide::Sell,
+        "50",
+        "195.00",
+        None,
+        None,
+        None,
+        None,
+    );
+    cache
+        .borrow_mut()
+        .add_order(
+            stop_order,
+            None,
+            Some(ClientId::from(ALPACA_VENUE)),
+            false,
+        )
+        .unwrap();
+
+    let ws_stopped = build_ws_trade_update_frame(
+        "stopped",
+        "VEN-WS-STOPPED",
+        "CID-WS-STOPPED",
+        "AAPL",
+        "sell",
+        "stop",
+        "stopped",
+        "50",
+        "0",
+        None,
+        Some("195.00"),
+        None,
+        Some("50"),
+        None,
+    );
+    client.ingest_execution_update(decode_ws_frame_to_update(&ws_stopped));
+
+    let events = drain_events(&mut rx);
+    assert_eq!(events.len(), 1);
+    assert!(
+        matches!(
+            events[0],
+            ExecutionEvent::Order(OrderEventAny::Accepted(ref a))
+                if a.client_order_id == ClientOrderId::from("CID-WS-STOPPED")
+                    && a.venue_order_id == VenueOrderId::from("VEN-WS-STOPPED")
+        ),
+        "AlpacaTradeEventKind::Stopped must emit OrderAccepted and never OrderCanceled, got {:?}",
+        events[0]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_cross_path_ws_and_rest_fill_reconciliation_dedup_and_delta_notional_dst() {
+    let http_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let http_addr = http_listener.local_addr().unwrap();
+    let http_base_url = format!("http://{http_addr}");
+
+    let http_server = tokio::spawn(async move {
+        // Sweep 1 (Startup REST `generate_fill_reports` for Case C):
+        // Returns `VEN-CROSS-C` partially filled (`40` shares @ `$100.00`).
+        let (mut s1, _) = http_listener.accept().await.unwrap();
+        let (m1, p1, _) = read_http_request(&mut s1).await;
+        assert_eq!(m1, "GET");
+        assert!(p1.starts_with("/v2/orders?status=all&limit=500"));
+        write_http_response(
+            &mut s1,
+            "200 OK",
+            r#"[
+                {
+                    "id":"VEN-CROSS-C",
+                    "client_order_id":"CID-CROSS-C",
+                    "created_at":"2026-03-31T14:00:00Z",
+                    "submitted_at":"2026-03-31T14:00:00.100Z",
+                    "updated_at":"2026-03-31T14:00:01Z",
+                    "symbol":"MSFT",
+                    "qty":"100",
+                    "filled_qty":"40",
+                    "filled_avg_price":"100.00",
+                    "order_class":"simple",
+                    "type":"limit",
+                    "side":"buy",
+                    "time_in_force":"day",
+                    "limit_price":"105.00",
+                    "status":"partially_filled"
+                }
+            ]"#,
+        )
+        .await;
+
+        // Sweep 2..=4 (Periodic REST `generate_fill_reports` + `generate_mass_status` for Cases A, B, and C):
+        // - `VEN-CROSS-A`: WS already reported 40 @ 100.00; REST now sees 100 @ 103.00 -> must emit delta 60 @ 105.00!
+        // - `VEN-CROSS-B`: WS already reported 100 @ 200.00; REST sees 100 @ 200.00 -> must emit 0 duplicate fills!
+        // - `VEN-CROSS-C`: Startup REST reported 40 @ 100.00 + WS reported delta 60 @ 105.00 (total 100); REST sees 100 @ 103.00 -> 0 duplicate fills!
+        let sweep2_orders = r#"[
+                {
+                    "id":"VEN-CROSS-A",
+                    "client_order_id":"CID-CROSS-A",
+                    "created_at":"2026-03-31T14:01:00Z",
+                    "submitted_at":"2026-03-31T14:01:00.100Z",
+                    "filled_at":"2026-03-31T14:01:05Z",
+                    "symbol":"AAPL",
+                    "qty":"100",
+                    "filled_qty":"100",
+                    "filled_avg_price":"103.00",
+                    "order_class":"simple",
+                    "type":"limit",
+                    "side":"buy",
+                    "time_in_force":"day",
+                    "limit_price":"105.00",
+                    "status":"filled"
+                },
+                {
+                    "id":"VEN-CROSS-B",
+                    "client_order_id":"CID-CROSS-B",
+                    "created_at":"2026-03-31T14:02:00Z",
+                    "submitted_at":"2026-03-31T14:02:00.100Z",
+                    "filled_at":"2026-03-31T14:02:02Z",
+                    "symbol":"NVDA",
+                    "qty":"100",
+                    "filled_qty":"100",
+                    "filled_avg_price":"200.00",
+                    "order_class":"simple",
+                    "type":"market",
+                    "side":"buy",
+                    "time_in_force":"day",
+                    "status":"filled"
+                },
+                {
+                    "id":"VEN-CROSS-C",
+                    "client_order_id":"CID-CROSS-C",
+                    "created_at":"2026-03-31T14:00:00Z",
+                    "submitted_at":"2026-03-31T14:00:00.100Z",
+                    "filled_at":"2026-03-31T14:00:05Z",
+                    "symbol":"MSFT",
+                    "qty":"100",
+                    "filled_qty":"100",
+                    "filled_avg_price":"103.00",
+                    "order_class":"simple",
+                    "type":"limit",
+                    "side":"buy",
+                    "time_in_force":"day",
+                    "limit_price":"105.00",
+                    "status":"filled"
+                }
+            ]"#;
+        for _ in 0..4 {
+            let (mut sock, _) = http_listener.accept().await.unwrap();
+            let (m, p, _) = read_http_request(&mut sock).await;
+            assert_eq!(m, "GET");
+            if p.starts_with("/v2/orders") {
+                assert!(p.starts_with("/v2/orders?status=all&limit=500"));
+                write_http_response(&mut sock, "200 OK", sweep2_orders).await;
+            } else if p.starts_with("/v2/positions") {
+                write_http_response(&mut sock, "200 OK", "[]").await;
+            } else {
+                write_http_response(&mut sock, "404 Not Found", "{}").await;
+            }
+        }
+    });
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+    replace_exec_event_sender(tx);
+
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let config = make_test_config(&http_base_url, "ws://127.0.0.1:9/stream");
+    let client = AlpacaExecutionClient::new(
+        TraderId::from("TRADER-001"),
+        ClientId::from(ALPACA_VENUE),
+        AccountId::from("ALPACA-001"),
+        config,
+        cache.clone(),
+    )
+    .unwrap()
+    .with_ws_enabled(false);
+
+    let ord_a = make_limit_order(
+        "CID-CROSS-A",
+        "AAPL",
+        OrderSide::Buy,
+        "100",
+        "105.00",
+        None,
+        None,
+        None,
+        None,
+    );
+    let ord_b = make_market_order(
+        "CID-CROSS-B",
+        "NVDA",
+        OrderSide::Buy,
+        "100",
+        None,
+        None,
+        None,
+        None,
+    );
+    let ord_c = make_limit_order(
+        "CID-CROSS-C",
+        "MSFT",
+        OrderSide::Buy,
+        "100",
+        "105.00",
+        None,
+        None,
+        None,
+        None,
+    );
+    {
+        let mut c = cache.borrow_mut();
+        for o in [&ord_a, &ord_b, &ord_c] {
+            c.add_order(o.clone(), None, Some(ClientId::from(ALPACA_VENUE)), false)
+                .unwrap();
+        }
+    }
+
+    let ts_init = UnixNanos::from(1_700_000_000_000_000_000u64);
+
+    // --- Step 1 (Case C startup): REST `generate_fill_reports` sees `VEN-CROSS-C` filled_qty = 40 @ $100.00 ---
+    let startup_fills = client
+        .generate_fill_reports(
+            GenerateFillReportsBuilder::default()
+                .ts_init(ts_init)
+                .build()
+                .unwrap(),
+        )
+        .await
+        .expect("startup generate_fill_reports must succeed");
+    assert_eq!(startup_fills.len(), 1);
+    assert_eq!(
+        startup_fills[0].venue_order_id,
+        VenueOrderId::from("VEN-CROSS-C")
+    );
+    assert_eq!(startup_fills[0].trade_id, TradeId::from("FILL-VEN-CROSS-C"));
+    assert_eq!(startup_fills[0].last_qty, Quantity::from("40"));
+    assert_eq!(startup_fills[0].last_px, Price::from("100.00"));
+
+    // --- Step 2 (Case C WS): WebSocket `fill` arrives with `cum_qty = 100, last_qty = 100, last_px = 105.00` ---
+    // Because 40 shares were already reported by startup REST reconciliation, `AlpacaExecutionClient`
+    // must cap the emitted WebSocket fill at the unreported delta (`60` shares @ `$105.00`)!
+    let ws_c_fill = build_ws_trade_update_frame(
+        "fill",
+        "VEN-CROSS-C",
+        "CID-CROSS-C",
+        "MSFT",
+        "buy",
+        "limit",
+        "filled",
+        "100",
+        "100",
+        Some("103.00"),
+        Some("105.00"),
+        Some("100"),
+        Some("100"),
+        Some("EXEC-C-UNSEEN"),
+    );
+    client.ingest_execution_update(decode_ws_frame_to_update(&ws_c_fill));
+
+    let ev_c = drain_events(&mut rx);
+    assert_eq!(ev_c.len(), 1);
+    match &ev_c[0] {
+        ExecutionEvent::Order(OrderEventAny::Filled(f)) => {
+            assert_eq!(f.client_order_id, ClientOrderId::from("CID-CROSS-C"));
+            assert_eq!(f.venue_order_id, VenueOrderId::from("VEN-CROSS-C"));
+            assert_eq!(
+                f.last_qty,
+                Quantity::from("60"),
+                "WebSocket fill must be capped at the unreported delta (100 - 40 = 60 shares)"
+            );
+            assert_eq!(f.last_px, Price::from("105.00"));
+        }
+        other => panic!("expected capped OrderFilled for Case C, got {other:?}"),
+    }
+
+    // Subsequent WebSocket replay with `cum_qty <= 100` AND malformed `cum_qty == 0, last_qty = 100` frame
+    // must both be suppressed!
+    let ws_c_replay = build_ws_trade_update_frame(
+        "fill",
+        "VEN-CROSS-C",
+        "CID-CROSS-C",
+        "MSFT",
+        "buy",
+        "limit",
+        "filled",
+        "100",
+        "100",
+        Some("103.00"),
+        Some("105.00"),
+        Some("60"),
+        Some("100"),
+        Some("EXEC-C-REPLAY-2"),
+    );
+    client.ingest_execution_update(decode_ws_frame_to_update(&ws_c_replay));
+
+    let ws_c_malformed_zero_cum = build_ws_trade_update_frame(
+        "fill",
+        "VEN-CROSS-C",
+        "CID-CROSS-C",
+        "MSFT",
+        "buy",
+        "limit",
+        "filled",
+        "100",
+        "0",
+        Some("103.00"),
+        Some("105.00"),
+        Some("100"),
+        Some("100"),
+        Some("EXEC-C-ZERO-CUM"),
+    );
+    client.ingest_execution_update(decode_ws_frame_to_update(&ws_c_malformed_zero_cum));
+    assert!(
+        drain_events(&mut rx).is_empty(),
+        "subsequent WS replay (cum_qty <= 100) and malformed (cum_qty == 0, last_qty = 100) frames must be suppressed"
+    );
+
+    // --- Step 3 (Case A & Case B WS): ---
+    // Case A: WebSocket `partial_fill` (40 shares @ $100.00) arrives first
+    let ws_a_partial = build_ws_trade_update_frame(
+        "partial_fill",
+        "VEN-CROSS-A",
+        "CID-CROSS-A",
+        "AAPL",
+        "buy",
+        "limit",
+        "partially_filled",
+        "100",
+        "40",
+        Some("100.00"),
+        Some("100.00"),
+        Some("40"),
+        Some("40"),
+        Some("EXEC-A-PARTIAL-1"),
+    );
+    client.ingest_execution_update(decode_ws_frame_to_update(&ws_a_partial));
+
+    // Case B: WebSocket `fill` (100 shares @ $200.00) arrives first
+    let ws_b_fill = build_ws_trade_update_frame(
+        "fill",
+        "VEN-CROSS-B",
+        "CID-CROSS-B",
+        "NVDA",
+        "buy",
+        "market",
+        "filled",
+        "100",
+        "100",
+        Some("200.00"),
+        Some("200.00"),
+        Some("100"),
+        Some("100"),
+        Some("EXEC-B-FULL-1"),
+    );
+    client.ingest_execution_update(decode_ws_frame_to_update(&ws_b_fill));
+
+    let ev_ab = drain_events(&mut rx);
+    assert_eq!(ev_ab.len(), 2);
+
+    // --- Step 4 (Cases A, B, C REST reconciliation): `generate_fill_reports` ---
+    // Only `VEN-CROSS-A` has an unreported incremental delta (`100 - 40 = 60` shares)
+    // at weighted slice price `(100 * 103.00 - 40 * 100.00) / 60 = 105.00`!
+    // `VEN-CROSS-B` and `VEN-CROSS-C` are already 100% reported and must produce 0 duplicate fills.
+    let reconcile_fills = client
+        .generate_fill_reports(
+            GenerateFillReportsBuilder::default()
+                .ts_init(ts_init)
+                .build()
+                .unwrap(),
+        )
+        .await
+        .expect("periodic generate_fill_reports must succeed");
+
+    assert_eq!(
+        reconcile_fills.len(),
+        1,
+        "only Case A should emit an incremental delta FillReport; Cases B and C must emit 0 duplicates"
+    );
+    let fill_a = &reconcile_fills[0];
+    assert_eq!(fill_a.venue_order_id, VenueOrderId::from("VEN-CROSS-A"));
+    assert_eq!(
+        fill_a.client_order_id,
+        Some(ClientOrderId::from("CID-CROSS-A"))
+    );
+    assert_eq!(
+        fill_a.last_qty,
+        Quantity::from("60"),
+        "Case A REST reconciliation must return only the incremental delta (60 shares)"
+    );
+    assert_eq!(
+        fill_a.last_px,
+        Price::from("105.00"),
+        "Case A REST reconciliation must compute weighted slice price (100*103 - 40*100)/60 = $105.00"
+    );
+    assert_eq!(
+        fill_a.trade_id,
+        TradeId::from("FILL-VEN-CROSS-A-100"),
+        "incremental delta fill must have deterministic delta TradeId"
+    );
+
+    let mass_status = client
+        .generate_mass_status(None)
+        .await
+        .expect("generate_mass_status must succeed")
+        .expect("ExecutionMassStatus must be Some");
+    assert_eq!(mass_status.order_reports().len(), 3);
+    let fill_reports_map = mass_status.fill_reports();
+    assert_eq!(
+        fill_reports_map.len(),
+        0,
+        "repeated REST sweep in generate_mass_status must not re-emit already claimed delta fill for VEN-CROSS-A"
+    );
 
     http_server.await.unwrap();
 }

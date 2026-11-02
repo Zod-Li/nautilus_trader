@@ -88,7 +88,7 @@ impl RustPlanGateEngine {
     }
 
     /// Upserts a locked `RustPlanItemEnvelope` into the in-memory $O(1)$ lookup table.
-    pub fn upsert_plan_item(&self, item: RustPlanItemEnvelope, preserve_higher_reservation: bool) {
+    pub fn upsert_plan_item(&self, mut item: RustPlanItemEnvelope, preserve_higher_reservation: bool) {
         let mut guard = self.state.write();
         let sym = item.symbol.clone();
         let db_filled = item.filled_qty;
@@ -102,6 +102,9 @@ impl RustPlanGateEngine {
         } else {
             db_filled
         };
+        if preserve_higher_reservation {
+            item.filled_qty = next_reserved;
+        }
         guard.reserved_qty_by_symbol.insert(sym.clone(), next_reserved);
         guard.items_by_symbol.insert(sym, item);
     }
@@ -157,12 +160,21 @@ impl RustPlanGateEngine {
         }
 
         if guard.backend_unavailable {
+            let reason = format!(
+                "BACKEND_UNAVAILABLE: {}",
+                guard.backend_unavailable_reason
+            );
+            Self::enqueue_denied_mutation(
+                &mut guard,
+                request,
+                &reason,
+                "CRITICAL",
+                item_id_opt.as_deref(),
+                plan_id_opt.as_deref(),
+            );
             return RustPlanGateDecision {
                 allowed: false,
-                reason: Some(format!(
-                    "BACKEND_UNAVAILABLE: {}",
-                    guard.backend_unavailable_reason
-                )),
+                reason: Some(reason),
                 is_exit_bypass: false,
                 derived_limit_price: None,
                 item_id: item_id_opt,
@@ -449,9 +461,213 @@ impl RustPlanGateEngine {
             None
         } else if request.collar_market_order {
             Some(worst_limit_px.to_string())
+        } else if request.order_type.to_ascii_uppercase().contains("MARKET") {
+            let reason = "UNCOLLARED_MARKET_ENTRY_DENIED: uncollared MARKET entry orders are prohibited; enable collar_market_orders or submit a collared LIMIT order".to_string();
+            Self::enqueue_denied_mutation(
+                &mut guard,
+                request,
+                &reason,
+                "WARN",
+                Some(&plan_item.item_id),
+                Some(&plan_item.plan_id),
+            );
+            return RustPlanGateDecision {
+                allowed: false,
+                reason: Some(reason),
+                is_exit_bypass: false,
+                derived_limit_price: None,
+                item_id: Some(plan_item.item_id),
+                plan_id: Some(plan_item.plan_id),
+                new_reserved_qty: None,
+                added_notional_usd: None,
+            };
         } else {
             None
         };
+
+        let entry_ref_price = if ref_price > Decimal::ZERO {
+            ref_price
+        } else {
+            request
+                .limit_price
+                .filter(|px| *px > Decimal::ZERO)
+                .unwrap_or(Decimal::ZERO)
+        };
+
+        if let Some(stop_px) = request.stop_loss_price {
+            if stop_px <= Decimal::ZERO {
+                let reason = format!(
+                    "INVALID_STOP_LOSS_PRICE: stop_loss_price ({stop_px}) must be > 0"
+                );
+                Self::enqueue_denied_mutation(
+                    &mut guard,
+                    request,
+                    &reason,
+                    "WARN",
+                    Some(&plan_item.item_id),
+                    Some(&plan_item.plan_id),
+                );
+                return RustPlanGateDecision {
+                    allowed: false,
+                    reason: Some(reason),
+                    is_exit_bypass: false,
+                    derived_limit_price: None,
+                    item_id: Some(plan_item.item_id),
+                    plan_id: Some(plan_item.plan_id),
+                    new_reserved_qty: None,
+                    added_notional_usd: None,
+                };
+            }
+            if plan_item.side.eq_ignore_ascii_case("LONG") {
+                if stop_px >= entry_ref_price {
+                    let reason = format!(
+                        "INVALID_STOP_LOSS_PRICE: LONG stop_loss_price ({stop_px}) must be < entry_ref_price ({entry_ref_price})"
+                    );
+                    Self::enqueue_denied_mutation(
+                        &mut guard,
+                        request,
+                        &reason,
+                        "WARN",
+                        Some(&plan_item.item_id),
+                        Some(&plan_item.plan_id),
+                    );
+                    return RustPlanGateDecision {
+                        allowed: false,
+                        reason: Some(reason),
+                        is_exit_bypass: false,
+                        derived_limit_price: None,
+                        item_id: Some(plan_item.item_id),
+                        plan_id: Some(plan_item.plan_id),
+                        new_reserved_qty: None,
+                        added_notional_usd: None,
+                    };
+                }
+                if plan_item.initial_stop_price > Decimal::ZERO
+                    && stop_px < plan_item.initial_stop_price
+                {
+                    let reason = format!(
+                        "STOP_LOSS_FLOOR_VIOLATION (STOP_LOSS_BELOW_PLAN_FLOOR): LONG stop_loss_price ({stop_px}) < initial_stop_price ({})",
+                        plan_item.initial_stop_price
+                    );
+                    Self::enqueue_denied_mutation(
+                        &mut guard,
+                        request,
+                        &reason,
+                        "WARN",
+                        Some(&plan_item.item_id),
+                        Some(&plan_item.plan_id),
+                    );
+                    return RustPlanGateDecision {
+                        allowed: false,
+                        reason: Some(reason),
+                        is_exit_bypass: false,
+                        derived_limit_price: None,
+                        item_id: Some(plan_item.item_id),
+                        plan_id: Some(plan_item.plan_id),
+                        new_reserved_qty: None,
+                        added_notional_usd: None,
+                    };
+                }
+            } else {
+                if stop_px <= entry_ref_price {
+                    let reason = format!(
+                        "INVALID_STOP_LOSS_PRICE: SHORT stop_loss_price ({stop_px}) must be > entry_ref_price ({entry_ref_price})"
+                    );
+                    Self::enqueue_denied_mutation(
+                        &mut guard,
+                        request,
+                        &reason,
+                        "WARN",
+                        Some(&plan_item.item_id),
+                        Some(&plan_item.plan_id),
+                    );
+                    return RustPlanGateDecision {
+                        allowed: false,
+                        reason: Some(reason),
+                        is_exit_bypass: false,
+                        derived_limit_price: None,
+                        item_id: Some(plan_item.item_id),
+                        plan_id: Some(plan_item.plan_id),
+                        new_reserved_qty: None,
+                        added_notional_usd: None,
+                    };
+                }
+                if plan_item.initial_stop_price > Decimal::ZERO
+                    && stop_px > plan_item.initial_stop_price
+                {
+                    let reason = format!(
+                        "STOP_LOSS_FLOOR_VIOLATION (STOP_LOSS_ABOVE_PLAN_CEILING): SHORT stop_loss_price ({stop_px}) > initial_stop_price ({})",
+                        plan_item.initial_stop_price
+                    );
+                    Self::enqueue_denied_mutation(
+                        &mut guard,
+                        request,
+                        &reason,
+                        "WARN",
+                        Some(&plan_item.item_id),
+                        Some(&plan_item.plan_id),
+                    );
+                    return RustPlanGateDecision {
+                        allowed: false,
+                        reason: Some(reason),
+                        is_exit_bypass: false,
+                        derived_limit_price: None,
+                        item_id: Some(plan_item.item_id),
+                        plan_id: Some(plan_item.plan_id),
+                        new_reserved_qty: None,
+                        added_notional_usd: None,
+                    };
+                }
+            }
+        }
+
+        let effective_stop_px = request.stop_loss_price.or_else(|| {
+            if plan_item.initial_stop_price > Decimal::ZERO {
+                Some(plan_item.initial_stop_price)
+            } else {
+                None
+            }
+        });
+        let collar_allowance = (worst_limit_px - ref_price).abs() + Decimal::new(1, 2);
+        let budget_ref_price = if implied_plan_ref_price > Decimal::ZERO
+            && entry_ref_price > Decimal::ZERO
+            && (implied_plan_ref_price - entry_ref_price).abs() <= collar_allowance
+        {
+            implied_plan_ref_price
+        } else if entry_ref_price > Decimal::ZERO {
+            entry_ref_price
+        } else {
+            implied_plan_ref_price
+        };
+        if let Some(stop_px) = effective_stop_px
+            && plan_item.max_risk_budget_usd > Decimal::ZERO
+        {
+            let trade_risk_usd = (budget_ref_price - stop_px).abs() * request.quantity;
+            if trade_risk_usd > plan_item.max_risk_budget_usd {
+                let reason = format!(
+                    "RISK_BUDGET_EXCEEDED: single-trade risk (|{budget_ref_price} - {stop_px}| * {} = {trade_risk_usd}) exceeds max_risk_budget_usd ({})",
+                    request.quantity, plan_item.max_risk_budget_usd
+                );
+                Self::enqueue_denied_mutation(
+                    &mut guard,
+                    request,
+                    &reason,
+                    "WARN",
+                    Some(&plan_item.item_id),
+                    Some(&plan_item.plan_id),
+                );
+                return RustPlanGateDecision {
+                    allowed: false,
+                    reason: Some(reason),
+                    is_exit_bypass: false,
+                    derived_limit_price: None,
+                    item_id: Some(plan_item.item_id),
+                    plan_id: Some(plan_item.plan_id),
+                    new_reserved_qty: None,
+                    added_notional_usd: None,
+                };
+            }
+        }
 
         // Atomically reserve capacity and transition ARMED -> TRIGGERED in O(1) memory
         guard
@@ -584,6 +800,8 @@ mod tests {
             valid_until_iso: "2033-05-18T03:33:20+00:00".to_string(),
             limit_collar_pct: dec!(1.0),
             limit_collar_atr: dec!(0.5),
+            initial_stop_price: dec!(95.00),
+            max_risk_budget_usd: dec!(500.00),
         }
     }
 
@@ -603,10 +821,11 @@ mod tests {
             limit_price: Some(dec!(100.50)),
             reference_price: Some(dec!(100.00)),
             atr: Some(dec!(2.0)),
-            collar_market_order: false,
+            collar_market_order: true,
             is_exit_intent: false,
             cache_open_entry_qty: dec!(0),
             cache_filled_entry_qty: dec!(0),
+            stop_loss_price: Some(dec!(96.00)),
         }
     }
 

@@ -105,12 +105,14 @@ pub fn parse_trade_update_payload(
     order_report.ts_last = ts_event;
 
     order_report.order_status = match payload.event {
-        AlpacaTradeEventKind::New => OrderStatus::Accepted,
+        AlpacaTradeEventKind::New
+        | AlpacaTradeEventKind::Calculated
+        | AlpacaTradeEventKind::Stopped => OrderStatus::Accepted,
         AlpacaTradeEventKind::Fill => OrderStatus::Filled,
         AlpacaTradeEventKind::PartialFill => OrderStatus::PartiallyFilled,
         AlpacaTradeEventKind::Canceled | AlpacaTradeEventKind::DoneForDay => OrderStatus::Canceled,
         AlpacaTradeEventKind::Expired => OrderStatus::Expired,
-        AlpacaTradeEventKind::Rejected => OrderStatus::Rejected,
+        AlpacaTradeEventKind::Rejected | AlpacaTradeEventKind::Suspended => OrderStatus::Rejected,
         AlpacaTradeEventKind::Replaced => OrderStatus::Accepted,
         AlpacaTradeEventKind::PendingNew => OrderStatus::Submitted,
         AlpacaTradeEventKind::PendingCancel => OrderStatus::PendingCancel,
@@ -159,7 +161,9 @@ pub fn parse_trade_update_payload(
         let raw_px = payload
             .price
             .filter(|p| *p > Decimal::ZERO)
-            .or(payload.order.filled_avg_price)
+            .or_else(|| payload.order.filled_avg_price.filter(|p| *p > Decimal::ZERO))
+            .or_else(|| payload.order.limit_price.filter(|p| *p > Decimal::ZERO))
+            .or_else(|| payload.order.stop_price.filter(|p| *p > Decimal::ZERO))
             .ok_or_else(|| {
                 AlpacaError::Parse(format!(
                     "trade_update {:?} for order {} missing positive fill price",
@@ -170,14 +174,19 @@ pub fn parse_trade_update_payload(
         let fill_qty = decimal_to_quantity(raw_qty, size_precision)?;
         let fill_px = decimal_to_price(raw_px, price_precision)?;
 
-        let exec_id_str = payload
+        let exec_trade_id = match payload
             .execution_id
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .map(ToString::to_string)
-            .unwrap_or_else(|| format!("{venue_order_id}-{}", ts_event.as_u64()));
-        let t_id = parse_alpaca_trade_id("", &exec_id_str)?;
+        {
+            Some(exec_id) => Some(parse_alpaca_trade_id("", exec_id)?),
+            None => None,
+        };
+        let report_trade_id = match exec_trade_id {
+            Some(tid) => tid,
+            None => parse_alpaca_trade_id("", &format!("{venue_order_id}-{}", ts_event.as_u64()))?,
+        };
 
         let liquidity_side = match order_type {
             OrderType::Limit => LiquiditySide::Maker,
@@ -188,7 +197,7 @@ pub fn parse_trade_update_payload(
             account_id,
             instrument_id,
             venue_order_id,
-            t_id,
+            report_trade_id,
             order_side,
             fill_qty,
             fill_px,
@@ -202,7 +211,7 @@ pub fn parse_trade_update_payload(
         );
         report.avg_px = avg_px;
 
-        (Some(fill_qty), Some(fill_px), Some(t_id), Some(report))
+        (Some(fill_qty), Some(fill_px), exec_trade_id, Some(report))
     } else {
         let opt_qty = match payload.qty {
             Some(q) if q > Decimal::ZERO => Some(decimal_to_quantity(q, size_precision)?),

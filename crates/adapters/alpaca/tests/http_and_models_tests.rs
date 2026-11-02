@@ -29,8 +29,8 @@ use std::sync::{
 use nautilus_alpaca::{
     ALPACA_LIVE_HTTP_URL, ALPACA_PAPER_HTTP_URL, ALPACA_VENUE, AlpacaConfig, AlpacaCredential,
     AlpacaEnvironment, AlpacaError, AlpacaHttpClient, AlpacaOrderClass, AlpacaOrderSide,
-    AlpacaOrderType, AlpacaTimeInForce,
-    common::{HEADER_APCA_API_KEY_ID, HEADER_APCA_API_SECRET_KEY},
+    AlpacaOrderStatus, AlpacaOrderType, AlpacaTimeInForce,
+    common::{HEADER_APCA_API_KEY_ID, HEADER_APCA_API_SECRET_KEY, enums::parse_alpaca_order_status},
     http::{
         AlpacaAccountResponse, AlpacaAssetResponse, AlpacaOrderRequest, AlpacaOrderResponse,
         AlpacaPositionResponse, AlpacaReplaceOrderRequest, AlpacaStopLossSpec,
@@ -726,6 +726,355 @@ async fn test_http_client_does_not_retry_deterministic_422_or_403_rejects() {
         2,
         "403 business rejection must fail closed on first attempt without retrying"
     );
+
+    server_handle.await.unwrap();
+}
+
+// =================================================================================================
+// 4. Ticket 04 (P0-EXEC-05, P1-EXEC-08): Stopped Status, Idempotent Submit & Cursor Pagination
+// =================================================================================================
+
+#[test]
+fn test_alpaca_order_status_stopped_maps_to_accepted_and_is_open() {
+    let status: AlpacaOrderStatus = "stopped".parse().expect("parse stopped status");
+    assert_eq!(status, AlpacaOrderStatus::Stopped);
+    assert!(
+        status.is_open(),
+        "AlpacaOrderStatus::Stopped is an active specialist price-guaranteed order and must be open"
+    );
+    assert_eq!(status.to_order_status(), OrderStatus::Accepted);
+    assert_eq!(OrderStatus::from(status), OrderStatus::Accepted);
+    assert_eq!(
+        parse_alpaca_order_status("stopped").expect("parse_alpaca_order_status stopped"),
+        OrderStatus::Accepted
+    );
+
+    let ts_init = UnixNanos::from(1_700_000_000_000_000_000u64);
+    let raw_stopped_order = r#"{
+        "id": "ord-stopped-01",
+        "client_order_id": "CID-STOPPED-01",
+        "created_at": "2026-03-31T14:00:00Z",
+        "submitted_at": "2026-03-31T14:00:00.100Z",
+        "symbol": "AAPL",
+        "asset_class": "us_equity",
+        "qty": "50",
+        "filled_qty": "0",
+        "order_class": "simple",
+        "type": "stop",
+        "side": "sell",
+        "time_in_force": "gtc",
+        "stop_price": "195.00",
+        "status": "stopped"
+    }"#;
+    let dto: AlpacaOrderResponse = serde_json::from_str(raw_stopped_order).unwrap();
+    let report = parse_order_status_report(
+        &dto,
+        AccountId::from("ALPACA-PA31415926"),
+        ALPACA_VENUE,
+        ts_init,
+    )
+    .expect("parse stopped order status report");
+    assert_eq!(
+        report.order_status,
+        OrderStatus::Accepted,
+        "Alpaca stopped status must never map to OrderStatus::Canceled"
+    );
+}
+
+#[tokio::test]
+async fn test_http_submit_order_idempotent_recovery_via_get_order_by_client_id() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{addr}");
+
+    let post_count = Arc::new(AtomicUsize::new(0));
+    let probe_count = Arc::new(AtomicUsize::new(0));
+    let post_srv = Arc::clone(&post_count);
+    let probe_srv = Arc::clone(&probe_count);
+
+    let server_handle = tokio::spawn(async move {
+        // Case 1: POST /v2/orders returns 500 Internal Server Error, but order actually landed on Alpaca.
+        // Client must probe GET /v2/orders:by_client_order_id?client_order_id=CID-IDEMP-500 and recover
+        // without issuing a duplicate POST!
+        let (mut s1, _) = listener.accept().await.unwrap();
+        let req1 = read_http_request(&mut s1).await;
+        assert!(req1.starts_with("POST /v2/orders HTTP/1.1"));
+        post_srv.fetch_add(1, Ordering::SeqCst);
+        write_http_response(
+            &mut s1,
+            "500 Internal Server Error",
+            r#"{"message":"upstream gateway timeout after order commit"}"#,
+        )
+        .await;
+
+        let (mut s2, _) = listener.accept().await.unwrap();
+        let req2 = read_http_request(&mut s2).await;
+        assert!(req2.starts_with(
+            "GET /v2/orders:by_client_order_id?client_order_id=CID-IDEMP-500 HTTP/1.1"
+        ));
+        probe_srv.fetch_add(1, Ordering::SeqCst);
+        write_http_response(
+            &mut s2,
+            "200 OK",
+            r#"{"id":"VEN-IDEMP-500","client_order_id":"CID-IDEMP-500","created_at":"2026-03-31T14:10:00Z","submitted_at":"2026-03-31T14:10:00.050Z","symbol":"AAPL","qty":"100","filled_qty":"0","order_class":"simple","type":"limit","side":"buy","time_in_force":"day","limit_price":"200.00","status":"accepted"}"#,
+        )
+        .await;
+
+        // Case 2: POST /v2/orders returns 422 "client_order_id already exists".
+        // Client must probe GET /v2/orders:by_client_order_id?client_order_id=CID-IDEMP-422 and recover!
+        let (mut s3, _) = listener.accept().await.unwrap();
+        let req3 = read_http_request(&mut s3).await;
+        assert!(req3.starts_with("POST /v2/orders HTTP/1.1"));
+        post_srv.fetch_add(1, Ordering::SeqCst);
+        write_http_response(
+            &mut s3,
+            "422 Unprocessable Entity",
+            r#"{"code":42210000,"message":"client_order_id already exists"}"#,
+        )
+        .await;
+
+        let (mut s4, _) = listener.accept().await.unwrap();
+        let req4 = read_http_request(&mut s4).await;
+        assert!(req4.starts_with(
+            "GET /v2/orders:by_client_order_id?client_order_id=CID-IDEMP-422 HTTP/1.1"
+        ));
+        probe_srv.fetch_add(1, Ordering::SeqCst);
+        write_http_response(
+            &mut s4,
+            "200 OK",
+            r#"{"id":"VEN-IDEMP-422","client_order_id":"CID-IDEMP-422","created_at":"2026-03-31T14:11:00Z","submitted_at":"2026-03-31T14:11:00.050Z","filled_at":"2026-03-31T14:11:00.200Z","symbol":"NVDA","qty":"50","filled_qty":"50","filled_avg_price":"135.25","order_class":"simple","type":"market","side":"buy","time_in_force":"day","status":"filled"}"#,
+        )
+        .await;
+    });
+
+    let client = build_test_client(&base_url, 2);
+
+    let req_500 = AlpacaOrderRequest {
+        symbol: "AAPL".to_string(),
+        qty: dec!(100),
+        side: AlpacaOrderSide::Buy,
+        order_type: AlpacaOrderType::Limit,
+        time_in_force: AlpacaTimeInForce::Day,
+        limit_price: Some(dec!(200.00)),
+        stop_price: None,
+        trail_price: None,
+        trail_percent: None,
+        extended_hours: false,
+        client_order_id: "CID-IDEMP-500".to_string(),
+        order_class: Some(AlpacaOrderClass::Simple),
+        take_profit: None,
+        stop_loss: None,
+    };
+    let recovered_500 = client
+        .submit_order(&req_500)
+        .await
+        .expect("submit_order must recover order via get_order_by_client_id after 500");
+    assert_eq!(recovered_500.id, "VEN-IDEMP-500");
+    assert_eq!(recovered_500.client_order_id, "CID-IDEMP-500");
+    assert_eq!(recovered_500.status, "accepted");
+    assert_eq!(
+        post_count.load(Ordering::SeqCst),
+        1,
+        "must not blindly issue duplicate POST when get_order_by_client_id finds the order"
+    );
+    assert_eq!(probe_count.load(Ordering::SeqCst), 1);
+
+    let req_422 = AlpacaOrderRequest {
+        symbol: "NVDA".to_string(),
+        qty: dec!(50),
+        side: AlpacaOrderSide::Buy,
+        order_type: AlpacaOrderType::Market,
+        time_in_force: AlpacaTimeInForce::Day,
+        limit_price: None,
+        stop_price: None,
+        trail_price: None,
+        trail_percent: None,
+        extended_hours: false,
+        client_order_id: "CID-IDEMP-422".to_string(),
+        order_class: Some(AlpacaOrderClass::Simple),
+        take_profit: None,
+        stop_loss: None,
+    };
+    let recovered_422 = client
+        .submit_order(&req_422)
+        .await
+        .expect("submit_order must recover order via get_order_by_client_id after duplicate 422");
+    assert_eq!(recovered_422.id, "VEN-IDEMP-422");
+    assert_eq!(recovered_422.client_order_id, "CID-IDEMP-422");
+    assert_eq!(recovered_422.status, "filled");
+    assert_eq!(recovered_422.filled_qty, dec!(50));
+    assert_eq!(post_count.load(Ordering::SeqCst), 2);
+    assert_eq!(probe_count.load(Ordering::SeqCst), 2);
+
+    server_handle.await.unwrap();
+}
+
+#[tokio::test]
+async fn test_http_list_orders_paginated_and_list_open_orders_cursor_pagination() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let base_url = format!("http://{addr}");
+
+    let server_handle = tokio::spawn(async move {
+        // Part A: `list_orders_paginated` with `page_limit = 3` across 3 pages (descending `created_at`)
+        // Page 1: returns 3 orders (ORD-P1-1, ORD-P1-2, ORD-P1-3)
+        let (mut s1, _) = listener.accept().await.unwrap();
+        let req1 = read_http_request(&mut s1).await;
+        assert!(
+            req1.starts_with("GET /v2/orders?status=all&limit=3 HTTP/1.1"),
+            "unexpected page 1 request: {req1}"
+        );
+        write_http_response(
+            &mut s1,
+            "200 OK",
+            r#"[
+                {"id":"ORD-P1-1","client_order_id":"CID-P1-1","created_at":"2026-03-31T15:00:05Z","symbol":"AAPL","qty":"10","filled_qty":"10","type":"market","side":"buy","time_in_force":"day","status":"filled"},
+                {"id":"ORD-P1-2","client_order_id":"CID-P1-2","created_at":"2026-03-31T15:00:04Z","symbol":"AAPL","qty":"10","filled_qty":"10","type":"market","side":"buy","time_in_force":"day","status":"filled"},
+                {"id":"ORD-P1-3","client_order_id":"CID-P1-3","created_at":"2026-03-31T15:00:03Z","symbol":"AAPL","qty":"10","filled_qty":"10","type":"market","side":"buy","time_in_force":"day","status":"filled"}
+            ]"#,
+        )
+        .await;
+
+        // Page 2: includes `until=` cursor and returns 3 orders (1 boundary duplicate ORD-P1-3 + 2 new ORD-P2-1, ORD-P2-2)
+        let (mut s2, _) = listener.accept().await.unwrap();
+        let req2 = read_http_request(&mut s2).await;
+        assert!(
+            req2.starts_with("GET /v2/orders?status=all&limit=3&until="),
+            "expected until cursor on page 2: {req2}"
+        );
+        write_http_response(
+            &mut s2,
+            "200 OK",
+            r#"[
+                {"id":"ORD-P1-3","client_order_id":"CID-P1-3","created_at":"2026-03-31T15:00:03Z","symbol":"AAPL","qty":"10","filled_qty":"10","type":"market","side":"buy","time_in_force":"day","status":"filled"},
+                {"id":"ORD-P2-1","client_order_id":"CID-P2-1","created_at":"2026-03-31T15:00:02Z","symbol":"NVDA","qty":"20","filled_qty":"20","type":"market","side":"buy","time_in_force":"day","status":"filled"},
+                {"id":"ORD-P2-2","client_order_id":"CID-P2-2","created_at":"2026-03-31T15:00:01Z","symbol":"NVDA","qty":"20","filled_qty":"20","type":"market","side":"buy","time_in_force":"day","status":"filled"}
+            ]"#,
+        )
+        .await;
+
+        // Page 3: returns < 3 orders (1 boundary duplicate ORD-P2-2 + 1 final order ORD-P3-1), terminating pagination
+        let (mut s3, _) = listener.accept().await.unwrap();
+        let req3 = read_http_request(&mut s3).await;
+        assert!(
+            req3.starts_with("GET /v2/orders?status=all&limit=3&until="),
+            "expected until cursor on page 3: {req3}"
+        );
+        write_http_response(
+            &mut s3,
+            "200 OK",
+            r#"[
+                {"id":"ORD-P2-2","client_order_id":"CID-P2-2","created_at":"2026-03-31T15:00:01Z","symbol":"NVDA","qty":"20","filled_qty":"20","type":"market","side":"buy","time_in_force":"day","status":"filled"},
+                {"id":"ORD-P3-1","client_order_id":"CID-P3-1","created_at":"2026-03-31T15:00:00Z","symbol":"MSFT","qty":"15","filled_qty":"15","type":"market","side":"buy","time_in_force":"day","status":"filled"}
+            ]"#,
+        )
+        .await;
+
+        // Part B: `list_open_orders` when first page has 500 open orders
+        // Initial request: GET /v2/orders?status=open&limit=500 -> returns 500 open orders
+        let (mut s4, _) = listener.accept().await.unwrap();
+        let req4 = read_http_request(&mut s4).await;
+        assert!(
+            req4.starts_with("GET /v2/orders?status=open&limit=500 HTTP/1.1"),
+            "unexpected initial list_open_orders request: {req4}"
+        );
+        let mut first_500 = Vec::with_capacity(500);
+        for idx in 0..500 {
+            let min = 59 - (idx / 10);
+            let sec = 59 - (idx % 10);
+            first_500.push(serde_json::json!({
+                "id": format!("OPEN-ORD-{idx:03}"),
+                "client_order_id": format!("CID-OPEN-{idx:03}"),
+                "created_at": format!("2026-03-31T14:{min:02}:{sec:02}Z"),
+                "symbol": "AAPL",
+                "qty": "10",
+                "filled_qty": "0",
+                "type": "limit",
+                "side": "buy",
+                "time_in_force": "day",
+                "limit_price": "200.00",
+                "status": "accepted"
+            }));
+        }
+        write_http_response(&mut s4, "200 OK", &serde_json::to_string(&first_500).unwrap()).await;
+
+        // Follow-up paginated request: GET /v2/orders?status=open&limit=500&until=...
+        // Returns 1 boundary duplicate (OPEN-ORD-499) + 12 additional open orders (OPEN-ORD-500..511)
+        let (mut s5, _) = listener.accept().await.unwrap();
+        let req5 = read_http_request(&mut s5).await;
+        assert!(
+            req5.starts_with("GET /v2/orders?status=open&limit=500&until="),
+            "expected paginated follow-up with limit=500 and until cursor: {req5}"
+        );
+        let mut second_page = Vec::with_capacity(13);
+        second_page.push(serde_json::json!({
+            "id": "OPEN-ORD-499",
+            "client_order_id": "CID-OPEN-499",
+            "created_at": "2026-03-31T14:10:50Z",
+            "symbol": "AAPL",
+            "qty": "10",
+            "filled_qty": "0",
+            "type": "limit",
+            "side": "buy",
+            "time_in_force": "day",
+            "limit_price": "200.00",
+            "status": "accepted"
+        }));
+        for idx in 500..512 {
+            let sec = 512 - idx;
+            second_page.push(serde_json::json!({
+                "id": format!("OPEN-ORD-{idx:03}"),
+                "client_order_id": format!("CID-OPEN-{idx:03}"),
+                "created_at": format!("2026-03-31T14:09:{sec:02}Z"),
+                "symbol": "NVDA",
+                "qty": "5",
+                "filled_qty": "0",
+                "type": "limit",
+                "side": "buy",
+                "time_in_force": "day",
+                "limit_price": "130.00",
+                "status": "new"
+            }));
+        }
+        write_http_response(
+            &mut s5,
+            "200 OK",
+            &serde_json::to_string(&second_page).unwrap(),
+        )
+        .await;
+    });
+
+    let client = build_test_client(&base_url, 1);
+
+    let paginated = client
+        .list_orders_paginated(Some("all"), None, None, 3)
+        .await
+        .expect("list_orders_paginated must succeed across 3 pages");
+    let ids: Vec<&str> = paginated.iter().map(|o| o.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        vec![
+            "ORD-P1-1",
+            "ORD-P1-2",
+            "ORD-P1-3",
+            "ORD-P2-1",
+            "ORD-P2-2",
+            "ORD-P3-1"
+        ],
+        "list_orders_paginated must return all 6 unique orders across pages without duplicates"
+    );
+
+    let open_orders = client
+        .list_open_orders()
+        .await
+        .expect("list_open_orders must paginate when first page has 500 orders");
+    assert_eq!(
+        open_orders.len(),
+        512,
+        "list_open_orders must return all 512 unique open orders across pages without truncation or duplicates"
+    );
+    assert_eq!(open_orders.first().unwrap().id, "OPEN-ORD-000");
+    assert_eq!(open_orders.last().unwrap().id, "OPEN-ORD-511");
 
     server_handle.await.unwrap();
 }

@@ -38,7 +38,7 @@ pub mod python;
 pub use common::{
     ALPACA_LIVE_HTTP_URL, ALPACA_LIVE_WS_URL, ALPACA_PAPER_HTTP_URL, ALPACA_PAPER_WS_URL,
     ALPACA_VENUE, AlpacaCredential, AlpacaEnvironment, AlpacaOrderClass, AlpacaOrderSide,
-    AlpacaOrderType, AlpacaTimeInForce,
+    AlpacaOrderStatus, AlpacaOrderType, AlpacaTimeInForce,
 };
 pub use config::{AlpacaConfig, AlpacaExecClientConfig};
 pub use error::{AlpacaError, AlpacaResult};

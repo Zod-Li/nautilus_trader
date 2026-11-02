@@ -1156,7 +1156,29 @@ impl SimulatedExchange {
             }
         }
 
-        if let Some(matching_engine) = self.matching_engines.get_mut(&bar.instrument_id()) {
+        let inst_id = bar.instrument_id();
+        let scope = SettlementScope::Data(Some(inst_id));
+        if self.has_pending_commands_for_scope(bar.ts_init, scope) {
+            let open_bar = Bar::new(
+                bar.bar_type,
+                bar.open,
+                bar.open,
+                bar.open,
+                bar.open,
+                bar.volume,
+                bar.ts_event,
+                bar.ts_init,
+            );
+            if let Some(matching_engine) = self.matching_engines.get_mut(&inst_id) {
+                matching_engine.process_bar(&open_bar);
+            }
+            self.process_for_scope(bar.ts_init, scope);
+            if let Some(matching_engine) = self.matching_engines.get_mut(&inst_id) {
+                matching_engine.iterate(bar.ts_init, AggressorSide::NoAggressor);
+            }
+        }
+
+        if let Some(matching_engine) = self.matching_engines.get_mut(&inst_id) {
             matching_engine.process_bar(&bar);
         } else {
             anyhow::bail!("Matching engine should be initialized");

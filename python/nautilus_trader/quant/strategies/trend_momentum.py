@@ -54,11 +54,19 @@ class TrendMomentumStrategy(BaseArchetypeStrategy):
     def momentum_scores(self) -> List[float]:
         return list(self._momentum_scores)
 
+    def reset_rolling_windows(self) -> None:
+        super().reset_rolling_windows()
+        self._momentum_scores.clear()
+        self._slope_diffs.clear()
+
     def on_bar(self, bar: Bar) -> None:
         if bar.bar_type != self._archetype_config.bar_type:
             return
 
-        self._record_primary_bar(bar)
+        if not self._record_primary_bar(bar):
+            return
+        if not self._in_warmup and self._check_and_execute_pending_thesis_exit(bar):
+            return
         n = len(self._closes)
         cfg = self._archetype_config
         if n < cfg.slow_window:
@@ -85,6 +93,9 @@ class TrendMomentumStrategy(BaseArchetypeStrategy):
         if len(self._momentum_scores) > max_keep:
             del self._momentum_scores[:-max_keep]
             del self._slope_diffs[:-max_keep]
+
+        if self._in_warmup:
+            return
 
         history_len = min(len(self._momentum_scores), cfg.lookback_window)
         if history_len < cfg.slow_window:
@@ -155,12 +166,18 @@ class TrendMomentumStrategy(BaseArchetypeStrategy):
                 self._peak_favorable_price = None
             return
 
-        if n < cfg.lookback_window or self._has_inflight_or_open_entry_order():
+        if (
+            self._exit_only_mode
+            or n < cfg.lookback_window
+            or self._has_inflight_or_open_entry_order()
+        ):
             return
 
         if cfg.plan_side == PlanSide.LONG:
             if mom_quantile >= entry_q and slope_quantile >= exit_q and slope_diff > 0.0:
-                stop_px = close_px - (atr_mult * atr)
+                stop_px = self._resolve_entry_stop_price(
+                    close_px, close_px - (atr_mult * atr)
+                )
                 self._trailing_stop_price = stop_px
                 self._peak_favorable_price = high_px
                 self._submit_plan_gated_entry(
@@ -175,7 +192,9 @@ class TrendMomentumStrategy(BaseArchetypeStrategy):
             short_mom_q = 1.0 - mom_quantile
             short_slope_q = 1.0 - slope_quantile
             if short_mom_q >= entry_q and short_slope_q >= exit_q and slope_diff < 0.0:
-                stop_px = close_px + (atr_mult * atr)
+                stop_px = self._resolve_entry_stop_price(
+                    close_px, close_px + (atr_mult * atr)
+                )
                 self._trailing_stop_price = stop_px
                 self._peak_favorable_price = low_px
                 self._submit_plan_gated_entry(

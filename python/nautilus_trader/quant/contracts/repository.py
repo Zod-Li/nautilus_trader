@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import date
 from decimal import Decimal
 import json
-from typing import List, Optional, Sequence
+from typing import Any, Dict, List, Mapping, Optional, Sequence
 from uuid import UUID, uuid4
 
 import psycopg2
@@ -48,6 +49,8 @@ class PlanContractRepository:
         summary: str = "",
         plan_id: Optional[UUID] = None,
         actor: str = "system:epistemic-committee",
+        carry_over_decisions: Optional[Sequence[Mapping[str, Any]]] = None,
+        zero_item_reason_code: Optional[str] = None,
     ) -> UUID:
         """Validate all candidate `PlanItemContract` items against `config/risk_envelope.json` and
         atomically persist + lock the daily `TradingPlan` in a single PostgreSQL transaction.
@@ -85,6 +88,19 @@ class PlanContractRepository:
             )
 
         resolved_plan_id = plan_id or (items[0].plan_id if items else uuid4())
+        rebound_items: List[PlanItemContract] = list(items)
+        serialized_carry_over = [dict(c) for c in (carry_over_decisions or ())]
+        vetoed_carry_over_symbols: List[str] = []
+        for entry in serialized_carry_over:
+            sym = str(entry.get("symbol") or "").strip().upper()
+            dec_state = str(
+                entry.get("decision")
+                or entry.get("lifecycle_state")
+                or entry.get("action")
+                or ""
+            ).strip().upper()
+            if sym and dec_state == "THESIS_INVALIDATED_EXIT" and sym not in vetoed_carry_over_symbols:
+                vetoed_carry_over_symbols.append(sym)
 
         conn = psycopg2.connect(self._dsn, cursor_factory=RealDictCursor)
         try:
@@ -92,25 +108,97 @@ class PlanContractRepository:
                 with conn.cursor() as cur:
                     cur.execute(
                         """
-                        INSERT INTO trading_plans (
-                            plan_id, trading_date, market, status, config_version_id,
-                            capital_snapshot_id, candidate_pool, rejections, summary
-                        ) VALUES (
-                            %s, %s, %s, 'DRAFT', %s, %s, %s::jsonb, '[]'::jsonb, %s
-                        )
+                        SELECT plan_id, status
+                        FROM trading_plans
+                        WHERE trading_date = %s AND market = %s
+                        FOR UPDATE
                         """,
-                        (
-                            resolved_plan_id,
-                            trading_date,
-                            market,
-                            config_version_id,
-                            capital_snapshot_id,
-                            json.dumps([item.symbol for item in items]),
-                            summary,
-                        ),
+                        (trading_date, market),
                     )
+                    existing_plan = cur.fetchone()
+                    if existing_plan is not None:
+                        existing_id = UUID(str(existing_plan["plan_id"]))
+                        existing_status = str(existing_plan["status"] or "").strip().upper()
+                        if existing_status in ("LOCKED", "CLOSED") and not items:
+                            return existing_id
+                        if existing_status == "DRAFT":
+                            if plan_id is None or (items and items[0].plan_id == resolved_plan_id):
+                                resolved_plan_id = existing_id
+                                rebound_items = [
+                                    replace(it, plan_id=resolved_plan_id)
+                                    if it.plan_id != resolved_plan_id
+                                    else it
+                                    for it in items
+                                ]
+                            cur.execute(
+                                "DELETE FROM trading_plan_items WHERE plan_id = %s",
+                                (existing_id,),
+                            )
+                            cur.execute(
+                                """
+                                UPDATE trading_plans
+                                SET plan_id = %s,
+                                    config_version_id = %s,
+                                    capital_snapshot_id = %s,
+                                    candidate_pool = %s::jsonb,
+                                    rejections = %s::jsonb,
+                                    summary = %s
+                                WHERE plan_id = %s
+                                """,
+                                (
+                                    resolved_plan_id,
+                                    config_version_id,
+                                    capital_snapshot_id,
+                                    json.dumps([item.symbol for item in rebound_items]),
+                                    json.dumps(vetoed_carry_over_symbols),
+                                    summary,
+                                    existing_id,
+                                ),
+                            )
+                        else:
+                            cur.execute(
+                                """
+                                INSERT INTO trading_plans (
+                                    plan_id, trading_date, market, status, config_version_id,
+                                    capital_snapshot_id, candidate_pool, rejections, summary
+                                ) VALUES (
+                                    %s, %s, %s, 'DRAFT', %s, %s, %s::jsonb, %s::jsonb, %s
+                                )
+                                """,
+                                (
+                                    resolved_plan_id,
+                                    trading_date,
+                                    market,
+                                    config_version_id,
+                                    capital_snapshot_id,
+                                    json.dumps([item.symbol for item in rebound_items]),
+                                    json.dumps(vetoed_carry_over_symbols),
+                                    summary,
+                                ),
+                            )
+                    else:
+                        cur.execute(
+                            """
+                            INSERT INTO trading_plans (
+                                plan_id, trading_date, market, status, config_version_id,
+                                capital_snapshot_id, candidate_pool, rejections, summary
+                            ) VALUES (
+                                %s, %s, %s, 'DRAFT', %s, %s, %s::jsonb, %s::jsonb, %s
+                            )
+                            """,
+                            (
+                                resolved_plan_id,
+                                trading_date,
+                                market,
+                                config_version_id,
+                                capital_snapshot_id,
+                                json.dumps([item.symbol for item in rebound_items]),
+                                json.dumps(vetoed_carry_over_symbols),
+                                summary,
+                            ),
+                        )
 
-                    for item in items:
+                    for item in rebound_items:
                         if item.plan_id != resolved_plan_id:
                             raise PlanContractValidationError(
                                 f"Item {item.item_id} plan_id ({item.plan_id}) != resolved_plan_id ({resolved_plan_id})"
@@ -157,6 +245,19 @@ class PlanContractRepository:
                                 item.risk_envelope.approved_qty_cap,
                             ),
                         )
+                        cur.execute(
+                            """
+                            INSERT INTO trading_plan_tranches (
+                                item_id, tranche_index, weight, qty, trigger_atr, status, filled_qty
+                            ) VALUES (
+                                %s, 0, 1.0, %s, NULL, 'PENDING', 0
+                            )
+                            """,
+                            (
+                                item.item_id,
+                                item.risk_envelope.target_qty,
+                            ),
+                        )
 
                     cur.execute(
                         """
@@ -166,6 +267,18 @@ class PlanContractRepository:
                         """,
                         (resolved_plan_id,),
                     )
+
+                    event_payload: Dict[str, Any] = {
+                        "trading_date": trading_date.isoformat(),
+                        "market": market,
+                        "item_count": len(rebound_items),
+                        "carry_over_decisions": serialized_carry_over,
+                        "vetoed_symbols": vetoed_carry_over_symbols,
+                    }
+                    if not rebound_items:
+                        event_payload["zero_item_reason_code"] = (
+                            zero_item_reason_code or "ALL_CANDIDATES_VETOED"
+                        )
 
                     cur.execute(
                         """
@@ -179,32 +292,93 @@ class PlanContractRepository:
                             resolved_plan_id,
                             actor,
                             summary or "Isomorphic trading plan locked",
-                            json.dumps(
-                                {
-                                    "trading_date": trading_date.isoformat(),
-                                    "market": market,
-                                    "item_count": len(items),
-                                }
-                            ),
+                            json.dumps(event_payload),
                         ),
                     )
 
+                    notify_payload: Dict[str, Any] = {
+                        "plan_id": str(resolved_plan_id),
+                        "trading_date": trading_date.isoformat(),
+                        "market": market,
+                        "vetoed_symbols": vetoed_carry_over_symbols,
+                        "carry_over_decisions": [
+                            {
+                                "symbol": str(c.get("symbol") or ""),
+                                "decision": str(
+                                    c.get("decision")
+                                    or c.get("lifecycle_state")
+                                    or c.get("action")
+                                    or ""
+                                ),
+                            }
+                            for c in serialized_carry_over
+                        ],
+                    }
+                    if not rebound_items:
+                        notify_payload["zero_item_reason_code"] = (
+                            zero_item_reason_code or "ALL_CANDIDATES_VETOED"
+                        )
+
                     cur.execute(
                         "SELECT pg_notify('nautilus_plan_locked', %s)",
-                        (
-                            json.dumps(
-                                {
-                                    "plan_id": str(resolved_plan_id),
-                                    "trading_date": trading_date.isoformat(),
-                                    "market": market,
-                                }
-                            ),
-                        ),
+                        (json.dumps(notify_payload),),
                     )
         finally:
             conn.close()
 
         return resolved_plan_id
+
+    def load_latest_plan_lock_event_payload(
+        self,
+        trading_date: date,
+        market: str = "US_EQUITY",
+    ) -> Dict[str, Any]:
+        """Loads the latest `PLAN_LOCKED` event payload for `(trading_date, market)`."""
+        conn = psycopg2.connect(self._dsn, cursor_factory=RealDictCursor)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT e.payload, p.rejections
+                    FROM trading_plans p
+                    LEFT JOIN trading_plan_events e
+                      ON e.plan_id = p.plan_id AND e.event_type = 'PLAN_LOCKED'
+                    WHERE p.trading_date = %s AND p.market = %s
+                    ORDER BY e.ts DESC NULLS LAST, p.locked_at DESC NULLS LAST
+                    LIMIT 1
+                    """,
+                    (trading_date, market),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    return {}
+                raw_payload = row.get("payload")
+                if isinstance(raw_payload, str):
+                    try:
+                        parsed = json.loads(raw_payload)
+                    except Exception:
+                        parsed = {}
+                elif isinstance(raw_payload, Mapping):
+                    parsed = dict(raw_payload)
+                else:
+                    parsed = {}
+                raw_rej = row.get("rejections")
+                if isinstance(raw_rej, str):
+                    try:
+                        rej_list = json.loads(raw_rej)
+                    except Exception:
+                        rej_list = []
+                elif isinstance(raw_rej, list):
+                    rej_list = list(raw_rej)
+                else:
+                    rej_list = []
+                if rej_list and not parsed.get("vetoed_symbols"):
+                    parsed["vetoed_symbols"] = [
+                        str(s).strip().upper() for s in rej_list if str(s).strip()
+                    ]
+                return parsed
+        finally:
+            conn.close()
 
     def load_locked_plan_items(
         self,

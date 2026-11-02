@@ -46,7 +46,10 @@ use ustr::Ustr;
 
 use crate::{
     error::{DataInfraError, DataInfraResult},
-    mapping::{DataInfraTimeframe, parse_datainfra_bar_type, to_bar_type, to_instrument_id},
+    mapping::{
+        DataInfraTimeframe, parse_datainfra_bar_type, timeframe_step_ns, to_bar_type,
+        to_instrument_id,
+    },
 };
 
 /// Selects whether ClickHouse `v_quant_bars` decoding uses split/dividend-adjusted
@@ -255,14 +258,15 @@ pub fn decode_bars_batches(
                 to_bar_type(&symbol, &options.venue, options.default_timeframe)?
             };
 
-            let ts_event = extract_unix_nanos_at(ts_col, row, "ts_event")?;
+            let bar_open_ns = extract_unix_nanos_at(ts_col, row, "ts_event")?;
+            let ts_event = UnixNanos::from(
+                bar_open_ns
+                    .as_u64()
+                    .saturating_add(timeframe_step_ns(&bar_type)),
+            );
             let ts_init = if let Some(idx) = ts_init_idx {
                 let candidate = extract_unix_nanos_at(batch.column(idx), row, "ts_init")?;
-                if candidate < ts_event {
-                    ts_event
-                } else {
-                    candidate
-                }
+                ts_event.max(candidate)
             } else {
                 ts_event
             };
@@ -368,11 +372,7 @@ pub fn decode_quotes_batches(
             let ts_event = extract_unix_nanos_at(ts_col, row, "ts_event")?;
             let ts_init = if let Some(idx) = ts_init_idx {
                 let candidate = extract_unix_nanos_at(batch.column(idx), row, "ts_init")?;
-                if candidate < ts_event {
-                    ts_event
-                } else {
-                    candidate
-                }
+                ts_event.max(candidate)
             } else {
                 ts_event
             };
@@ -472,11 +472,7 @@ pub fn decode_statuses_batches(
             let ts_event = extract_unix_nanos_at(ts_col, row, "ts_event")?;
             let ts_init = if let Some(idx) = ts_init_idx {
                 let candidate = extract_unix_nanos_at(batch.column(idx), row, "ts_init")?;
-                if candidate < ts_event {
-                    ts_event
-                } else {
-                    candidate
-                }
+                ts_event.max(candidate)
             } else {
                 ts_event
             };

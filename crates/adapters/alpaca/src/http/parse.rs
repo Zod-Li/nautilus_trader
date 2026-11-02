@@ -23,14 +23,16 @@ use std::str::FromStr;
 use jiff::Timestamp;
 use nautilus_core::{UUID4, UnixNanos};
 use nautilus_model::{
-    enums::{AccountType, OrderSide, OrderType, PositionSide, TimeInForce, TriggerType},
+    enums::{
+        AccountType, LiquiditySide, OrderSide, OrderType, PositionSide, TimeInForce, TriggerType,
+    },
     events::AccountState,
     identifiers::{
         AccountId, ClientOrderId, InstrumentId, OrderListId, PositionId, Symbol, TradeId, Venue,
         VenueOrderId,
     },
     instruments::{Equity, InstrumentAny},
-    reports::{OrderStatusReport, PositionStatusReport},
+    reports::{FillReport, OrderStatusReport, PositionStatusReport},
     types::{AccountBalance, Currency, Money, Price, Quantity},
 };
 use rust_decimal::Decimal;
@@ -142,6 +144,44 @@ pub fn parse_alpaca_trade_id(prefix: &str, raw_id: &str) -> AlpacaResult<TradeId
             compact_candidate[..36].to_string()
         }
     };
+    TradeId::new_checked(&bounded)
+        .map_err(|e| AlpacaError::Parse(format!("invalid TradeId '{bounded}': {e}")))
+}
+
+/// Derives a deterministic [`TradeId`] (`<= 36` ASCII characters) for an order fill.
+///
+/// For the initial fill on `order_id` (`is_delta == false`), formats `"FILL-{order_id}"`
+/// via [`parse_alpaca_trade_id`]. For incremental delta reconciliation fills (`is_delta == true`),
+/// incorporates the normalized cumulative filled quantity so each cumulative fill level produces
+/// a unique, deterministic [`TradeId`].
+///
+/// # Errors
+///
+/// Returns [`AlpacaError::Parse`] if the resulting identifier is invalid.
+pub fn derive_deterministic_fill_trade_id(
+    order_id: &str,
+    cum_filled_qty: Decimal,
+    is_delta: bool,
+) -> AlpacaResult<TradeId> {
+    let trimmed = order_id.trim();
+    if !is_delta {
+        return parse_alpaca_trade_id("FILL-", trimmed);
+    }
+    let norm_qty = cum_filled_qty.normalize();
+    let suffix = format!("-{norm_qty}");
+    let candidate = format!("FILL-{trimmed}{suffix}");
+    if candidate.len() <= 36 {
+        return TradeId::new_checked(&candidate)
+            .map_err(|e| AlpacaError::Parse(format!("invalid TradeId '{candidate}': {e}")));
+    }
+    let compact_id: String = trimmed.chars().filter(|c| *c != '-').collect();
+    let max_id_len = 36usize.saturating_sub(2 + suffix.len());
+    let prefix_part = if compact_id.len() <= max_id_len {
+        &compact_id
+    } else {
+        &compact_id[..max_id_len]
+    };
+    let bounded = format!("F-{prefix_part}{suffix}");
     TradeId::new_checked(&bounded)
         .map_err(|e| AlpacaError::Parse(format!("invalid TradeId '{bounded}': {e}")))
 }
@@ -350,6 +390,116 @@ pub fn parse_order_status_report(
     }
 
     Ok(report)
+}
+
+/// Builds a [`FillReport`] from an [`AlpacaOrderResponse`] using its full `filled_qty` and `filled_avg_price`.
+///
+/// Delegates directly to [`build_fill_report_with_qty`].
+///
+/// # Errors
+///
+/// Returns [`AlpacaError::Parse`] if any identifier, timestamp, price, or quantity is invalid.
+pub fn build_fill_report(
+    order: &AlpacaOrderResponse,
+    account_id: AccountId,
+    instrument_id: InstrumentId,
+    price_precision: u8,
+    size_precision: u8,
+    ts_init: UnixNanos,
+) -> AlpacaResult<Option<FillReport>> {
+    build_fill_report_with_qty(
+        order,
+        account_id,
+        instrument_id,
+        price_precision,
+        size_precision,
+        ts_init,
+        order.filled_qty,
+        None,
+        None,
+    )
+}
+
+/// Builds a [`FillReport`] from an [`AlpacaOrderResponse`] with an explicit fill slice quantity,
+/// optional deterministic [`TradeId`] override, and optional implied slice [`Price`] override.
+///
+/// # Errors
+///
+/// Returns [`AlpacaError::Parse`] if any identifier, timestamp, price, or quantity is invalid.
+#[expect(clippy::too_many_arguments)]
+pub fn build_fill_report_with_qty(
+    order: &AlpacaOrderResponse,
+    account_id: AccountId,
+    instrument_id: InstrumentId,
+    price_precision: u8,
+    size_precision: u8,
+    ts_init: UnixNanos,
+    fill_qty_dec: Decimal,
+    trade_id_override: Option<TradeId>,
+    fill_px_override: Option<Price>,
+) -> AlpacaResult<Option<FillReport>> {
+    if fill_qty_dec <= Decimal::ZERO {
+        return Ok(None);
+    }
+    let Some(avg_px_dec) = order
+        .filled_avg_price
+        .filter(|p| *p > Decimal::ZERO)
+        .or_else(|| order.limit_price.filter(|p| *p > Decimal::ZERO))
+        .or_else(|| order.stop_price.filter(|p| *p > Decimal::ZERO))
+    else {
+        return Ok(None);
+    };
+
+    let venue_order_id = VenueOrderId::new_checked(order.id.trim())
+        .map_err(|e| AlpacaError::Parse(format!("invalid VenueOrderId '{}': {e}", order.id)))?;
+    let client_order_id = if order.client_order_id.trim().is_empty() {
+        None
+    } else {
+        ClientOrderId::new_checked(order.client_order_id.trim()).ok()
+    };
+
+    let ts_event_str = order
+        .filled_at
+        .as_deref()
+        .or(order.updated_at.as_deref())
+        .unwrap_or(&order.created_at);
+    let ts_event_ns = parse_rfc3339_to_unix_nanos(ts_event_str)?;
+
+    let last_qty = decimal_to_quantity(fill_qty_dec, size_precision)?;
+    let last_px = match fill_px_override {
+        Some(px) => px,
+        None => decimal_to_price(avg_px_dec, price_precision)?,
+    };
+    let commission = Money::from_decimal(Decimal::ZERO, Currency::USD())
+        .map_err(|e| AlpacaError::Parse(format!("invalid commission Money: {e}")))?;
+    let trade_id = match trade_id_override {
+        Some(tid) => tid,
+        None => derive_deterministic_fill_trade_id(order.id.trim(), order.filled_qty, false)?,
+    };
+    let liquidity_side = match OrderType::from(order.order_type) {
+        OrderType::Limit => LiquiditySide::Maker,
+        _ => LiquiditySide::Taker,
+    };
+
+    let mut report = FillReport::new(
+        account_id,
+        instrument_id,
+        venue_order_id,
+        trade_id,
+        OrderSide::from(order.side),
+        last_qty,
+        last_px,
+        commission,
+        liquidity_side,
+        client_order_id,
+        None,
+        ts_event_ns,
+        ts_init,
+        Some(UUID4::new()),
+    );
+    report.avg_px = Some(avg_px_dec);
+
+    Ok(Some(report))
 }
 
 /// Converts an [`AlpacaAssetResponse`] into a Nautilus [`InstrumentAny::Equity`].

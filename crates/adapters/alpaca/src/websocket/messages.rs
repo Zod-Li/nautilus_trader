@@ -129,6 +129,27 @@ pub enum AlpacaTradeEventKind {
     OrderReplaceRejected,
 }
 
+impl AlpacaTradeEventKind {
+    /// Returns `true` when this trade event kind represents an open/in-flight order state
+    /// (including [`Self::Stopped`]).
+    #[must_use]
+    pub const fn is_open(self) -> bool {
+        matches!(
+            self,
+            Self::New
+                | Self::PartialFill
+                | Self::Replaced
+                | Self::PendingNew
+                | Self::PendingCancel
+                | Self::PendingReplace
+                | Self::Stopped
+                | Self::Calculated
+                | Self::OrderCancelRejected
+                | Self::OrderReplaceRejected
+        )
+    }
+}
+
 /// Strongly typed `data` payload of a `stream = "trade_updates"` frame.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AlpacaTradeUpdatePayload {

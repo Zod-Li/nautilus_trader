@@ -37,6 +37,7 @@ pub mod data;
 pub mod error;
 pub mod factories;
 pub mod instrument;
+pub mod kafka;
 pub mod mapping;
 pub mod stream;
 
@@ -49,8 +50,8 @@ pub use arrow_decoder::{
     decode_quotes_batches, decode_statuses_arrow_stream, decode_statuses_batches,
 };
 pub use calendar::{
-    CalendarSessionGate, CalendarSessionStatus, CalendarTransport, DEFAULT_CALENDAR_MARKET,
-    HttpCalendarTransport,
+    CALENDAR_SESSION_STATUS_PATH, CALENDAR_SESSION_STATUS_V1_PATH, CalendarSessionGate,
+    CalendarSessionStatus, CalendarTransport, DEFAULT_CALENDAR_MARKET, HttpCalendarTransport,
 };
 pub use catalog::{DATAINFRA_CATALOG_FACTORY_NAME, DataInfraCatalog};
 pub use clickhouse::{
@@ -64,12 +65,18 @@ pub use error::{DataInfraError, DataInfraResult};
 pub use factories::{DataInfraDataClientConfig, DataInfraDataClientFactory};
 pub use instrument::DataInfraEquityMetadata;
 pub use mapping::{
-    DataInfraTimeframe, from_bar_type, from_instrument_id, parse_datainfra_bar_type, to_bar_type,
-    to_instrument_id,
+    DataInfraTimeframe, bar_type_step_ns, from_bar_type, from_instrument_id,
+    parse_datainfra_bar_type, timeframe_step_ns, to_bar_type, to_instrument_id,
+};
+pub use kafka::{
+    CanonicalWireFrame, DEFAULT_SIP_KAFKA_TOPICS, KafkaBrokerEnvelope, KafkaEnvelopePayload,
+    KafkaMarketStreamDecoder, KafkaPayloadFrame, KafkaPayloadSource, TcpKafkaPayloadSource,
+    parse_broker_wire_frame,
 };
 pub use stream::{
     BarStreamVersionTracker, CanonicalBarWire, CanonicalQuoteWire, CanonicalStreamDecoder,
-    CanonicalTradingStatusWire, DataInfraStreamEvent, KafkaStreamSessionCoordinator,
+    CanonicalTradingStatusWire, DEFAULT_DECODER_PRICE_PRECISION, DEFAULT_DECODER_SIZE_PRECISION,
+    DEFAULT_VERSION_TRACKER_CAPACITY, DataInfraStreamEvent, KafkaStreamSessionCoordinator,
     StreamDecodeOutcome, StreamLifecycleListener, TOPIC_SIP_BARS_1M, TOPIC_SIP_BARS_PREFIX,
     TOPIC_SIP_QUOTES, TOPIC_SIP_STATUSES, VersionEvaluation,
 };

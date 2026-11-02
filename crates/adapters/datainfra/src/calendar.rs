@@ -36,6 +36,10 @@ use crate::{
 
 /// Canonical market code queried by [`CalendarSessionGate`].
 pub const DEFAULT_CALENDAR_MARKET: &str = "US_EQUITY";
+/// Primary HTTP endpoint path for `calendar-service` session status queries.
+pub const CALENDAR_SESSION_STATUS_PATH: &str = "/api/v1/calendar/session-status";
+/// Alternate HTTP endpoint path when `calendar-service` is mounted directly at `/v1`.
+pub const CALENDAR_SESSION_STATUS_V1_PATH: &str = "/v1/calendar/session-status";
 
 /// Rich domain model representing the response from `calendar-service` (`/api/v1/calendar/session-status`
 /// or `/v1/calendar/session-status`).
@@ -123,7 +127,7 @@ impl CalendarSessionStatus {
         }
     }
 
-    /// Returns `true` if `ts_ns` falls within the inclusive RTH window `[rth_open_ns, rth_close_ns]`.
+    /// Returns `true` if bar-open `ts_ns` falls within the half-open RTH window `[rth_open_ns, rth_close_ns)`.
     #[must_use]
     pub fn contains_rth_timestamp_ns(&self, ts_ns: UnixNanos) -> bool {
         let Some(open_ns) = self.rth_open_ns() else {
@@ -132,7 +136,19 @@ impl CalendarSessionStatus {
         let Some(close_ns) = self.rth_close_ns() else {
             return false;
         };
-        ts_ns >= open_ns && ts_ns <= close_ns
+        ts_ns >= open_ns && ts_ns < close_ns
+    }
+
+    /// Returns `true` if a bar closing at `ts_close_ns` falls within `(rth_open_ns, rth_close_ns]`.
+    #[must_use]
+    pub fn contains_rth_bar_close_ns(&self, ts_close_ns: UnixNanos) -> bool {
+        let Some(open_ns) = self.rth_open_ns() else {
+            return false;
+        };
+        let Some(close_ns) = self.rth_close_ns() else {
+            return false;
+        };
+        ts_close_ns > open_ns && ts_close_ns <= close_ns
     }
 }
 
@@ -214,7 +230,10 @@ impl CalendarTransport for HttpCalendarTransport {
         market: &str,
         at_ts_utc: Option<i64>,
     ) -> DataInfraResult<CalendarSessionStatus> {
-        let candidate_paths = ["/v1/calendar/session-status"];
+        let candidate_paths = [
+            CALENDAR_SESSION_STATUS_PATH,
+            CALENDAR_SESSION_STATUS_V1_PATH,
+        ];
         let mut last_err: Option<DataInfraError> = None;
 
         for path in candidate_paths {

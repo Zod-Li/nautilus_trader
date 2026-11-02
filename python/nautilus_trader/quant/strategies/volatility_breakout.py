@@ -50,11 +50,18 @@ class VolatilityBreakoutStrategy(BaseArchetypeStrategy):
     def volume_expansion_ratios(self) -> List[float]:
         return list(self._vol_ratios)
 
+    def reset_rolling_windows(self) -> None:
+        super().reset_rolling_windows()
+        self._vol_ratios.clear()
+
     def on_bar(self, bar: Bar) -> None:
         if bar.bar_type != self._archetype_config.bar_type:
             return
 
-        self._record_primary_bar(bar)
+        if not self._record_primary_bar(bar):
+            return
+        if not self._in_warmup and self._check_and_execute_pending_thesis_exit(bar):
+            return
         n = len(self._closes)
         cfg = self._archetype_config
         if n < cfg.slow_window:
@@ -68,6 +75,9 @@ class VolatilityBreakoutStrategy(BaseArchetypeStrategy):
         max_keep = max(cfg.lookback_window * 3, 120)
         if len(self._vol_ratios) > max_keep:
             del self._vol_ratios[:-max_keep]
+
+        if self._in_warmup:
+            return
 
         atr = rolling_atr(self._highs, self._lows, self._closes, cfg.fast_window)
         if atr <= 0.0:
@@ -142,7 +152,11 @@ class VolatilityBreakoutStrategy(BaseArchetypeStrategy):
                 self._entry_reference_price = None
             return
 
-        if n < cfg.lookback_window or self._has_inflight_or_open_entry_order():
+        if (
+            self._exit_only_mode
+            or n < cfg.lookback_window
+            or self._has_inflight_or_open_entry_order()
+        ):
             return
 
         if cfg.plan_side == PlanSide.LONG:
@@ -150,7 +164,9 @@ class VolatilityBreakoutStrategy(BaseArchetypeStrategy):
                 (price_quantile >= entry_q or close_px >= upper_channel)
                 and vol_quantile >= exit_q
             ):
-                stop_px = close_px - (atr_mult * atr)
+                stop_px = self._resolve_entry_stop_price(
+                    close_px, close_px - (atr_mult * atr)
+                )
                 self._trailing_stop_price = stop_px
                 self._entry_reference_price = close_px
                 self._submit_plan_gated_entry(
@@ -166,7 +182,9 @@ class VolatilityBreakoutStrategy(BaseArchetypeStrategy):
                 ((1.0 - price_quantile) >= entry_q or close_px <= lower_channel)
                 and vol_quantile >= exit_q
             ):
-                stop_px = close_px + (atr_mult * atr)
+                stop_px = self._resolve_entry_stop_price(
+                    close_px, close_px + (atr_mult * atr)
+                )
                 self._trailing_stop_price = stop_px
                 self._entry_reference_price = close_px
                 self._submit_plan_gated_entry(

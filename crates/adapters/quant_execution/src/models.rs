@@ -32,6 +32,10 @@ pub struct RustPlanItemEnvelope {
     pub valid_until_iso: String,
     pub limit_collar_pct: Decimal,
     pub limit_collar_atr: Decimal,
+    #[serde(default)]
+    pub initial_stop_price: Decimal,
+    #[serde(default)]
+    pub max_risk_budget_usd: Decimal,
 }
 
 impl RustPlanItemEnvelope {
@@ -89,6 +93,8 @@ pub struct RustPlanGateOrderRequest {
     pub is_exit_intent: bool,
     pub cache_open_entry_qty: Decimal,
     pub cache_filled_entry_qty: Decimal,
+    #[serde(default)]
+    pub stop_loss_price: Option<Decimal>,
 }
 
 /// Authoritative pre-trade admission decision returned in $O(1)$ by `RustPlanGateEngine`.

@@ -17,26 +17,25 @@ import math
 import statistics
 import uuid
 from dataclasses import dataclass, field, replace
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Dict, List, Optional, Sequence, Tuple
-from uuid import UUID
-
-import psycopg2
 
 from nautilus_trader.quant.contracts.models import (
-    ArchetypeStrategyConfig,
-    MarketableLimitCollar,
     PlanItemContract,
-    PlanRiskEnvelope,
     PlanSide,
 )
-from nautilus_trader.quant.contracts.repository import PlanContractRepository
 from nautilus_trader.quant.governance.plan_gate import (
     PLAN_GATE_EXEC_ALGORITHM_ID,
     PlanGateExecAlgorithm,
     PlanGateExecAlgorithmConfig,
-    PostgresPlanGateBackend,
+    SnapshotPlanGateBackend,
+    build_stat_arb_secondary_plan_item,
+)
+from nautilus_trader.quant.governance.telemetry_actor import (
+    PostgresTelemetryActor,
+    PostgresTelemetryActorConfig,
+    ProtectiveOcoMonitor,
 )
 from nautilus_trader.quant.strategies.registry import (
     instantiate_strategy_from_contract,
@@ -48,6 +47,7 @@ from nautilus_trader.execution import (
     FillModel,
     MakerTakerFeeModel,
     OneTickSlippageFillModel,
+    StaticLatencyModel,
 )
 from nautilus_trader.model import (
     AccountType,
@@ -230,6 +230,104 @@ def _clone_bar_with_prices(
     )
 
 
+def _normalize_bars_for_parity(bars: Sequence[Bar]) -> List[Bar]:
+    normalized: List[Bar] = []
+    for b in bars:
+        b_close_ns = max(
+            int(getattr(b, "ts_init", 0) or 0),
+            int(getattr(b, "ts_event", 0) or 0),
+        )
+        if int(b.ts_event) != b_close_ns or int(b.ts_init) != b_close_ns:
+            normalized.append(
+                _clone_bar_with_prices(
+                    b,
+                    open_px=float(b.open),
+                    high_px=float(b.high),
+                    low_px=float(b.low),
+                    close_px=float(b.close),
+                    ts_event=b_close_ns,
+                    ts_init=b_close_ns,
+                )
+            )
+        else:
+            normalized.append(b)
+    return sorted(normalized, key=lambda b: int(b.ts_init))
+
+
+def _resolve_trading_date_from_bars(
+    bars: Sequence[Bar],
+    fallback: Optional[date] = None,
+) -> date:
+    if fallback is not None:
+        return fallback
+    if bars:
+        max_bar_ts_ns = max(
+            int(getattr(b, "ts_init", 0) or getattr(b, "ts_event", 0) or 0)
+            for b in bars
+        )
+        if max_bar_ts_ns > 100_000_000_000_000_000:
+            return datetime.fromtimestamp(max_bar_ts_ns / 1e9, tz=timezone.utc).date()
+    return datetime.now(tz=timezone.utc).date()
+
+
+def _align_plan_item_valid_until_for_bars(
+    plan_item: PlanItemContract,
+    bars: Sequence[Bar],
+) -> PlanItemContract:
+    if not bars or len(bars) < plan_item.strategy_config.lookback_window:
+        return plan_item
+    max_bar_ts_ns = max(
+        int(getattr(b, "ts_init", 0) or getattr(b, "ts_event", 0) or 0)
+        for b in bars
+    )
+    min_bar_ts_ns = min(
+        int(getattr(b, "ts_init", 0) or getattr(b, "ts_event", 0) or 0)
+        for b in bars
+    )
+    if max_bar_ts_ns > 100_000_000_000_000_000:
+        last_bar_dt = datetime.fromtimestamp(max_bar_ts_ns / 1e9, tz=timezone.utc)
+        first_bar_dt = datetime.fromtimestamp(min_bar_ts_ns / 1e9, tz=timezone.utc)
+        cur_valid_until = (
+            plan_item.risk_envelope.valid_until
+            if plan_item.risk_envelope.valid_until.tzinfo is not None
+            else plan_item.risk_envelope.valid_until.replace(tzinfo=timezone.utc)
+        )
+        if (
+            last_bar_dt > cur_valid_until
+            and cur_valid_until >= first_bar_dt - timedelta(days=14)
+        ):
+            horizon_valid_until = last_bar_dt + timedelta(hours=1)
+            plan_item = replace(
+                plan_item,
+                risk_envelope=replace(
+                    plan_item.risk_envelope,
+                    valid_until=horizon_valid_until,
+                ),
+            )
+    return plan_item
+
+
+def _build_parity_plan_items(
+    plan_item: PlanItemContract,
+    venue_str: str,
+) -> List[PlanItemContract]:
+    ephemeral_plan_id = plan_item.plan_id or uuid.uuid4()
+    cloned_primary = replace(
+        plan_item,
+        item_id=plan_item.item_id or uuid.uuid4(),
+        plan_id=ephemeral_plan_id,
+        venue=plan_item.venue or venue_str,
+        status="ARMED",
+        filled_qty=Decimal("0"),
+        reserved_notional_usd=Decimal("0"),
+    )
+    items_to_lock: List[PlanItemContract] = [cloned_primary]
+    sec_item = build_stat_arb_secondary_plan_item(cloned_primary)
+    if sec_item is not None:
+        items_to_lock.append(sec_item)
+    return items_to_lock
+
+
 @dataclass(frozen=True)
 class WalkForwardSummary:
     """In-Sample (IS) and Out-of-Sample (OOS) Walk-Forward evaluation summary."""
@@ -287,6 +385,7 @@ class IsomorphicBacktestMetrics:
     plan_gate_denied_orders: int
     walk_forward: Optional[WalkForwardSummary] = None
     pareto_non_dominated: bool = True
+    effective_trials: int = 1
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -300,6 +399,7 @@ class IsomorphicBacktestMetrics:
             "total_return_pct": round(self.total_return_pct, 6),
             "sharpe_ratio": round(self.sharpe_ratio, 6),
             "per_period_dsr": round(self.per_period_dsr, 6),
+            "effective_trials": int(self.effective_trials),
             "max_drawdown_pct": round(self.max_drawdown_pct, 6),
             "max_single_trade_loss_usd": round(self.max_single_trade_loss_usd, 4),
             "turnover_ratio": round(self.turnover_ratio, 6),
@@ -369,6 +469,12 @@ class IsomorphicBacktestRunner:
         self._slippage_bps = Decimal(str(slippage_bps))
         self._effective_trials = max(1, int(effective_trials))
         self._venue_name = str(venue_name or "ALPACA").strip().upper()
+        self._last_first_entry_fill: Optional[Tuple[int, float]] = None
+        self._last_plan_gate: Optional[PlanGateExecAlgorithm] = None
+        self._last_oco_monitor: Optional[ProtectiveOcoMonitor] = None
+        self._last_telemetry_actor: Optional[PostgresTelemetryActor] = None
+        self._last_orders: List[Any] = []
+        self._last_period_returns: List[float] = []
 
     def load_historical_data(
         self,
@@ -437,15 +543,17 @@ class IsomorphicBacktestRunner:
         equities: Optional[Sequence[Equity]] = None,
         start_ns: Optional[int] = None,
         end_ns: Optional[int] = None,
-        use_limit_orders: bool = False,
-        submit_protective_stop: bool = False,
+        use_limit_orders: bool = True,
+        submit_protective_stop: bool = True,
+        execution_delay_bars: int = 0,
         fee_multiplier: float = 1.0,
         slippage_multiplier: float = 1.0,
         fill_model: Optional[FillModel] = None,
         trading_date: Optional[date] = None,
         walk_forward: Optional[WalkForwardSummary] = None,
+        effective_trials: Optional[int] = None,
     ) -> IsomorphicBacktestMetrics:
-        """Executes an isomorphic backtest in `BacktestEngine` with `PlanGateExecAlgorithm`."""
+        """Executes a 5-axis isomorphic backtest in `BacktestEngine` with `PlanGateExecAlgorithm(SnapshotPlanGateBackend)` and `ProtectiveOcoMonitor`."""
         venue_str = (
             plan_item.strategy_config.instrument_id.split(".", 1)[1].strip().upper()
             if "." in plan_item.strategy_config.instrument_id
@@ -483,111 +591,17 @@ class IsomorphicBacktestRunner:
         if not bar_list:
             raise ValueError(f"Cannot run backtest for {plan_item.symbol}: bar list is empty")
 
-        effective_date = trading_date or date(2099, 12, 31)
-        cleanup_plan_id: Optional[UUID] = None
-        repo: Optional[PlanContractRepository] = None
-
-        if self._dsn is not None:
-            repo = PlanContractRepository(dsn=self._dsn)
-            if effective_date >= date(2099, 12, 20):
-                self._cleanup_ephemeral_date_plans(repo.dsn, effective_date)
-            existing = repo.load_locked_plan_items(
-                trading_date=effective_date,
-                market="US_EQUITY",
-            )
-            if not existing:
-                cleanup_plan_id = uuid.uuid4()
-                cloned_primary = replace(
-                    plan_item,
-                    item_id=uuid.uuid4(),
-                    plan_id=cleanup_plan_id,
-                    status="ARMED",
-                    filled_qty=Decimal("0"),
-                    reserved_notional_usd=Decimal("0"),
-                )
-                items_to_lock: List[PlanItemContract] = [cloned_primary]
-
-                sec_id = plan_item.strategy_config.secondary_instrument_id
-                if sec_id:
-                    sec_sym = sec_id.split(".", 1)[0].strip().upper()
-                    sec_ven = (
-                        sec_id.split(".", 1)[1].strip().upper()
-                        if "." in sec_id
-                        else venue_str
-                    )
-                    if sec_sym and sec_sym != plan_item.symbol:
-                        sec_side = (
-                            PlanSide.SHORT
-                            if plan_item.risk_envelope.side == PlanSide.LONG
-                            else PlanSide.LONG
-                        )
-                        sec_env = PlanRiskEnvelope(
-                            side=sec_side,
-                            target_qty=plan_item.risk_envelope.target_qty,
-                            approved_qty_cap=plan_item.risk_envelope.approved_qty_cap,
-                            target_notional_usd=plan_item.risk_envelope.target_notional_usd,
-                            max_risk_budget_usd=plan_item.risk_envelope.max_risk_budget_usd,
-                            initial_stop_price=(
-                                Decimal("100000.00")
-                                if sec_side == PlanSide.SHORT
-                                else Decimal("0.01")
-                            ),
-                            take_profit_price=(
-                                Decimal("0.01")
-                                if sec_side == PlanSide.SHORT
-                                else Decimal("100000.00")
-                            ),
-                            collar=plan_item.risk_envelope.collar,
-                            valid_until=plan_item.risk_envelope.valid_until,
-                        )
-                        sec_cfg = ArchetypeStrategyConfig(
-                            archetype_id=plan_item.strategy_config.archetype_id,
-                            instrument_id=sec_id,
-                            bar_timeframe=plan_item.strategy_config.bar_timeframe,
-                            lookback_window=plan_item.strategy_config.lookback_window,
-                            fast_window=plan_item.strategy_config.fast_window,
-                            slow_window=plan_item.strategy_config.slow_window,
-                            entry_quantile_threshold=plan_item.strategy_config.entry_quantile_threshold,
-                            exit_quantile_threshold=plan_item.strategy_config.exit_quantile_threshold,
-                            atr_stop_multiplier=plan_item.strategy_config.atr_stop_multiplier,
-                            secondary_instrument_id=plan_item.strategy_config.instrument_id,
-                        )
-                        items_to_lock.append(
-                            PlanItemContract(
-                                item_id=uuid.uuid4(),
-                                plan_id=cleanup_plan_id,
-                                symbol=sec_sym,
-                                venue=sec_ven,
-                                broker=plan_item.broker,
-                                asset_class=plan_item.asset_class,
-                                strategy_id=f"{plan_item.strategy_id}-{sec_sym}",
-                                strategy_config=sec_cfg,
-                                risk_envelope=sec_env,
-                                sizing_trace={"role": "secondary_leg"},
-                            )
-                        )
-
-                effective_equity_for_plan = max(
-                    self._starting_capital_usd,
-                    plan_item.risk_envelope.target_notional_usd * Decimal("20"),
-                    plan_item.risk_envelope.max_risk_budget_usd * Decimal("200"),
-                )
-                repo.create_and_lock_trading_plan(
-                    trading_date=effective_date,
-                    items=items_to_lock,
-                    total_equity_usd=effective_equity_for_plan,
-                    market="US_EQUITY",
-                    summary="isomorphic_backtest_runner",
-                    plan_id=cleanup_plan_id,
-                    actor="isomorphic_backtest_runner",
-                )
-            else:
-                self._reset_locked_items_for_replay(repo.dsn, effective_date)
-            self._clear_entry_freeze_if_ephemeral(repo.dsn)
+        bar_list = _normalize_bars_for_parity(bar_list)
+        plan_item = _align_plan_item_valid_until_for_bars(plan_item, bar_list)
+        effective_date = _resolve_trading_date_from_bars(bar_list, fallback=trading_date)
+        items_to_lock = _build_parity_plan_items(plan_item, venue_str)
+        cloned_primary = items_to_lock[0]
 
         engine = BacktestEngine(
             BacktestEngineConfig(bypass_logging=True, run_analysis=False)
         )
+        plan_gate: Optional[PlanGateExecAlgorithm] = None
+        telemetry_actor: Optional[PostgresTelemetryActor] = None
         try:
             eff_maker = self._maker_fee_rate * Decimal(str(max(0.0, fee_multiplier)))
             eff_taker = self._taker_fee_rate * Decimal(str(max(0.0, fee_multiplier)))
@@ -606,56 +620,87 @@ class IsomorphicBacktestRunner:
                     maker_rate=eff_maker,
                     taker_rate=eff_taker,
                 ),
+                latency_model=StaticLatencyModel(
+                    base_latency_nanos=0,
+                    insert_latency_nanos=1,
+                    update_latency_nanos=0,
+                    cancel_latency_nanos=0,
+                ),
             )
             for eq in equity_list:
                 engine.add_instrument(eq)
 
-            plan_gate: Optional[PlanGateExecAlgorithm] = None
-            if self._dsn is not None:
-                pg_backend = PostgresPlanGateBackend(
-                    dsn=self._dsn,
-                    trading_date=effective_date,
-                    market="US_EQUITY",
-                )
-                plan_gate = PlanGateExecAlgorithm(
-                    backend=pg_backend,
-                    config=PlanGateExecAlgorithmConfig(
-                        exec_algorithm_id=PLAN_GATE_EXEC_ALGORITHM_ID,
-                    ),
-                )
-                engine.add_exec_algorithm(plan_gate)
+            snapshot_backend = SnapshotPlanGateBackend(
+                plan_items=items_to_lock,
+                entry_freeze=False,
+                trading_date=effective_date,
+            )
+            oco_monitor = ProtectiveOcoMonitor(
+                dsn=None,
+                persist_to_db=False,
+                on_entry_freeze_callback=lambda sym, reason: snapshot_backend.set_entry_freeze(
+                    True,
+                    reason=reason,
+                    updated_by=f"nautilus:protective_oco_monitor:{sym}",
+                ),
+            )
+            telemetry_actor = PostgresTelemetryActor(
+                config=PostgresTelemetryActorConfig(
+                    dsn=None,
+                    persist_to_db=False,
+                    enforce_protective_oco_on_position_events=bool(submit_protective_stop),
+                ),
+                oco_monitor=oco_monitor,
+            )
+            plan_gate = PlanGateExecAlgorithm(
+                backend=snapshot_backend,
+                telemetry_actor=telemetry_actor,
+                oco_monitor=oco_monitor,
+                config=PlanGateExecAlgorithmConfig(
+                    exec_algorithm_id=PLAN_GATE_EXEC_ALGORITHM_ID,
+                    collar_market_orders=bool(use_limit_orders),
+                ),
+            )
+            engine.add_actor(telemetry_actor)
+            engine.add_exec_algorithm(plan_gate)
 
             strategy = instantiate_strategy_from_contract(
-                plan_item,
+                cloned_primary,
                 use_limit_orders=use_limit_orders,
                 submit_protective_stop=submit_protective_stop,
+                execution_delay_bars=execution_delay_bars,
             )
-            if self._dsn is None:
-                strategy._archetype_config.exec_algorithm_id = None  # type: ignore[assignment]
+            strategy.bind_telemetry_actor(telemetry_actor)
+            if hasattr(strategy, "bind_plan_gate"):
+                strategy.bind_plan_gate(plan_gate)
             engine.add_strategy(strategy)
 
             if status_list:
                 engine.add_data(sorted(status_list, key=lambda s: s.ts_init))
             if quote_list:
                 engine.add_data(sorted(quote_list, key=lambda q: q.ts_init))
-            engine.add_data(sorted(bar_list, key=lambda b: b.ts_init))
+            engine.add_data(bar_list)
 
             engine.run()
 
+            self._last_plan_gate = plan_gate
+            self._last_oco_monitor = oco_monitor
+            self._last_telemetry_actor = telemetry_actor
             return self._extract_metrics(
                 engine=engine,
-                plan_item=plan_item,
+                plan_item=cloned_primary,
                 bars=bar_list,
                 plan_gate=plan_gate,
                 slippage_multiplier=slippage_multiplier,
                 walk_forward=walk_forward,
+                effective_trials=effective_trials,
             )
         finally:
+            if telemetry_actor is not None:
+                telemetry_actor.close()
             if plan_gate is not None:
                 plan_gate.close()
             engine.dispose()
-            if cleanup_plan_id is not None and repo is not None:
-                self._cleanup_ephemeral_plan(repo.dsn, cleanup_plan_id)
 
     def run_walk_forward(
         self,
@@ -664,8 +709,9 @@ class IsomorphicBacktestRunner:
         bars: Optional[Sequence[Bar]] = None,
         equities: Optional[Sequence[Equity]] = None,
         in_sample_ratio: float = 0.65,
-        use_limit_orders: bool = False,
-        submit_protective_stop: bool = False,
+        use_limit_orders: bool = True,
+        submit_protective_stop: bool = True,
+        effective_trials: Optional[int] = None,
     ) -> IsomorphicBacktestMetrics:
         """Runs Walk-Forward In-Sample (IS) and Out-of-Sample (OOS) validation plus full-window backtest."""
         if not (0.20 <= in_sample_ratio <= 0.90):
@@ -698,7 +744,11 @@ class IsomorphicBacktestRunner:
         )
         split_ts = primary_bars[split_idx].ts_init
         is_bars = [b for b in bar_list if b.ts_init < split_ts]
-        warmup_start_idx = max(0, split_idx - plan_item.strategy_config.lookback_window)
+        warmup_bars = (
+            int(plan_item.strategy_config.lookback_window)
+            + int(plan_item.strategy_config.slow_window)
+        )
+        warmup_start_idx = max(0, split_idx - warmup_bars)
         oos_start_ts = primary_bars[warmup_start_idx].ts_init
         oos_bars = [b for b in bar_list if b.ts_init >= oos_start_ts]
 
@@ -708,7 +758,8 @@ class IsomorphicBacktestRunner:
             equities=equity_list,
             use_limit_orders=use_limit_orders,
             submit_protective_stop=submit_protective_stop,
-            trading_date=date(2099, 12, 28),
+            trading_date=_resolve_trading_date_from_bars(is_bars),
+            effective_trials=effective_trials,
         )
         oos_metrics = self.run_backtest(
             plan_item,
@@ -716,7 +767,8 @@ class IsomorphicBacktestRunner:
             equities=equity_list,
             use_limit_orders=use_limit_orders,
             submit_protective_stop=submit_protective_stop,
-            trading_date=date(2099, 12, 29),
+            trading_date=_resolve_trading_date_from_bars(oos_bars),
+            effective_trials=effective_trials,
         )
         retention = (
             oos_metrics.sharpe_ratio / is_metrics.sharpe_ratio
@@ -740,8 +792,9 @@ class IsomorphicBacktestRunner:
             equities=equity_list,
             use_limit_orders=use_limit_orders,
             submit_protective_stop=submit_protective_stop,
-            trading_date=date(2099, 12, 30),
+            trading_date=_resolve_trading_date_from_bars(bar_list),
             walk_forward=wf_summary,
+            effective_trials=effective_trials,
         )
 
     def _extract_metrics(
@@ -753,17 +806,30 @@ class IsomorphicBacktestRunner:
         plan_gate: Optional[PlanGateExecAlgorithm],
         slippage_multiplier: float,
         walk_forward: Optional[WalkForwardSummary],
+        effective_trials: Optional[int] = None,
     ) -> IsomorphicBacktestMetrics:
         start_cap = float(self._starting_capital_usd)
         orders = list(engine.cache.orders() or [])
-        positions = list(engine.cache.positions() or [])
+        raw_positions = list(engine.cache.position_snapshots() or []) + list(
+            engine.cache.positions() or []
+        )
+        seen_pos_cycles: set[Tuple[str, int]] = set()
+        positions: List[Any] = []
+        for pos in raw_positions:
+            cycle_key = (
+                str(getattr(pos, "id", "")),
+                int(getattr(pos, "ts_opened", 0) or 0),
+            )
+            if cycle_key not in seen_pos_cycles:
+                seen_pos_cycles.add(cycle_key)
+                positions.append(pos)
 
         total_orders = len(orders)
         filled_orders = sum(1 for o in orders if o.status == OrderStatus.FILLED)
         denied_orders = sum(
             1
             for o in orders
-            if o.status in (OrderStatus.DENIED, OrderStatus.REJECTED, OrderStatus.CANCELED)
+            if o.status in (OrderStatus.DENIED, OrderStatus.REJECTED)
         )
 
         total_commissions = 0.0
@@ -779,7 +845,13 @@ class IsomorphicBacktestRunner:
         for b in bars:
             last_close_by_inst[str(b.bar_type.instrument_id)] = float(b.close)
 
-        for o in orders:
+        first_entry_fill: Optional[Tuple[int, float]] = None
+        for o in sorted(
+            orders,
+            key=lambda ord_obj: int(
+                getattr(ord_obj, "ts_last", 0) or getattr(ord_obj, "ts_init", 0)
+            ),
+        ):
             if o.status == OrderStatus.FILLED:
                 qty_f = _parse_money_float(
                     getattr(o, "filled_qty", None) or getattr(o, "quantity", 0)
@@ -790,6 +862,16 @@ class IsomorphicBacktestRunner:
                 if px_f <= 0.0:
                     px_f = last_close_by_inst.get(str(o.instrument_id), 0.0)
                 traded_notional += abs(qty_f * px_f)
+                if (
+                    first_entry_fill is None
+                    and not bool(getattr(o, "is_reduce_only", False))
+                    and str(getattr(o, "instrument_id", "")) == primary_inst
+                ):
+                    fill_ts = int(
+                        getattr(o, "ts_last", 0) or getattr(o, "ts_init", 0)
+                    )
+                    first_entry_fill = (fill_ts, px_f)
+        self._last_first_entry_fill = first_entry_fill
 
         net_pnl = 0.0
         for pos in positions:
@@ -817,13 +899,8 @@ class IsomorphicBacktestRunner:
             0.0, float(slippage_multiplier)
         )
         est_slippage_cost = traded_notional * slippage_rate
-        if slippage_multiplier > 1.0:
-            extra_slippage = (
-                traded_notional
-                * (float(self._slippage_bps) / 10_000.0)
-                * (float(slippage_multiplier) - 1.0)
-            )
-            net_pnl -= extra_slippage
+        if est_slippage_cost > 0.0:
+            net_pnl -= est_slippage_cost
 
         gross_pnl = net_pnl + total_commissions + est_slippage_cost
         end_cap = start_cap + net_pnl
@@ -834,7 +911,12 @@ class IsomorphicBacktestRunner:
             orders=orders,
             start_cap=start_cap,
             net_pnl_final=net_pnl,
+            all_bars=bars,
+            total_commissions=total_commissions,
+            est_slippage_cost=est_slippage_cost,
         )
+        self._last_orders = list(orders)
+        self._last_period_returns = list(period_returns)
 
         ann_factor = math.sqrt(
             BARS_PER_TRADING_YEAR.get(plan_item.strategy_config.bar_timeframe, 252.0)
@@ -846,9 +928,17 @@ class IsomorphicBacktestRunner:
         else:
             sharpe = 0.0
 
+        eff_trials = max(
+            1,
+            int(
+                effective_trials
+                if effective_trials is not None
+                else self._effective_trials
+            ),
+        )
         dsr = compute_per_period_deflated_sharpe_ratio(
             period_returns,
-            effective_trials=self._effective_trials,
+            effective_trials=eff_trials,
         )
 
         wins = [p for p in trade_pnls if p > 0.0]
@@ -898,6 +988,7 @@ class IsomorphicBacktestRunner:
             plan_gate_admitted_orders=admitted_cnt,
             plan_gate_denied_orders=denied_cnt,
             walk_forward=walk_forward,
+            effective_trials=eff_trials,
         )
 
     @staticmethod
@@ -906,16 +997,26 @@ class IsomorphicBacktestRunner:
         primary_bars: Sequence[Bar],
         orders: Sequence[Any],
         start_cap: float,
-        net_pnl_final: float,
+        net_pnl_final: float = 0.0,
+        all_bars: Optional[Sequence[Bar]] = None,
+        total_commissions: float = 0.0,
+        est_slippage_cost: float = 0.0,
     ) -> Tuple[List[float], float]:
+        _ = net_pnl_final
         if len(primary_bars) < 2:
             return [], 0.0
 
-        fills_by_ts: List[Tuple[int, float, float]] = []
+        bar_universe = sorted(
+            list(all_bars if all_bars is not None else primary_bars),
+            key=lambda b: int(b.ts_init),
+        )
+        total_notional = 0.0
+        raw_fills: List[Tuple[int, str, float, float, float]] = []
         for o in orders:
             if o.status != OrderStatus.FILLED:
                 continue
             ts = int(getattr(o, "ts_last", 0) or getattr(o, "ts_init", 0))
+            inst_key = str(getattr(o, "instrument_id", ""))
             qty = _parse_money_float(
                 getattr(o, "filled_qty", None) or getattr(o, "quantity", 0)
             )
@@ -924,34 +1025,50 @@ class IsomorphicBacktestRunner:
             )
             side_str = str(getattr(o, "side", "")).upper()
             signed_qty = qty if "BUY" in side_str else -qty
-            fills_by_ts.append((ts, signed_qty, px))
-        fills_by_ts.sort(key=lambda item: item[0])
+            notional = abs(qty * px)
+            total_notional += notional
+            raw_fills.append((ts, inst_key, signed_qty, px, notional))
+        raw_fills.sort(key=lambda item: item[0])
+
+        total_friction = max(0.0, float(total_commissions)) + max(0.0, float(est_slippage_cost))
 
         equity_series: List[float] = [start_cap]
         cash = start_cap
-        pos_qty = 0.0
+        pos_qty_by_inst: Dict[str, float] = {}
+        last_close_by_inst: Dict[str, float] = {}
         fill_idx = 0
+        bar_idx = 0
 
-        for bar in primary_bars:
-            bar_ts = int(bar.ts_init)
-            close_px = float(bar.close)
-            while fill_idx < len(fills_by_ts) and fills_by_ts[fill_idx][0] <= bar_ts:
-                _, s_qty, fill_px = fills_by_ts[fill_idx]
-                eff_px = fill_px if fill_px > 0.0 else close_px
-                cash -= s_qty * eff_px
-                pos_qty += s_qty
-                fill_idx += 1
-            eq = cash + pos_qty * close_px
-            equity_series.append(max(1.0, eq))
-
-        if len(equity_series) >= 2:
-            raw_delta = equity_series[-1] - start_cap
-            residual = net_pnl_final - raw_delta
-            steps = len(equity_series) - 1
-            for i in range(1, len(equity_series)):
-                equity_series[i] = max(
-                    1.0, equity_series[i] + residual * (float(i) / float(steps))
+        for p_bar in primary_bars:
+            bar_ts = int(p_bar.ts_init)
+            while bar_idx < len(bar_universe) and int(bar_universe[bar_idx].ts_init) <= bar_ts:
+                b_obj = bar_universe[bar_idx]
+                last_close_by_inst[str(b_obj.bar_type.instrument_id)] = float(b_obj.close)
+                bar_idx += 1
+            while fill_idx < len(raw_fills) and raw_fills[fill_idx][0] <= bar_ts:
+                _, inst_key, s_qty, fill_px, notional = raw_fills[fill_idx]
+                eff_px = (
+                    fill_px
+                    if fill_px > 0.0
+                    else last_close_by_inst.get(inst_key, float(p_bar.close))
                 )
+                fill_friction = (
+                    total_friction * (notional / total_notional)
+                    if total_notional > 0.0
+                    else 0.0
+                )
+                cash -= (s_qty * eff_px) + fill_friction
+                pos_qty_by_inst[inst_key] = pos_qty_by_inst.get(inst_key, 0.0) + s_qty
+                if abs(pos_qty_by_inst[inst_key]) <= 1e-9:
+                    pos_qty_by_inst.pop(inst_key, None)
+                fill_idx += 1
+
+            mtm_value = 0.0
+            for inst_key, held_qty in pos_qty_by_inst.items():
+                mark_px = last_close_by_inst.get(inst_key, float(p_bar.close))
+                mtm_value += held_qty * mark_px
+            eq = cash + mtm_value
+            equity_series.append(max(1.0, eq))
 
         returns: List[float] = []
         peak = equity_series[0]
@@ -968,115 +1085,6 @@ class IsomorphicBacktestRunner:
                 max_dd = dd
 
         return returns, max_dd
-
-    @staticmethod
-    def _clear_entry_freeze_if_ephemeral(dsn: str) -> None:
-        conn = psycopg2.connect(dsn)
-        try:
-            with conn:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        "UPDATE system_flags SET active = FALSE WHERE flag = 'ENTRY_FREEZE'"
-                    )
-        except Exception:
-            pass
-        finally:
-            conn.close()
-
-    @staticmethod
-    def _reset_locked_items_for_replay(dsn: str, trading_date: date) -> None:
-        conn = psycopg2.connect(dsn)
-        try:
-            with conn:
-                with conn.cursor() as cur:
-                    cur.execute("ALTER TABLE trading_plan_items DISABLE TRIGGER USER")
-                    try:
-                        cur.execute(
-                            """
-                            UPDATE trading_plan_items i
-                            SET filled_qty = 0,
-                                reserved_notional_usd = 0,
-                                status = 'ARMED'
-                            FROM trading_plans p
-                            WHERE p.plan_id = i.plan_id
-                              AND p.trading_date = %s
-                              AND p.market = 'US_EQUITY'
-                            """,
-                            (trading_date,),
-                        )
-                    finally:
-                        cur.execute("ALTER TABLE trading_plan_items ENABLE TRIGGER USER")
-        except Exception:
-            pass
-        finally:
-            conn.close()
-
-    @staticmethod
-    def _delete_ephemeral_plans_where(dsn: str, plan_subquery: str, params: Tuple[Any, ...]) -> None:
-        conn = psycopg2.connect(dsn)
-        try:
-            with conn:
-                with conn.cursor() as cur:
-                    cur.execute("ALTER TABLE trading_plan_events DISABLE TRIGGER USER")
-                    cur.execute("ALTER TABLE trading_plans DISABLE TRIGGER USER")
-                    cur.execute("ALTER TABLE trading_plan_items DISABLE TRIGGER USER")
-                    try:
-                        cur.execute(
-                            f"""
-                            DELETE FROM protective_orders
-                            WHERE item_id IN (
-                                SELECT item_id FROM trading_plan_items
-                                WHERE plan_id IN ({plan_subquery})
-                            )
-                            """,
-                            params,
-                        )
-                        cur.execute(
-                            f"""
-                            DELETE FROM trading_plan_tranches
-                            WHERE item_id IN (
-                                SELECT item_id FROM trading_plan_items
-                                WHERE plan_id IN ({plan_subquery})
-                            )
-                            """,
-                            params,
-                        )
-                        cur.execute(
-                            f"DELETE FROM trading_plan_events WHERE plan_id IN ({plan_subquery})",
-                            params,
-                        )
-                        cur.execute(
-                            f"DELETE FROM trading_plan_items WHERE plan_id IN ({plan_subquery})",
-                            params,
-                        )
-                        cur.execute(
-                            f"DELETE FROM trading_plans WHERE plan_id IN ({plan_subquery})",
-                            params,
-                        )
-                    finally:
-                        cur.execute("ALTER TABLE trading_plan_items ENABLE TRIGGER USER")
-                        cur.execute("ALTER TABLE trading_plans ENABLE TRIGGER USER")
-                        cur.execute("ALTER TABLE trading_plan_events ENABLE TRIGGER USER")
-        except Exception:
-            pass
-        finally:
-            conn.close()
-
-    @staticmethod
-    def _cleanup_ephemeral_date_plans(dsn: str, trading_date: date) -> None:
-        IsomorphicBacktestRunner._delete_ephemeral_plans_where(
-            dsn,
-            "SELECT plan_id FROM trading_plans WHERE trading_date = %s AND market = 'US_EQUITY'",
-            (trading_date,),
-        )
-
-    @staticmethod
-    def _cleanup_ephemeral_plan(dsn: str, plan_id: UUID) -> None:
-        IsomorphicBacktestRunner._delete_ephemeral_plans_where(
-            dsn,
-            "SELECT %s::uuid",
-            (str(plan_id),),
-        )
 
 
 @dataclass(frozen=True)
@@ -1148,8 +1156,9 @@ class StressFalsifier:
         *,
         bars: Optional[Sequence[Bar]] = None,
         equities: Optional[Sequence[Equity]] = None,
-        use_limit_orders: bool = False,
-        submit_protective_stop: bool = False,
+        use_limit_orders: bool = True,
+        submit_protective_stop: bool = True,
+        effective_trials: Optional[int] = None,
     ) -> StressFalsificationReport:
         """Runs baseline + 3 counterfactual stress experiments in `BacktestEngine`."""
         if bars is None:
@@ -1160,35 +1169,35 @@ class StressFalsifier:
             bar_list = sorted(bars, key=lambda b: b.ts_init)
             equity_list = list(equities) if equities is not None else None
 
+        resolved_date = _resolve_trading_date_from_bars(bar_list)
         baseline = self._runner.run_backtest(
             plan_item,
             bars=bar_list,
             equities=equity_list,
             use_limit_orders=use_limit_orders,
             submit_protective_stop=submit_protective_stop,
-            trading_date=date(2099, 12, 20),
+            trading_date=resolved_date,
+            effective_trials=effective_trials,
         )
+        baseline_first_entry = getattr(self._runner, "_last_first_entry_fill", None)
 
-        # 1. Experiment 1: 2x Friction & Slippage Stress Test
-        friction_bars = self._apply_adverse_friction_to_bars(
-            bar_list,
-            plan_item=plan_item,
-            slippage_bps=float(self._runner._slippage_bps) * self._friction_multiplier,
+        # 1. Experiment 1: 2x Friction & Slippage Stress Test across entire horizon
+        friction_fill_model: FillModel = OneTickSlippageFillModel(
+            prob_fill_on_limit=1.0,
+            prob_slippage=1.0,
+            random_seed=42,
         )
         friction_metrics = self._runner.run_backtest(
             plan_item,
-            bars=friction_bars,
+            bars=bar_list,
             equities=equity_list,
             use_limit_orders=use_limit_orders,
             submit_protective_stop=submit_protective_stop,
             fee_multiplier=self._friction_multiplier,
             slippage_multiplier=self._friction_multiplier,
-            fill_model=OneTickSlippageFillModel(
-                prob_fill_on_limit=1.0,
-                prob_slippage=1.0,
-                random_seed=42,
-            ),
-            trading_date=date(2099, 12, 21),
+            fill_model=friction_fill_model,
+            trading_date=resolved_date,
+            effective_trials=effective_trials,
         )
         friction_passed = (
             friction_metrics.filled_orders > 0 and friction_metrics.net_pnl_usd > 0.0
@@ -1210,18 +1219,16 @@ class StressFalsifier:
             reason=friction_reason,
         )
 
-        # 2. Experiment 2: +1 Bar Signal Delay Degradation Stress Test
-        delayed_bars = self._build_plus_one_bar_delayed_series(
-            bar_list,
-            primary_instrument_id=plan_item.strategy_config.instrument_id,
-        )
+        # 2. Experiment 2: +1 Bar Signal Execution Latency Stress Test (signal on bar_t -> order submitted on bar_{t+1} -> filled on bar_{t+2})
         delay_metrics = self._runner.run_backtest(
             plan_item,
-            bars=delayed_bars,
+            bars=bar_list,
             equities=equity_list,
             use_limit_orders=use_limit_orders,
             submit_protective_stop=submit_protective_stop,
-            trading_date=date(2099, 12, 22),
+            execution_delay_bars=1,
+            trading_date=resolved_date,
+            effective_trials=effective_trials,
         )
         max_budget = float(plan_item.risk_envelope.max_risk_budget_usd)
         delay_passed = (
@@ -1250,9 +1257,10 @@ class StressFalsifier:
         )
 
         # 3. Experiment 3: Empirical Tail Adverse Opening Gap Shock Test
-        shocked_bars, injected_loss_usd = self._inject_tail_adverse_gap_shock(
+        shocked_bars = self._inject_tail_adverse_gap_shock(
             bar_list,
             plan_item=plan_item,
+            baseline_first_entry=baseline_first_entry,
         )
         gap_metrics = self._runner.run_backtest(
             plan_item,
@@ -1260,14 +1268,17 @@ class StressFalsifier:
             equities=equity_list,
             use_limit_orders=use_limit_orders,
             submit_protective_stop=submit_protective_stop,
-            trading_date=date(2099, 12, 23),
+            trading_date=resolved_date,
+            effective_trials=effective_trials,
         )
         observed_worst_loss = max(
             abs(min(0.0, gap_metrics.max_single_trade_loss_usd)),
             abs(min(0.0, gap_metrics.net_pnl_usd)),
-            injected_loss_usd,
         )
-        gap_passed = observed_worst_loss <= max_budget
+        gap_passed = (
+            gap_metrics.filled_orders > 0
+            and observed_worst_loss <= max_budget
+        )
         gap_reason = (
             f"Tail gap shock worst loss ${observed_worst_loss:.2f} <= max_risk_budget_usd ${max_budget:.2f}"
             if gap_passed
@@ -1301,81 +1312,13 @@ class StressFalsifier:
             failure_reasons=tuple(failures),
         )
 
-    @staticmethod
-    def _apply_adverse_friction_to_bars(
-        bars: Sequence[Bar],
-        *,
-        plan_item: PlanItemContract,
-        slippage_bps: float,
-    ) -> List[Bar]:
-        primary_inst = plan_item.strategy_config.instrument_id
-        lookback = plan_item.strategy_config.lookback_window
-        rate = max(0.0, slippage_bps) / 10_000.0
-        result: List[Bar] = []
-        primary_idx = 0
-        for b in bars:
-            if str(b.bar_type.instrument_id) != primary_inst:
-                result.append(b)
-                continue
-            primary_idx += 1
-            if primary_idx == lookback + 1:
-                mult = (
-                    (1.0 + rate)
-                    if plan_item.risk_envelope.side == PlanSide.LONG
-                    else (1.0 - rate)
-                )
-                cl = float(b.close) * mult
-                result.append(
-                    _clone_bar_with_prices(
-                        b,
-                        open_px=float(b.open) * mult,
-                        high_px=max(float(b.high), cl),
-                        low_px=min(float(b.low), cl),
-                        close_px=cl,
-                    )
-                )
-            else:
-                result.append(b)
-        return result
-
-    @staticmethod
-    def _build_plus_one_bar_delayed_series(
-        bars: Sequence[Bar],
-        *,
-        primary_instrument_id: str,
-    ) -> List[Bar]:
-        primary_bars = [
-            b for b in bars if str(b.bar_type.instrument_id) == primary_instrument_id
-        ]
-        other_bars = [
-            b for b in bars if str(b.bar_type.instrument_id) != primary_instrument_id
-        ]
-        if len(primary_bars) < 3:
-            return list(bars)
-
-        delayed_primary: List[Bar] = [primary_bars[0]]
-        for idx in range(1, len(primary_bars)):
-            prev_bar = primary_bars[idx - 1]
-            curr_bar = primary_bars[idx]
-            delayed_primary.append(
-                _clone_bar_with_prices(
-                    curr_bar,
-                    open_px=float(prev_bar.open),
-                    high_px=float(prev_bar.high),
-                    low_px=float(prev_bar.low),
-                    close_px=float(prev_bar.close),
-                )
-            )
-        combined = delayed_primary + other_bars
-        combined.sort(key=lambda b: b.ts_init)
-        return combined
-
     def _inject_tail_adverse_gap_shock(
         self,
         bars: Sequence[Bar],
         *,
         plan_item: PlanItemContract,
-    ) -> Tuple[List[Bar], float]:
+        baseline_first_entry: Optional[Tuple[int, float]] = None,
+    ) -> List[Bar]:
         primary_inst = plan_item.strategy_config.instrument_id
         primary_bars = [
             b for b in bars if str(b.bar_type.instrument_id) == primary_inst
@@ -1384,7 +1327,7 @@ class StressFalsifier:
             b for b in bars if str(b.bar_type.instrument_id) != primary_inst
         ]
         if len(primary_bars) < 5:
-            return list(bars), 0.0
+            return list(bars)
 
         abs_ranges: List[float] = []
         for idx in range(1, len(primary_bars)):
@@ -1405,21 +1348,42 @@ class StressFalsifier:
             empirical_tail_range * self._tail_shock_multiplier * max(1.0, atr_mult * 0.5)
         )
 
-        shock_idx = min(
-            len(primary_bars) - 1,
-            plan_item.strategy_config.lookback_window + 2,
-        )
+        baseline_entry_px = 0.0
+        shock_idx: Optional[int] = None
+        if baseline_first_entry is not None:
+            entry_fill_ts_ns, baseline_entry_px = baseline_first_entry
+            for idx, b in enumerate(primary_bars):
+                if int(b.ts_init) > int(entry_fill_ts_ns):
+                    shock_idx = min(len(primary_bars) - 1, idx + 1)
+                    break
+            if shock_idx is None:
+                shock_idx = len(primary_bars) - 1
+
+        if shock_idx is None:
+            shock_idx = min(
+                len(primary_bars) - 1,
+                plan_item.strategy_config.lookback_window + 2,
+            )
+
         ref_bar = primary_bars[shock_idx]
-        ref_close = float(ref_bar.close)
+        prev_bar_close = (
+            float(primary_bars[shock_idx - 1].close)
+            if shock_idx > 0
+            else float(ref_bar.close)
+        )
+        anchor_px = (
+            baseline_entry_px
+            if (baseline_first_entry is not None and baseline_entry_px > 0.0)
+            else prev_bar_close
+        )
 
         if plan_item.risk_envelope.side == PlanSide.LONG:
-            shocked_close = max(0.01, ref_close - shock_distance)
-            shocked_low = shocked_close
-            shocked_high = max(shocked_close, ref_close)
+            shocked_close = max(0.01, anchor_px - shock_distance)
         else:
-            shocked_close = ref_close + shock_distance
-            shocked_low = min(shocked_close, ref_close)
-            shocked_high = shocked_close
+            shocked_close = anchor_px + shock_distance
+
+        shocked_low = shocked_close
+        shocked_high = shocked_close
 
         shocked_primary = list(primary_bars)
         shocked_primary[shock_idx] = _clone_bar_with_prices(
@@ -1430,14 +1394,10 @@ class StressFalsifier:
             close_px=shocked_close,
         )
 
-        stop_dist_per_share = min(
-            shock_distance,
-            empirical_tail_range * atr_mult,
-        )
-        estimated_gap_loss_usd = (
-            float(plan_item.risk_envelope.target_qty) * stop_dist_per_share
-        )
-
         combined = shocked_primary + other_bars
         combined.sort(key=lambda b: b.ts_init)
-        return combined, estimated_gap_loss_usd
+        return combined
+
+
+StressFalsificationSuite = StressFalsifier
+

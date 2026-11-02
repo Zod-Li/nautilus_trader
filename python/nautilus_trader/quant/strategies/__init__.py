@@ -5,6 +5,7 @@ from nautilus_trader.quant.strategies.base import (
     BaseArchetypeStrategy,
     BaseArchetypeStrategyConfig,
     format_datainfra_bar_type,
+    required_warmup_bars,
 )
 from nautilus_trader.quant.strategies.empirical import (
     compute_true_range,
@@ -74,6 +75,7 @@ __all__ = [
     "instantiate_strategy_from_contract",
     "list_strategy_archetype_schemas",
     "quantile_to_float",
+    "required_warmup_bars",
     "rolling_atr",
     "rolling_linear_slope",
     "rolling_mad_zscore",

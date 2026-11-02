@@ -206,26 +206,152 @@ impl TryFrom<TimeInForce> for AlpacaTimeInForce {
     }
 }
 
+/// Alpaca order status values returned by `/v2/orders` and `trade_updates`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AlpacaOrderStatus {
+    /// Routed and waiting for execution (`"new"`).
+    New,
+    /// Received by Alpaca and routing to exchanges (`"pending_new"`).
+    PendingNew,
+    /// Accepted by Alpaca (`"accepted"`).
+    Accepted,
+    /// Accepted for bidding (`"accepted_for_bidding"`).
+    AcceptedForBidding,
+    /// Fill price guaranteed by specialist/market maker; execution is imminent/active (`"stopped"`).
+    Stopped,
+    /// Order calculated (`"calculated"`).
+    Calculated,
+    /// Contingent leg held awaiting trigger (`"held"`).
+    Held,
+    /// Partially filled (`"partially_filled"`).
+    PartiallyFilled,
+    /// Completely filled (`"filled"`).
+    Filled,
+    /// Done for the trading day (`"done_for_day"`).
+    DoneForDay,
+    /// Canceled (`"canceled"`).
+    Canceled,
+    /// Expired (`"expired"`).
+    Expired,
+    /// Replaced by a modified order (`"replaced"`).
+    Replaced,
+    /// Waiting for cancellation confirmation (`"pending_cancel"`).
+    PendingCancel,
+    /// Waiting for replacement confirmation (`"pending_replace"`).
+    PendingReplace,
+    /// Rejected by venue (`"rejected"`).
+    Rejected,
+    /// Suspended by venue (`"suspended"`).
+    Suspended,
+}
+
+impl AlpacaOrderStatus {
+    /// Maps this [`AlpacaOrderStatus`] to the canonical Nautilus [`OrderStatus`].
+    #[must_use]
+    pub const fn to_order_status(self) -> OrderStatus {
+        match self {
+            Self::New
+            | Self::Accepted
+            | Self::AcceptedForBidding
+            | Self::Calculated
+            | Self::Held
+            | Self::Stopped => OrderStatus::Accepted,
+            Self::PendingNew => OrderStatus::Submitted,
+            Self::PartiallyFilled => OrderStatus::PartiallyFilled,
+            Self::Filled => OrderStatus::Filled,
+            Self::DoneForDay | Self::Canceled | Self::Replaced => OrderStatus::Canceled,
+            Self::Expired => OrderStatus::Expired,
+            Self::PendingCancel => OrderStatus::PendingCancel,
+            Self::PendingReplace => OrderStatus::PendingUpdate,
+            Self::Rejected | Self::Suspended => OrderStatus::Rejected,
+        }
+    }
+
+    /// Returns `true` when the order is open/in-flight on the venue (including [`Self::Stopped`]).
+    #[must_use]
+    pub const fn is_open(self) -> bool {
+        matches!(
+            self,
+            Self::New
+                | Self::PendingNew
+                | Self::Accepted
+                | Self::AcceptedForBidding
+                | Self::Stopped
+                | Self::Calculated
+                | Self::Held
+                | Self::PartiallyFilled
+                | Self::PendingCancel
+                | Self::PendingReplace
+        )
+    }
+}
+
+impl From<AlpacaOrderStatus> for OrderStatus {
+    fn from(status: AlpacaOrderStatus) -> Self {
+        status.to_order_status()
+    }
+}
+
+impl std::str::FromStr for AlpacaOrderStatus {
+    type Err = AlpacaError;
+
+    fn from_str(status: &str) -> AlpacaResult<Self> {
+        match status.trim().to_ascii_lowercase().as_str() {
+            "new" => Ok(Self::New),
+            "pending_new" => Ok(Self::PendingNew),
+            "accepted" => Ok(Self::Accepted),
+            "accepted_for_bidding" => Ok(Self::AcceptedForBidding),
+            "stopped" => Ok(Self::Stopped),
+            "calculated" => Ok(Self::Calculated),
+            "held" => Ok(Self::Held),
+            "partially_filled" => Ok(Self::PartiallyFilled),
+            "filled" => Ok(Self::Filled),
+            "done_for_day" => Ok(Self::DoneForDay),
+            "canceled" | "cancelled" => Ok(Self::Canceled),
+            "expired" => Ok(Self::Expired),
+            "replaced" => Ok(Self::Replaced),
+            "pending_cancel" => Ok(Self::PendingCancel),
+            "pending_replace" => Ok(Self::PendingReplace),
+            "rejected" => Ok(Self::Rejected),
+            "suspended" => Ok(Self::Suspended),
+            other => Err(AlpacaError::Parse(format!(
+                "unrecognized Alpaca order status '{other}'"
+            ))),
+        }
+    }
+}
+
+impl std::fmt::Display for AlpacaOrderStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            Self::New => "new",
+            Self::PendingNew => "pending_new",
+            Self::Accepted => "accepted",
+            Self::AcceptedForBidding => "accepted_for_bidding",
+            Self::Stopped => "stopped",
+            Self::Calculated => "calculated",
+            Self::Held => "held",
+            Self::PartiallyFilled => "partially_filled",
+            Self::Filled => "filled",
+            Self::DoneForDay => "done_for_day",
+            Self::Canceled => "canceled",
+            Self::Expired => "expired",
+            Self::Replaced => "replaced",
+            Self::PendingCancel => "pending_cancel",
+            Self::PendingReplace => "pending_replace",
+            Self::Rejected => "rejected",
+            Self::Suspended => "suspended",
+        };
+        f.write_str(s)
+    }
+}
+
 /// Maps an Alpaca order status string into a Nautilus [`OrderStatus`].
 ///
 /// # Errors
 ///
 /// Returns [`AlpacaError::Parse`] if the status string is unrecognized.
 pub fn parse_alpaca_order_status(status: &str) -> AlpacaResult<OrderStatus> {
-    match status.trim().to_ascii_lowercase().as_str() {
-        "new" | "accepted" | "accepted_for_bidding" | "calculated" | "held" => {
-            Ok(OrderStatus::Accepted)
-        }
-        "pending_new" => Ok(OrderStatus::Submitted),
-        "partially_filled" => Ok(OrderStatus::PartiallyFilled),
-        "filled" => Ok(OrderStatus::Filled),
-        "done_for_day" | "canceled" | "stopped" | "replaced" => Ok(OrderStatus::Canceled),
-        "expired" => Ok(OrderStatus::Expired),
-        "pending_cancel" => Ok(OrderStatus::PendingCancel),
-        "pending_replace" => Ok(OrderStatus::PendingUpdate),
-        "rejected" | "suspended" => Ok(OrderStatus::Rejected),
-        other => Err(AlpacaError::Parse(format!(
-            "unrecognized Alpaca order status '{other}'"
-        ))),
-    }
+    status.parse::<AlpacaOrderStatus>().map(OrderStatus::from)
 }

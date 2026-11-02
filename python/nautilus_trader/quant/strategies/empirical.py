@@ -146,7 +146,9 @@ def rolling_ols_hedge_params(
         dy = y_val - mean_y
         cov_xy += dx * dy
         var_x += dx * dx
-    beta = cov_xy / var_x if var_x > 0.0 else 1.0
+    if var_x <= 1e-12:
+        return float(mean_y), 1.0, 0.0
+    beta = cov_xy / var_x
     alpha = mean_y - beta * mean_x
     residual = ys[-1] - (alpha + beta * xs[-1])
     return alpha, beta, residual

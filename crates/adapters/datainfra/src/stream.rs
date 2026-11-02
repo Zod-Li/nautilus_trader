@@ -25,6 +25,7 @@
 use std::sync::Arc;
 
 use ahash::AHashMap;
+use nautilus_core::UnixNanos;
 use nautilus_model::{
     data::{Bar, InstrumentStatus, QuoteTick},
     identifiers::InstrumentId,
@@ -38,7 +39,9 @@ use crate::{
         f64_to_price, f64_to_quantity, map_trading_status_state, normalize_epoch_to_unix_nanos,
     },
     error::{DataInfraError, DataInfraResult},
-    mapping::{DataInfraTimeframe, parse_datainfra_bar_type, to_instrument_id},
+    mapping::{
+        DataInfraTimeframe, parse_datainfra_bar_type, timeframe_step_ns, to_instrument_id,
+    },
 };
 
 /// Canonical Kafka topic for 1-minute SIP bars (`sip-feeder`).
@@ -49,6 +52,13 @@ pub const TOPIC_SIP_BARS_PREFIX: &str = "md.sip.bars.";
 pub const TOPIC_SIP_QUOTES: &str = "md.sip.quotes";
 /// Canonical Kafka topic for SIP trading statuses / halts (`sip-feeder`).
 pub const TOPIC_SIP_STATUSES: &str = "md.sip.statuses";
+
+/// Default decimal price precision (`2` decimal places for US equities).
+pub const DEFAULT_DECODER_PRICE_PRECISION: u8 = 2;
+/// Default decimal size precision (`0` decimal places for whole shares).
+pub const DEFAULT_DECODER_SIZE_PRECISION: u8 = 0;
+/// Default window retention capacity for [`BarStreamVersionTracker`].
+pub const DEFAULT_VERSION_TRACKER_CAPACITY: usize = 4_096;
 
 /// Strongly typed wire representation of `sip-feeder` `CanonicalBar` JSON frames.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -119,14 +129,15 @@ impl CanonicalBarWire {
         size_precision: u8,
     ) -> DataInfraResult<Bar> {
         let bar_type = parse_datainfra_bar_type(&self.symbol, venue, &self.timeframe)?;
-        let ts_event = normalize_epoch_to_unix_nanos(self.bar_ts, "bar_ts")?;
+        let bar_open_ns = normalize_epoch_to_unix_nanos(self.bar_ts, "bar_ts")?;
+        let ts_event = UnixNanos::from(
+            bar_open_ns
+                .as_u64()
+                .saturating_add(timeframe_step_ns(&bar_type)),
+        );
         let ts_init = if self.ingest_ts_ms > 0 {
             let init_ns = normalize_epoch_to_unix_nanos(self.ingest_ts_ms, "ingest_ts_ms")?;
-            if init_ns < ts_event {
-                ts_event
-            } else {
-                init_ns
-            }
+            ts_event.max(init_ns)
         } else {
             ts_event
         };
@@ -528,6 +539,16 @@ impl CanonicalStreamDecoder {
                 wire.symbol, wire.bar_ts
             )));
         }
+        let session_trimmed = wire.session.trim();
+        if !session_trimmed.is_empty()
+            && !session_trimmed.eq_ignore_ascii_case("REGULAR")
+            && !session_trimmed.eq_ignore_ascii_case("REG")
+        {
+            return Err(DataInfraError::CalendarGate(format!(
+                "CanonicalBarWire non-RTH session '{session_trimmed}' rejected for {} at bar_ts={}",
+                wire.symbol, wire.bar_ts
+            )));
+        }
 
         let bar = wire.to_nautilus_bar(&self.venue, self.price_precision, self.size_precision)?;
         let tf: DataInfraTimeframe = wire.timeframe.parse()?;
@@ -693,3 +714,9 @@ impl KafkaStreamSessionCoordinator {
         self.decoder.decode_topic_payload(topic, payload)
     }
 }
+
+pub use crate::kafka::{
+    CanonicalWireFrame, DEFAULT_SIP_KAFKA_TOPICS, KafkaBrokerEnvelope, KafkaEnvelopePayload,
+    KafkaMarketStreamDecoder, KafkaPayloadFrame, KafkaPayloadSource, TcpKafkaPayloadSource,
+    parse_broker_wire_frame,
+};

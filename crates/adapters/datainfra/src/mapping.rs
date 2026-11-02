@@ -74,6 +74,19 @@ impl DataInfraTimeframe {
         }
     }
 
+    /// Returns the bar duration step in nanoseconds for this timeframe.
+    #[must_use]
+    pub const fn step_ns(&self) -> u64 {
+        match self {
+            Self::M1 => 60_000_000_000,
+            Self::M15 => 900_000_000_000,
+            Self::H1 => 3_600_000_000_000,
+            Self::H4 => 14_400_000_000_000,
+            Self::D1 => 86_400_000_000_000,
+            Self::W1 => 604_800_000_000_000,
+        }
+    }
+
     /// Converts a Nautilus [`BarSpecification`] into a [`DataInfraTimeframe`].
     ///
     /// # Errors
@@ -231,4 +244,29 @@ pub fn from_bar_type(bar_type: &BarType) -> DataInfraResult<(String, String, Dat
             "Composite BarType is not supported by DataInfra".to_string(),
         )),
     }
+}
+
+/// Returns the bar interval duration in nanoseconds (`bar_close_ns - bar_open_ns`) for `bar_type`.
+#[must_use]
+pub fn timeframe_step_ns(bar_type: &BarType) -> u64 {
+    if let Ok((_, _, tf)) = from_bar_type(bar_type) {
+        return tf.step_ns();
+    }
+    let spec = bar_type.spec();
+    let step = spec.step.get() as u64;
+    match spec.aggregation {
+        BarAggregation::Millisecond => step.saturating_mul(1_000_000),
+        BarAggregation::Second => step.saturating_mul(1_000_000_000),
+        BarAggregation::Minute => step.saturating_mul(60_000_000_000),
+        BarAggregation::Hour => step.saturating_mul(3_600_000_000_000),
+        BarAggregation::Day => step.saturating_mul(86_400_000_000_000),
+        BarAggregation::Week => step.saturating_mul(604_800_000_000_000),
+        _ => 0,
+    }
+}
+
+/// Alias for [`timeframe_step_ns`].
+#[must_use]
+pub fn bar_type_step_ns(bar_type: &BarType) -> u64 {
+    timeframe_step_ns(bar_type)
 }

@@ -478,6 +478,54 @@ fn test_parse_trade_update_lifecycle_events_and_decimal_precision() {
 }
 
 #[test]
+fn test_parse_trade_update_stopped_event_maps_to_order_status_accepted() {
+    let account_id = AccountId::new("ALPACA-PA123456");
+    let ts_init = UnixNanos::from(1_775_000_000_000_000_000u64);
+
+    let raw_stopped_frame = br#"{
+        "stream": "trade_updates",
+        "data": {
+            "event": "stopped",
+            "timestamp": "2026-03-31T15:05:00Z",
+            "order": {
+                "id": "venue-ord-stopped-1",
+                "client_order_id": "client-ord-stopped-1",
+                "created_at": "2026-03-31T15:04:55Z",
+                "submitted_at": "2026-03-31T15:04:55.100Z",
+                "symbol": "AAPL",
+                "qty": "50",
+                "filled_qty": "0",
+                "type": "stop",
+                "side": "sell",
+                "time_in_force": "gtc",
+                "stop_price": "195.00",
+                "status": "stopped"
+            }
+        }
+    }"#;
+
+    let classified =
+        classify_alpaca_ws_frame(raw_stopped_frame).expect("classify stopped trade_updates frame");
+    let payload = match classified {
+        AlpacaWsFrameClassification::TradeUpdate(p) => p,
+        other => panic!("expected TradeUpdate, got {other:?}"),
+    };
+    assert_eq!(payload.event, AlpacaTradeEventKind::Stopped);
+    assert_eq!(payload.order.status, "stopped");
+
+    let update = parse_trade_update_payload(&payload, account_id, ALPACA_VENUE, 2, 0, ts_init)
+        .expect("parse stopped trade update");
+    assert_eq!(update.event_kind, AlpacaTradeEventKind::Stopped);
+    assert_eq!(
+        update.order_status,
+        OrderStatus::Accepted,
+        "AlpacaTradeEventKind::Stopped must map to OrderStatus::Accepted (never Canceled)"
+    );
+    assert_eq!(update.order_report.order_status, OrderStatus::Accepted);
+    assert!(update.fill_report.is_none());
+}
+
+#[test]
 fn test_parse_trade_update_fail_closed_validation() {
     let account_id = AccountId::new("ALPACA-PA123456");
     let ts_init = UnixNanos::from(1_775_000_000_000_000_000u64);

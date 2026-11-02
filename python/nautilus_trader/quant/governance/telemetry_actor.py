@@ -10,18 +10,37 @@ coverage via `ProtectiveOcoMonitor`.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
 import json
 import logging
 import queue
 import threading
+import time
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 from uuid import UUID
+import weakref
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
+
+from nautilus_trader.common import DataActor, DataActorConfig
+from nautilus_trader.model import (
+    ActorId,
+    OrderAccepted,
+    OrderCanceled,
+    OrderDenied,
+    OrderExpired,
+    OrderFilled,
+    OrderInitialized,
+    OrderRejected,
+    OrderSubmitted,
+    OrderUpdated,
+    PositionChanged,
+    PositionClosed,
+    PositionOpened,
+)
 
 from evolution_engine.db.dsn import resolve_database_dsn
 
@@ -41,6 +60,10 @@ class _AsyncTelemetryDbWorker:
         self._connect_timeout_secs = max(1, int(connect_timeout_secs))
         self._on_db_error_callback = on_db_error_callback
         self._queue: "queue.Queue[Optional[Tuple[Callable[[Any], None], Optional[threading.Event]]]]" = queue.Queue()
+        self._state_lock = threading.Lock()
+        self._retry_buffer: List[Callable[[Any], None]] = []
+        self._consecutive_failures: int = 0
+        self._next_retry_monotonic: float = 0.0
         self._conn: Optional[Any] = None
         self._thread = threading.Thread(
             target=self._run_loop,
@@ -49,13 +72,15 @@ class _AsyncTelemetryDbWorker:
         )
         self._thread.start()
 
-    def submit(self, task_fn: Callable[[Any], None], eager_flush: bool = True) -> None:
+    def submit(self, task_fn: Callable[[Any], None], eager_flush: bool = False) -> None:
         done = threading.Event() if eager_flush else None
         self._queue.put((task_fn, done))
         if done is not None:
             done.wait(timeout=2.0)
 
     def flush(self, timeout_secs: float = 5.0) -> None:
+        if not self._thread.is_alive():
+            return
         done = threading.Event()
         self._queue.put((lambda _cur: None, done))
         done.wait(timeout=max(0.05, float(timeout_secs)))
@@ -84,13 +109,57 @@ class _AsyncTelemetryDbWorker:
             )
         return self._conn
 
+    def _execute_tasks(self, tasks: List[Callable[[Any], None]]) -> None:
+        with self._state_lock:
+            combined = list(self._retry_buffer) + list(tasks)
+            self._retry_buffer.clear()
+        if not combined:
+            return
+        try:
+            conn = self._ensure_conn()
+            with conn:
+                with conn.cursor() as cur:
+                    for fn in combined:
+                        fn(cur)
+            with self._state_lock:
+                self._consecutive_failures = 0
+                self._next_retry_monotonic = 0.0
+        except Exception as exc:
+            logger.error("Telemetry async write-behind batch failed: %s", exc)
+            with self._state_lock:
+                merged = combined + list(self._retry_buffer)
+                if len(merged) > 4096:
+                    merged = merged[-4096:]
+                self._retry_buffer = merged
+                self._consecutive_failures += 1
+                backoff = min(30.0, 0.5 * (2 ** min(self._consecutive_failures, 6)))
+                self._next_retry_monotonic = time.monotonic() + backoff
+            if self._on_db_error_callback is not None:
+                try:
+                    self._on_db_error_callback(
+                        "POSTGRES_TELEMETRY",
+                        f"TELEMETRY_DB_WRITE_FAILED: {exc}",
+                    )
+                except Exception as cb_exc:
+                    logger.error("Telemetry DB error callback failed: %s", cb_exc)
+            self._close_conn()
+
     def _run_loop(self) -> None:
         try:
             while True:
                 try:
                     item = self._queue.get(timeout=0.5)
                 except queue.Empty:
-                    self._close_conn()
+                    now_mono = time.monotonic()
+                    with self._state_lock:
+                        has_retries = bool(self._retry_buffer)
+                        should_retry = (
+                            has_retries and now_mono >= self._next_retry_monotonic
+                        )
+                    if should_retry:
+                        self._execute_tasks([])
+                    elif not has_retries:
+                        self._close_conn()
                     continue
                 if item is None:
                     self._queue.task_done()
@@ -109,22 +178,7 @@ class _AsyncTelemetryDbWorker:
                         break
 
                 try:
-                    conn = self._ensure_conn()
-                    with conn:
-                        with conn.cursor() as cur:
-                            for fn, _ in batch:
-                                fn(cur)
-                except Exception as exc:
-                    logger.error("Telemetry async write-behind batch failed: %s", exc)
-                    if self._on_db_error_callback is not None:
-                        try:
-                            self._on_db_error_callback(
-                                "POSTGRES_TELEMETRY",
-                                f"TELEMETRY_DB_WRITE_FAILED: {exc}",
-                            )
-                        except Exception as cb_exc:
-                            logger.error("Telemetry DB error callback failed: %s", cb_exc)
-                    self._close_conn()
+                    self._execute_tasks([fn for fn, _ in batch])
                 finally:
                     for _, done_ev in batch:
                         if done_ev is not None:
@@ -134,22 +188,7 @@ class _AsyncTelemetryDbWorker:
                     break
         finally:
             self._close_conn()
-from nautilus_trader.common import DataActor, DataActorConfig
-from nautilus_trader.model import (
-    ActorId,
-    OrderAccepted,
-    OrderCanceled,
-    OrderDenied,
-    OrderExpired,
-    OrderFilled,
-    OrderInitialized,
-    OrderRejected,
-    OrderSubmitted,
-    OrderUpdated,
-    PositionChanged,
-    PositionClosed,
-    PositionOpened,
-)
+
 
 # Canonical alias matching Nautilus Actor terminology
 Actor = DataActor
@@ -210,6 +249,16 @@ def _is_protective_stop_order_type(order_type_str: str) -> bool:
     )
 
 
+def _is_protective_stop_meta(meta: Dict[str, Any]) -> bool:
+    if not _is_protective_stop_order_type(str(meta.get("order_type") or "")):
+        return False
+    intent = str(meta.get("intent") or "").strip().upper()
+    is_reduce_only = bool(meta.get("is_reduce_only", False))
+    if intent == "ENTRY" and not is_reduce_only:
+        return False
+    return True
+
+
 @dataclass(frozen=True)
 class ProtectiveOrderCoverage:
     """Tracked protective stop-loss / OCO coverage for a symbol."""
@@ -259,19 +308,70 @@ class ProtectiveOcoMonitor:
         broker: str = "alpaca",
         connect_timeout_secs: int = 3,
         on_entry_freeze_callback: Optional[Callable[[str, str], None]] = None,
+        *,
+        persist_to_db: bool = True,
     ) -> None:
-        self._dsn = resolve_database_dsn(dsn)
+        self._persist_to_db = bool(persist_to_db)
+        self._dsn = (
+            resolve_database_dsn(dsn)
+            if self._persist_to_db
+            else (str(dsn) if dsn is not None else "")
+        )
         self._broker = str(broker or "alpaca").strip().lower()
         self._connect_timeout_secs = max(1, int(connect_timeout_secs))
         self._on_entry_freeze_callback = on_entry_freeze_callback
+        self._entry_freeze_callbacks: List[Callable[[str, str], None]] = []
         self._positions_qty: Dict[str, Decimal] = {}
         self._coverage_by_symbol: Dict[str, ProtectiveOrderCoverage] = {}
         self._protective_orders_by_id: Dict[str, ProtectiveOrderCoverage] = {}
-        self._async_writer = _AsyncTelemetryDbWorker(
-            dsn=self._dsn,
-            connect_timeout_secs=self._connect_timeout_secs,
-            on_db_error_callback=self._on_entry_freeze_callback,
+        self._safe_exit_symbols: Set[str] = set()
+        self._async_writer: Optional[_AsyncTelemetryDbWorker] = (
+            _AsyncTelemetryDbWorker(
+                dsn=self._dsn,
+                connect_timeout_secs=self._connect_timeout_secs,
+                on_db_error_callback=self._notify_entry_freeze,
+            )
+            if self._persist_to_db
+            else None
         )
+        if self._persist_to_db and self._dsn:
+            self._hydrate_coverage_from_db()
+
+    def begin_safe_exit(self, symbol: str, reason: str = "TWO_PHASE_SAFE_EXIT") -> None:
+        _ = reason
+        norm = _normalize_symbol(symbol)
+        if norm:
+            self._safe_exit_symbols.add(norm)
+
+    def end_safe_exit(self, symbol: str) -> None:
+        norm = _normalize_symbol(symbol)
+        if norm:
+            self._safe_exit_symbols.discard(norm)
+
+    def is_safe_exit_active(self, symbol: str) -> bool:
+        norm = _normalize_symbol(symbol)
+        return bool(norm and norm in self._safe_exit_symbols)
+
+    def is_safe_exit_in_flight(self, symbol: str) -> bool:
+        return self.is_safe_exit_active(symbol)
+
+    def add_entry_freeze_callback(self, callback: Callable[[str, str], None]) -> None:
+        if callback not in self._entry_freeze_callbacks and callback is not self._on_entry_freeze_callback:
+            self._entry_freeze_callbacks.append(callback)
+
+    def _notify_entry_freeze(self, symbol: str, reason: str) -> None:
+        if self._on_entry_freeze_callback is not None:
+            try:
+                self._on_entry_freeze_callback(symbol, reason)
+            except Exception as exc:
+                logger.error("Primary entry freeze callback failed: %s", exc)
+        for cb in list(self._entry_freeze_callbacks):
+            if cb is self._on_entry_freeze_callback:
+                continue
+            try:
+                cb(symbol, reason)
+            except Exception as exc:
+                logger.error("Secondary entry freeze callback failed: %s", exc)
 
     @property
     def dsn(self) -> str:
@@ -281,9 +381,14 @@ class ProtectiveOcoMonitor:
     def broker(self) -> str:
         return self._broker
 
+    def flush(self, timeout_secs: float = 5.0) -> None:
+        if self._async_writer is not None:
+            self._async_writer.flush(timeout_secs=timeout_secs)
+
     def close(self) -> None:
         try:
-            self._async_writer.close()
+            if self._async_writer is not None:
+                self._async_writer.close()
         except Exception:
             pass
 
@@ -297,16 +402,70 @@ class ProtectiveOcoMonitor:
         norm = _normalize_symbol(symbol)
         return self._positions_qty.get(norm, Decimal("0"))
 
+    def _hydrate_coverage_from_db(self) -> None:
+        if not self._persist_to_db or not self._dsn:
+            return
+        try:
+            conn = psycopg2.connect(
+                self._dsn,
+                cursor_factory=RealDictCursor,
+                connect_timeout=self._connect_timeout_secs,
+            )
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT broker, symbol, item_id, broker_order_id,
+                               qty, stop_price, take_profit_price, status
+                        FROM protective_orders
+                        WHERE broker = %s
+                        """,
+                        (self._broker,),
+                    )
+                    rows = cur.fetchall() or []
+                    for row in rows:
+                        norm_sym = _normalize_symbol(str(row.get("symbol") or ""))
+                        if not norm_sym:
+                            continue
+                        raw_item_id = row.get("item_id")
+                        parsed_item_id: Optional[UUID] = None
+                        if raw_item_id:
+                            try:
+                                parsed_item_id = (
+                                    raw_item_id
+                                    if isinstance(raw_item_id, UUID)
+                                    else UUID(str(raw_item_id))
+                                )
+                            except Exception:
+                                parsed_item_id = None
+                        cov = ProtectiveOrderCoverage(
+                            symbol=norm_sym,
+                            broker=str(row.get("broker") or self._broker),
+                            broker_order_id=str(row.get("broker_order_id") or ""),
+                            covered_qty=_to_decimal(row.get("qty"), "0"),
+                            stop_price=_to_decimal(row.get("stop_price"), "0"),
+                            take_profit_price=(
+                                _to_decimal(row.get("take_profit_price"), "0")
+                                if row.get("take_profit_price") is not None
+                                else None
+                            ),
+                            status=str(row.get("status") or "MISSING").strip().upper(),
+                            item_id=parsed_item_id,
+                        )
+                        self._coverage_by_symbol[norm_sym] = cov
+                        if cov.broker_order_id:
+                            self._protective_orders_by_id[cov.broker_order_id] = cov
+            finally:
+                conn.close()
+        except Exception as exc:
+            logger.warning(
+                "ProtectiveOcoMonitor failed to hydrate protective_orders on startup: %s",
+                exc,
+            )
+
     def get_coverage(self, symbol: str) -> Optional[ProtectiveOrderCoverage]:
         norm = _normalize_symbol(symbol)
         return self._coverage_by_symbol.get(norm)
-
-    def _connect(self):
-        return psycopg2.connect(
-            self._dsn,
-            cursor_factory=RealDictCursor,
-            connect_timeout=self._connect_timeout_secs,
-        )
 
     def register_protective_order(
         self,
@@ -374,7 +533,15 @@ class ProtectiveOcoMonitor:
             return None
 
         if existing is None:
-            existing = self._coverage_by_symbol.get(target_sym)
+            existing = self.get_coverage(target_sym)
+
+        stale_ids = [
+            oid
+            for oid, cov in self._protective_orders_by_id.items()
+            if cov.symbol == target_sym
+        ]
+        for oid in stale_ids:
+            self._protective_orders_by_id.pop(oid, None)
 
         lost_coverage = ProtectiveOrderCoverage(
             symbol=target_sym,
@@ -401,6 +568,7 @@ class ProtectiveOcoMonitor:
                 item_id=lost_coverage.item_id,
                 override_reason=reason,
             )
+        self._persist_protective_order(lost_coverage)
         return None
 
     def verify_position_coverage(
@@ -422,11 +590,7 @@ class ProtectiveOcoMonitor:
         abs_pos_qty = abs(_to_decimal(pos_qty, "0"))
         self._positions_qty[norm_sym] = abs_pos_qty
 
-        coverage = self._coverage_by_symbol.get(norm_sym)
-        if coverage is None:
-            coverage = self._load_coverage_from_db(norm_sym)
-            if coverage is not None:
-                self._coverage_by_symbol[norm_sym] = coverage
+        coverage = self.get_coverage(norm_sym)
 
         if abs_pos_qty == Decimal("0"):
             closed_cov = ProtectiveOrderCoverage(
@@ -499,8 +663,7 @@ class ProtectiveOcoMonitor:
             uncovered_qty=uncovered_qty,
             reason=mismatch_reason,
         )
-        if self._on_entry_freeze_callback is not None:
-            self._on_entry_freeze_callback(norm_sym, mismatch_reason)
+        self._notify_entry_freeze(norm_sym, mismatch_reason)
 
         return OcoCheckResult(
             symbol=norm_sym,
@@ -513,50 +676,10 @@ class ProtectiveOcoMonitor:
             reason=mismatch_reason,
         )
 
-    def _load_coverage_from_db(self, symbol: str) -> Optional[ProtectiveOrderCoverage]:
-        try:
-            conn = self._connect()
-        except Exception:
-            return None
-        try:
-            with conn:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        """
-                        SELECT broker, symbol, item_id, broker_order_id,
-                               qty, stop_price, take_profit_price, status
-                        FROM protective_orders
-                        WHERE broker = %s AND symbol = %s
-                        """,
-                        (self._broker, symbol),
-                    )
-                    row = cur.fetchone()
-                    if not row:
-                        return None
-                    raw_item_id = row.get("item_id")
-                    parsed_item_id = (
-                        UUID(str(raw_item_id)) if raw_item_id is not None else None
-                    )
-                    return ProtectiveOrderCoverage(
-                        symbol=str(row["symbol"]).strip().upper(),
-                        broker=str(row["broker"]).strip().lower(),
-                        broker_order_id=str(row.get("broker_order_id") or ""),
-                        covered_qty=_to_decimal(row.get("qty"), "0"),
-                        stop_price=_to_decimal(row.get("stop_price"), "0"),
-                        take_profit_price=(
-                            _to_decimal(row.get("take_profit_price"), "0")
-                            if row.get("take_profit_price") is not None
-                            else None
-                        ),
-                        status=str(row.get("status") or "MISSING").strip().upper(),
-                        item_id=parsed_item_id,
-                    )
-        except Exception:
-            return None
-        finally:
-            conn.close()
-
     def _persist_protective_order(self, coverage: ProtectiveOrderCoverage) -> None:
+        if not self._persist_to_db or self._async_writer is None:
+            return
+
         def _task(cur: Any) -> None:
             item_id_val = (
                 str(coverage.item_id)
@@ -620,6 +743,9 @@ class ProtectiveOcoMonitor:
         uncovered_qty: Decimal,
         reason: str,
     ) -> None:
+        if not self._persist_to_db or self._async_writer is None:
+            return
+
         def _task(cur: Any) -> None:
             item_id_val = (
                 str(coverage.item_id)
@@ -735,6 +861,7 @@ class PostgresTelemetryActorConfig(DataActorConfig):
         trading_date: Optional[date] = None,
         connect_timeout_secs: int = 3,
         enforce_protective_oco_on_position_events: bool = True,
+        persist_to_db: bool = True,
         log_events: bool = True,
         log_commands: bool = True,
     ):
@@ -760,6 +887,7 @@ class PostgresTelemetryActorConfig(DataActorConfig):
         trading_date: Optional[date] = None,
         connect_timeout_secs: int = 3,
         enforce_protective_oco_on_position_events: bool = True,
+        persist_to_db: bool = True,
         log_events: bool = True,
         log_commands: bool = True,
     ) -> None:
@@ -772,6 +900,37 @@ class PostgresTelemetryActorConfig(DataActorConfig):
         self.enforce_protective_oco_on_position_events = bool(
             enforce_protective_oco_on_position_events
         )
+        self.persist_to_db = bool(persist_to_db)
+
+
+_ACTIVE_TELEMETRY_ACTORS: "weakref.WeakSet[PostgresTelemetryActor]" = weakref.WeakSet()
+
+
+def find_active_telemetry_actor(
+    cache: Optional[Any] = None,
+    clock: Optional[Any] = None,
+) -> Optional["PostgresTelemetryActor"]:
+    """Finds a live, registered `PostgresTelemetryActor` sharing the exact kernel `cache` or `clock`."""
+    if cache is None and clock is None:
+        return None
+    candidates = list(_ACTIVE_TELEMETRY_ACTORS)
+    for actor in reversed(candidates):
+        if not actor._safe_is_registered():
+            continue
+        actor._refresh_runtime_handles()
+        actor_cache = actor._safe_cache()
+        actor_clock = actor._safe_clock()
+        if (cache is not None and actor_cache is cache) or (
+            clock is not None and actor_clock is clock
+        ):
+            return actor
+        if cache is not None and callable(getattr(cache, "get", None)):
+            try:
+                if cache.get(actor._cache_identity_key) == actor._cache_identity_bytes:
+                    return actor
+            except Exception:
+                pass
+    return None
 
 
 class PostgresTelemetryActor(DataActor):
@@ -795,7 +954,12 @@ class PostgresTelemetryActor(DataActor):
         effective_config = config or PostgresTelemetryActorConfig()
         super().__init__(effective_config)
         self._telemetry_config = effective_config
-        self._dsn = resolve_database_dsn(effective_config.dsn)
+        self._persist_to_db = bool(getattr(effective_config, "persist_to_db", True))
+        self._dsn = (
+            resolve_database_dsn(effective_config.dsn)
+            if self._persist_to_db
+            else (str(effective_config.dsn) if effective_config.dsn is not None else "")
+        )
         self._broker = effective_config.broker
         self._environment = effective_config.environment
         self._market = effective_config.market
@@ -805,16 +969,237 @@ class PostgresTelemetryActor(DataActor):
             effective_config.enforce_protective_oco_on_position_events
         )
         self._oco_monitor = oco_monitor or ProtectiveOcoMonitor(
-            dsn=self._dsn,
+            dsn=self._dsn if self._persist_to_db else None,
             broker=self._broker,
             connect_timeout_secs=self._connect_timeout_secs,
+            persist_to_db=self._persist_to_db,
         )
         self._processed_event_ids: Set[str] = set()
         self._order_meta: Dict[str, Dict[str, Any]] = {}
         self._fills_by_cid: Dict[str, Dict[str, Tuple[Decimal, Decimal]]] = {}
+        self._active_stop_legs_by_symbol: Dict[str, Dict[str, Decimal]] = {}
+        self._active_stop_price_by_leg: Dict[str, Decimal] = {}
+        self._terminated_stop_cids: Set[str] = set()
+        self._replaced_stop_cids: Set[str] = set()
+        self._safe_exit_symbols: Set[str] = set()
         self._msgbus_subscriptions: List[Tuple[str, Any]] = []
+        self._subscribed_msgbuses: Set[int] = set()
+        self._is_started: bool = False
+        self._owner_thread_id: int = threading.get_ident()
+        self._cached_cache: Optional[Any] = None
+        self._cached_clock: Optional[Any] = None
+        self._cache_identity_key: str = f"__nautilus_telemetry_actor__{id(self)}"
+        self._cache_identity_bytes: bytes = str(id(self)).encode("utf-8")
         self._async_writer = self._oco_monitor._async_writer
-        self.ensure_schema()
+
+    def _is_owner_thread(self) -> bool:
+        return threading.get_ident() == getattr(
+            self, "_owner_thread_id", threading.get_ident()
+        )
+
+    @property
+    def trading_date(self) -> Optional[date]:
+        return self._trading_date
+
+    def set_trading_date(self, trading_date: Optional[date]) -> None:
+        """Hot-reloads the active `trading_date` on `PostgresTelemetryActor` during daily rollover."""
+        self._trading_date = trading_date
+        self._telemetry_config.trading_date = trading_date
+
+    def begin_safe_exit(self, symbol: str, reason: str = "TWO_PHASE_SAFE_EXIT") -> None:
+        """Marks `symbol` as entering an authorized Two-Phase Safe Exit window."""
+        _ = reason
+        norm_sym = _normalize_symbol(symbol)
+        if not norm_sym:
+            return
+        self._safe_exit_symbols.add(norm_sym)
+        self._oco_monitor.begin_safe_exit(norm_sym)
+        cache = self._safe_cache()
+        if cache is not None and callable(getattr(cache, "add", None)):
+            try:
+                cache.add(f"__nautilus_safe_exit__{norm_sym}", b"1")
+            except Exception:
+                pass
+
+    def end_safe_exit(self, symbol: str) -> None:
+        """Clears the Two-Phase Safe Exit window for `symbol`."""
+        norm_sym = _normalize_symbol(symbol)
+        if not norm_sym:
+            return
+        self._safe_exit_symbols.discard(norm_sym)
+        self._oco_monitor.end_safe_exit(norm_sym)
+        cache = self._safe_cache()
+        if cache is not None and callable(getattr(cache, "add", None)):
+            try:
+                cache.add(f"__nautilus_safe_exit__{norm_sym}", b"0")
+            except Exception:
+                pass
+
+    def is_safe_exit_active(self, symbol: str) -> bool:
+        """Returns True if `symbol` is currently in an authorized Two-Phase Safe Exit window."""
+        norm_sym = _normalize_symbol(symbol)
+        if not norm_sym:
+            return False
+        if (
+            norm_sym in self._safe_exit_symbols
+            or self._oco_monitor.is_safe_exit_active(norm_sym)
+        ):
+            return True
+        cache = self._safe_cache()
+        if cache is not None and callable(getattr(cache, "get", None)):
+            try:
+                raw = cache.get(f"__nautilus_safe_exit__{norm_sym}")
+                if raw == b"1":
+                    return True
+            except Exception:
+                pass
+        return False
+
+    def is_safe_exit_in_flight(self, symbol: str) -> bool:
+        """Alias for `is_safe_exit_active`."""
+        return self.is_safe_exit_active(symbol)
+
+    def mark_stop_leg_replaced(
+        self,
+        symbol_or_old_cid: str,
+        old_or_new_cid: str = "",
+        new_cid: Optional[str] = None,
+        new_covered_qty: Any = None,
+        stop_price: Any = None,
+        *,
+        symbol: Optional[str] = None,
+    ) -> None:
+        """Records that `old_cid` is being replaced by a resized stop order so its cancellation does not freeze."""
+        s1 = str(symbol_or_old_cid or "").strip()
+        s2 = str(old_or_new_cid or "").strip()
+        if s1.startswith("O-") or (not s2 and symbol):
+            old_cid = s1
+            norm_sym = _normalize_symbol(symbol or "")
+            resolved_new_cid = str(new_cid or s2 or "").strip()
+        else:
+            norm_sym = _normalize_symbol(s1)
+            old_cid = s2
+            resolved_new_cid = str(new_cid or "").strip()
+
+        prev_stop_px = self._active_stop_price_by_leg.get(str(old_cid), Decimal("0"))
+        if not norm_sym and old_cid:
+            for cand_sym, legs in self._active_stop_legs_by_symbol.items():
+                if str(old_cid) in legs:
+                    norm_sym = cand_sym
+                    break
+
+        if old_cid:
+            if len(self._replaced_stop_cids) >= 4096:
+                self._replaced_stop_cids.pop()
+            if len(self._terminated_stop_cids) >= 4096:
+                self._terminated_stop_cids.pop()
+            self._replaced_stop_cids.add(str(old_cid))
+            self._terminated_stop_cids.add(str(old_cid))
+            if norm_sym and norm_sym in self._active_stop_legs_by_symbol:
+                self._active_stop_legs_by_symbol[norm_sym].pop(str(old_cid), None)
+                self._active_stop_price_by_leg.pop(str(old_cid), None)
+            else:
+                for legs in self._active_stop_legs_by_symbol.values():
+                    legs.pop(str(old_cid), None)
+                self._active_stop_price_by_leg.pop(str(old_cid), None)
+
+        qty_dec = (
+            _to_decimal(new_covered_qty, "0")
+            if new_covered_qty is not None
+            else Decimal("0")
+        )
+        if norm_sym and resolved_new_cid and qty_dec > Decimal("0"):
+            self._terminated_stop_cids.discard(resolved_new_cid)
+            self._replaced_stop_cids.discard(resolved_new_cid)
+            legs = self._active_stop_legs_by_symbol.setdefault(norm_sym, {})
+            legs[resolved_new_cid] = qty_dec
+            stop_px_dec = (
+                _to_decimal(stop_price, "0")
+                if stop_price is not None
+                else Decimal("0")
+            )
+            if stop_px_dec <= Decimal("0"):
+                existing_cov = self._oco_monitor.get_coverage(norm_sym)
+                stop_px_dec = (
+                    prev_stop_px
+                    if prev_stop_px > Decimal("0")
+                    else (
+                        existing_cov.stop_price
+                        if existing_cov is not None
+                        else Decimal("0")
+                    )
+                )
+            if stop_px_dec > Decimal("0"):
+                self._active_stop_price_by_leg[resolved_new_cid] = stop_px_dec
+                total_covered_qty = sum(legs.values(), Decimal("0"))
+                self._oco_monitor.register_protective_order(
+                    symbol=norm_sym,
+                    covered_qty=total_covered_qty,
+                    stop_price=stop_px_dec,
+                    broker_order_id=resolved_new_cid,
+                    status="ACTIVE",
+                )
+
+    def _refresh_runtime_handles(self) -> None:
+        if not self._is_owner_thread():
+            return
+        try:
+            if self._safe_is_registered():
+                try:
+                    self._cached_cache = self.cache
+                except Exception:
+                    pass
+                try:
+                    self._cached_clock = self.clock
+                except Exception:
+                    pass
+                if self._cached_cache is not None and callable(
+                    getattr(self._cached_cache, "add", None)
+                ):
+                    try:
+                        self._cached_cache.add(
+                            self._cache_identity_key,
+                            self._cache_identity_bytes,
+                        )
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    def _safe_is_registered(self) -> bool:
+        if not self._is_owner_thread():
+            return False
+        try:
+            is_reg_fn = getattr(self, "is_registered", None)
+            if callable(is_reg_fn):
+                return bool(is_reg_fn())
+            return getattr(self, "trader_id", None) is not None
+        except Exception:
+            return self._is_started and (
+                self._cached_cache is not None or self._cached_clock is not None
+            )
+
+    def _safe_cache(self) -> Optional[Any]:
+        if not self._is_owner_thread():
+            return None
+        try:
+            c = self.cache
+            if c is not None:
+                self._cached_cache = c
+            return c
+        except Exception:
+            return self._cached_cache
+
+    def _safe_clock(self) -> Optional[Any]:
+        if not self._is_owner_thread():
+            return None
+        try:
+            clk = self.clock
+            if clk is not None:
+                self._cached_clock = clk
+            return clk
+        except Exception:
+            return self._cached_clock
 
     @property
     def dsn(self) -> str:
@@ -832,55 +1217,72 @@ class PostgresTelemetryActor(DataActor):
         )
 
     def ensure_schema(self) -> None:
-        """Idempotently ensures `order_fills` exists in PostgreSQL."""
-        conn = self._connect()
-        try:
-            with conn:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        """
-                        CREATE TABLE IF NOT EXISTS order_fills (
-                            fill_id           BIGSERIAL PRIMARY KEY,
-                            trade_id          VARCHAR(128) NOT NULL,
-                            event_id          VARCHAR(128) NOT NULL,
-                            order_id          VARCHAR(128) NOT NULL,
-                            client_order_id   VARCHAR(128) NOT NULL,
-                            venue_order_id    VARCHAR(128) NOT NULL DEFAULT '',
-                            strategy_id       VARCHAR(128) NOT NULL DEFAULT '',
-                            broker            VARCHAR(32) NOT NULL DEFAULT 'alpaca',
-                            environment       VARCHAR(32) NOT NULL DEFAULT 'PAPER',
-                            symbol            VARCHAR(32) NOT NULL,
-                            side              VARCHAR(16) NOT NULL,
-                            last_qty          NUMERIC(20, 6) NOT NULL,
-                            last_px           NUMERIC(20, 6) NOT NULL,
-                            commission        NUMERIC(20, 6) NOT NULL DEFAULT 0,
-                            liquidity_side    VARCHAR(32) NOT NULL DEFAULT 'TAKER',
-                            ts_event_ns       BIGINT NOT NULL DEFAULT 0,
-                            payload           JSONB NOT NULL DEFAULT '{}'::jsonb,
-                            created_at        TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                            UNIQUE (client_order_id, trade_id)
-                        )
-                        """
-                    )
-        finally:
-            conn.close()
+        """Idempotently ensures `order_fills` and dependent telemetry tables exist via `db/migrations/`."""
+        if not self._dsn:
+            return
+        from evolution_engine.db_migrate import apply_migrations
+
+        apply_migrations(self._dsn)
 
     def subscribe_to_message_bus(self, msgbus: Any) -> None:
         """Subscribes to `events.order.*` and `events.position.*` on a Nautilus `MessageBus`."""
+        if msgbus is None:
+            return
+        bus_id = id(msgbus)
+        if bus_id in self._subscribed_msgbuses:
+            return
         order_handler = self.on_order_event
         position_handler = self.on_position_event
         msgbus.subscribe("events.order.*", order_handler)
         msgbus.subscribe("events.position.*", position_handler)
+        self._subscribed_msgbuses.add(bus_id)
         self._msgbus_subscriptions.append(("events.order.*", order_handler))
         self._msgbus_subscriptions.append(("events.position.*", position_handler))
 
     def on_start(self) -> None:
+        self._is_started = True
+        self._refresh_runtime_handles()
+        subscribed = False
+        if self._safe_is_registered():
+            _ACTIVE_TELEMETRY_ACTORS.add(self)
+            try:
+                self.subscribe_topic("events.order.*", self.on_order_event)
+                self.subscribe_topic("events.position.*", self.on_position_event)
+                subscribed = True
+            except Exception:
+                pass
+        if not subscribed:
+            try:
+                msgbus = getattr(self, "msgbus", None)
+                if msgbus is not None:
+                    self.subscribe_to_message_bus(msgbus)
+            except Exception:
+                pass
         self.sync_from_cache()
+
+    def flush(self, timeout_secs: float = 5.0) -> None:
+        if self._async_writer is not None:
+            self._async_writer.flush(timeout_secs=timeout_secs)
 
     def on_stop(self) -> None:
+        self._is_started = False
+        _ACTIVE_TELEMETRY_ACTORS.discard(self)
         self.sync_from_cache()
+        self.flush(timeout_secs=2.0)
+
+    def on_reset(self) -> None:
+        self._is_started = False
+        _ACTIVE_TELEMETRY_ACTORS.discard(self)
+
+    def on_dispose(self) -> None:
+        self._is_started = False
+        _ACTIVE_TELEMETRY_ACTORS.discard(self)
+        self.flush(timeout_secs=2.0)
 
     def close(self) -> None:
+        self._is_started = False
+        _ACTIVE_TELEMETRY_ACTORS.discard(self)
+        self.flush(timeout_secs=2.0)
         try:
             self._oco_monitor.close()
         except Exception:
@@ -902,13 +1304,26 @@ class PostgresTelemetryActor(DataActor):
         self.sync_from_cache()
 
     def sync_from_cache(self) -> None:
-        """Synchronizes any unprocessed order and position events from the Nautilus `Cache`."""
-        try:
-            cache = self.cache
-        except Exception:
-            return
+        """Synchronizes any unprocessed position and order events from the Nautilus `Cache`."""
+        self._refresh_runtime_handles()
+        cache = self._safe_cache()
         if cache is None:
             return
+
+        try:
+            positions = cache.positions()
+        except Exception:
+            positions = []
+
+        ordered_positions = sorted(
+            positions or [],
+            key=lambda p: (
+                not bool(getattr(p, "is_closed", False)),
+                int(getattr(p, "ts_last", 0) or 0),
+            ),
+        )
+        for pos in ordered_positions:
+            self._sync_position_snapshot(pos)
 
         try:
             orders = cache.orders()
@@ -916,19 +1331,304 @@ class PostgresTelemetryActor(DataActor):
             orders = []
 
         for order in orders or []:
-            self._cache_order_metadata(order)
+            self._sync_order_object(order)
             events_Attr = getattr(order, "events", None)
             events = events_Attr() if callable(events_Attr) else (events_Attr or [])
             for ev in events:
                 self.on_order_event(ev)
 
+    def _has_open_protective_stop_for_symbol(self, symbol: str) -> bool:
+        norm_sym = _normalize_symbol(symbol)
+        if not norm_sym:
+            return False
+        cache = self._safe_cache()
+        if cache is None:
+            return False
         try:
-            positions = cache.positions()
+            orders = cache.orders() or []
         except Exception:
-            positions = []
+            return False
+        for order in orders:
+            inst_sym = _normalize_symbol(getattr(order, "instrument_id", ""))
+            if inst_sym != norm_sym:
+                continue
+            meta = self._cache_order_metadata(order)
+            if not _is_protective_stop_meta(meta):
+                continue
+            cid = str(meta.get("client_order_id") or "")
+            vid = str(meta.get("venue_order_id") or "")
+            if (cid and cid in self._terminated_stop_cids) or (
+                vid and vid in self._terminated_stop_cids
+            ):
+                continue
+            is_closed = bool(getattr(order, "is_closed", False))
+            raw_status = str(getattr(order, "status", "") or "").upper()
+            if "." in raw_status:
+                raw_status = raw_status.rsplit(".", 1)[-1]
+            if not is_closed and raw_status not in {
+                "CANCELED",
+                "CANCELLED",
+                "PENDING_CANCEL",
+                "REJECTED",
+                "EXPIRED",
+                "DENIED",
+                "FILLED",
+                "CLOSED",
+            }:
+                return True
+        return False
 
-        for pos in positions or []:
-            self._sync_position_snapshot(pos)
+    def _register_active_stop_leg(
+        self,
+        meta: Dict[str, Any],
+        leaves_qty: Decimal,
+        stop_px: Any,
+    ) -> None:
+        sym = _normalize_symbol(meta.get("symbol") or meta.get("instrument_id") or "")
+        if not sym or leaves_qty <= Decimal("0"):
+            return
+        stop_dec = _to_decimal(stop_px, "0") if stop_px is not None else Decimal("0")
+        if stop_dec <= Decimal("0"):
+            return
+        cid = str(meta.get("client_order_id") or "")
+        vid = str(meta.get("venue_order_id") or "")
+        if (cid and cid in self._terminated_stop_cids) or (
+            vid and vid in self._terminated_stop_cids
+        ):
+            return
+        leg_id = cid or vid
+        if not leg_id:
+            return
+        legs = self._active_stop_legs_by_symbol.setdefault(sym, {})
+        if cid and vid and cid != vid and cid in legs:
+            legs.pop(cid, None)
+            self._active_stop_price_by_leg.pop(cid, None)
+        legs[leg_id] = leaves_qty
+        self._active_stop_price_by_leg[leg_id] = stop_dec
+        if cid:
+            self._active_stop_price_by_leg[cid] = stop_dec
+        if vid:
+            self._active_stop_price_by_leg[vid] = stop_dec
+        total_covered_qty = sum(legs.values(), Decimal("0"))
+        self._oco_monitor.register_protective_order(
+            symbol=sym,
+            covered_qty=total_covered_qty,
+            stop_price=stop_dec,
+            broker_order_id=vid or cid,
+            status="ACTIVE",
+        )
+
+    def _invalidate_stop_leg(
+        self,
+        meta: Dict[str, Any],
+        reason: str,
+    ) -> None:
+        sym = _normalize_symbol(meta.get("symbol") or meta.get("instrument_id") or "")
+        cid = str(meta.get("client_order_id") or "")
+        vid = str(meta.get("venue_order_id") or "")
+        if cid:
+            self._terminated_stop_cids.add(cid)
+            self._active_stop_price_by_leg.pop(cid, None)
+        if vid:
+            self._terminated_stop_cids.add(vid)
+            self._active_stop_price_by_leg.pop(vid, None)
+        legs = self._active_stop_legs_by_symbol.get(sym)
+        if legs is not None:
+            if cid:
+                legs.pop(cid, None)
+            if vid:
+                legs.pop(vid, None)
+        if not sym:
+            return
+
+        self._sync_protective_orders_from_cache(sym)
+        pos_qty = self._sync_open_position_qty_from_cache(sym)
+        active_legs = self._active_stop_legs_by_symbol.get(sym, {})
+        remaining_covered_qty = sum(active_legs.values(), Decimal("0"))
+
+        if remaining_covered_qty > Decimal("0") and (
+            pos_qty == Decimal("0") or remaining_covered_qty >= pos_qty
+        ):
+            active_leg_id = next(iter(active_legs.keys()), vid or cid)
+            existing_cov = self._oco_monitor.get_coverage(sym)
+            active_stop_px = self._active_stop_price_by_leg.get(
+                active_leg_id,
+                existing_cov.stop_price if existing_cov is not None else Decimal("0"),
+            )
+            if active_stop_px <= Decimal("0"):
+                raw_px = (
+                    meta.get("trigger_price")
+                    or meta.get("limit_price")
+                    or meta.get("stop_loss_price")
+                )
+                active_stop_px = _to_decimal(raw_px, "0") if raw_px is not None else Decimal("0")
+            if active_stop_px > Decimal("0"):
+                self._oco_monitor.register_protective_order(
+                    symbol=sym,
+                    covered_qty=remaining_covered_qty,
+                    stop_price=active_stop_px,
+                    broker_order_id=active_leg_id,
+                    status="ACTIVE",
+                )
+                return
+
+        if (
+            cid and cid in self._replaced_stop_cids
+        ) or (
+            vid and vid in self._replaced_stop_cids
+        ):
+            if cid:
+                self._replaced_stop_cids.discard(cid)
+            if vid:
+                self._replaced_stop_cids.discard(vid)
+            if remaining_covered_qty >= pos_qty:
+                return
+
+        if self.is_safe_exit_active(sym) and "CANCELED" in reason.upper():
+            return
+
+        if remaining_covered_qty > Decimal("0") and remaining_covered_qty < pos_qty:
+            active_leg_id = next(iter(active_legs.keys()), vid or cid)
+            existing_cov = self._oco_monitor.get_coverage(sym)
+            active_stop_px = self._active_stop_price_by_leg.get(
+                active_leg_id,
+                existing_cov.stop_price if existing_cov is not None else Decimal("0"),
+            )
+            reduced_cov = ProtectiveOrderCoverage(
+                symbol=sym,
+                broker=self._broker,
+                broker_order_id=active_leg_id,
+                covered_qty=remaining_covered_qty,
+                stop_price=active_stop_px,
+                take_profit_price=(
+                    existing_cov.take_profit_price if existing_cov is not None else None
+                ),
+                status="ACTIVE",
+                item_id=existing_cov.item_id if existing_cov is not None else None,
+            )
+            self._oco_monitor._coverage_by_symbol[sym] = reduced_cov
+            self._oco_monitor.verify_position_coverage(
+                symbol=sym,
+                pos_qty=pos_qty,
+                item_id=reduced_cov.item_id,
+                override_reason=reason,
+            )
+            return
+
+        self._oco_monitor.invalidate_protective_order(
+            symbol=sym,
+            broker_order_id=vid or cid,
+            reason=reason,
+        )
+
+    def _sync_order_object(self, order: Any) -> Dict[str, Any]:
+        """Caches order metadata and registers active protective stop orders (`STOP_*`) if not closed."""
+        meta = self._cache_order_metadata(order)
+        if not meta:
+            return meta
+        if not _is_protective_stop_meta(meta):
+            return meta
+        cid = str(meta.get("client_order_id") or "")
+        vid = str(meta.get("venue_order_id") or "")
+        if (cid and cid in self._terminated_stop_cids) or (
+            vid and vid in self._terminated_stop_cids
+        ):
+            return meta
+        is_closed = bool(getattr(order, "is_closed", False))
+        raw_status = str(getattr(order, "status", "") or "").upper()
+        if "." in raw_status:
+            raw_status = raw_status.rsplit(".", 1)[-1]
+        if is_closed or raw_status in {
+            "CANCELED",
+            "CANCELLED",
+            "PENDING_CANCEL",
+            "REJECTED",
+            "EXPIRED",
+            "DENIED",
+            "FILLED",
+            "CLOSED",
+        }:
+            return meta
+        cid = str(meta.get("client_order_id") or "")
+        cum_filled = sum(
+            (q for q, _ in self._fills_by_cid.get(cid, {}).values()),
+            Decimal("0"),
+        )
+        order_filled = max(
+            _to_decimal(meta.get("filled_qty"), "0"),
+            cum_filled,
+        )
+        total_qty = _to_decimal(meta.get("quantity"), "0")
+        leaves_attr = getattr(order, "leaves_qty", None)
+        leaves_qty = (
+            min(
+                _to_decimal(leaves_attr, "0"),
+                max(Decimal("0"), total_qty - order_filled),
+            )
+            if leaves_attr is not None
+            else max(Decimal("0"), total_qty - order_filled)
+        )
+        if leaves_qty <= Decimal("0"):
+            return meta
+        stop_px = (
+            meta.get("trigger_price")
+            or meta.get("limit_price")
+            or meta.get("stop_loss_price")
+        )
+        stop_dec = _to_decimal(stop_px, "0") if stop_px is not None else Decimal("0")
+        if stop_dec > Decimal("0"):
+            self._register_active_stop_leg(meta, leaves_qty, stop_dec)
+        return meta
+
+    def _sync_protective_orders_from_cache(
+        self,
+        symbol: Optional[str] = None,
+    ) -> None:
+        """Scans `self.cache.orders()` for active protective stop orders matching `symbol`."""
+        cache = self._safe_cache()
+        if cache is None:
+            return
+        try:
+            orders = cache.orders()
+        except Exception:
+            return
+        target_sym = _normalize_symbol(symbol) if symbol else ""
+        for order in orders or []:
+            if target_sym:
+                inst_sym = _normalize_symbol(getattr(order, "instrument_id", ""))
+                if inst_sym != target_sym:
+                    continue
+            self._sync_order_object(order)
+
+    def _sync_open_position_qty_from_cache(self, symbol: str) -> Decimal:
+        """Ensures `_oco_monitor._positions_qty[symbol]` reflects open positions in `self.cache`."""
+        norm_sym = _normalize_symbol(symbol)
+        if not norm_sym:
+            return Decimal("0")
+        existing_qty = self._oco_monitor.get_position_qty(norm_sym)
+        cache = self._safe_cache()
+        if cache is None:
+            return existing_qty
+        try:
+            positions = cache.positions() or []
+        except Exception:
+            return existing_qty
+        found_symbol = False
+        total_open = Decimal("0")
+        for pos in positions:
+            pos_sym = _normalize_symbol(
+                getattr(pos, "instrument_id", "") or getattr(pos, "symbol", "")
+            )
+            if pos_sym != norm_sym:
+                continue
+            found_symbol = True
+            if bool(getattr(pos, "is_closed", False)):
+                continue
+            total_open += abs(_to_decimal(getattr(pos, "quantity", None), "0"))
+        if found_symbol:
+            self._oco_monitor._positions_qty[norm_sym] = total_open
+            return total_open
+        return existing_qty
 
     def _cache_order_metadata(self, order: Any) -> Dict[str, Any]:
         cid = str(getattr(order, "client_order_id", "") or "")
@@ -939,6 +1639,7 @@ class PostgresTelemetryActor(DataActor):
         side = _normalize_side_str(getattr(order, "side", "BUY"))
         order_type = _normalize_order_type_str(getattr(order, "order_type", "MARKET"))
         qty = _to_decimal(getattr(order, "quantity", None), "0")
+        filled_qty = _to_decimal(getattr(order, "filled_qty", None), "0")
         price_attr = getattr(order, "price", None)
         trigger_attr = getattr(order, "trigger_price", None)
         limit_px = _to_decimal(price_attr, "0") if price_attr is not None else None
@@ -956,6 +1657,22 @@ class PostgresTelemetryActor(DataActor):
         stop_loss_px = (
             _to_decimal(stop_loss_raw, "0") if stop_loss_raw is not None else None
         )
+        intent_val = ""
+        if isinstance(exec_params, dict):
+            intent_val = str(
+                exec_params.get("intent") or exec_params.get("action") or ""
+            ).strip().upper()
+        if not intent_val:
+            tags_raw = getattr(order, "tags", None) or []
+            tags_upper = {str(t).strip().upper() for t in tags_raw}
+            if (
+                "PROTECTIVE_STOP" in tags_upper
+                or "STOP_LOSS" in tags_upper
+                or "EXIT" in tags_upper
+            ):
+                intent_val = "PROTECTIVE_STOP"
+            elif "ENTRY" in tags_upper:
+                intent_val = "ENTRY"
         meta = {
             "client_order_id": cid,
             "venue_order_id": str(getattr(order, "venue_order_id", "") or ""),
@@ -965,11 +1682,13 @@ class PostgresTelemetryActor(DataActor):
             "side": side,
             "order_type": order_type,
             "quantity": qty,
+            "filled_qty": filled_qty,
             "limit_price": limit_px,
             "trigger_price": trigger_px,
             "stop_loss_price": stop_loss_px,
             "is_reduce_only": is_reduce_only,
             "parent_order_id": parent_order_id,
+            "intent": intent_val,
         }
         self._order_meta[cid] = meta
         return meta
@@ -978,7 +1697,7 @@ class PostgresTelemetryActor(DataActor):
         cid = str(getattr(event, "client_order_id", "") or "")
         cached_meta = dict(self._order_meta.get(cid, {}))
         try:
-            cache = self.cache
+            cache = self._safe_cache()
             if cache is not None and cid:
                 from nautilus_trader.model import ClientOrderId
 
@@ -1056,6 +1775,11 @@ class PostgresTelemetryActor(DataActor):
             if ev_stop_raw is not None
             else cached_meta.get("stop_loss_price")
         )
+        intent_val = str(cached_meta.get("intent") or "").strip().upper()
+        if isinstance(ev_exec_params, dict) and not intent_val:
+            intent_val = str(
+                ev_exec_params.get("intent") or ev_exec_params.get("action") or ""
+            ).strip().upper()
         merged = {
             "client_order_id": cid,
             "venue_order_id": vid,
@@ -1065,11 +1789,13 @@ class PostgresTelemetryActor(DataActor):
             "side": side,
             "order_type": order_type,
             "quantity": qty,
+            "filled_qty": _to_decimal(cached_meta.get("filled_qty"), "0"),
             "limit_price": limit_px,
             "trigger_price": trigger_px,
             "stop_loss_price": stop_loss_px,
             "is_reduce_only": is_reduce_only,
             "parent_order_id": parent_order_id,
+            "intent": intent_val,
         }
         if cid:
             self._order_meta[cid] = merged
@@ -1109,6 +1835,10 @@ class PostgresTelemetryActor(DataActor):
             self.on_order_canceled(event)
         elif isinstance(event, OrderRejected):
             self.on_order_rejected(event)
+        elif isinstance(event, OrderExpired):
+            self.on_order_expired(event)
+        elif isinstance(event, OrderUpdated):
+            self.on_order_updated(event)
         elif isinstance(event, OrderFilled):
             self.on_order_filled(event)
 
@@ -1127,6 +1857,8 @@ class PostgresTelemetryActor(DataActor):
     def on_order_submitted(self, event: OrderSubmitted) -> None:
         meta = self._resolve_order_metadata(event)
         event_id = str(getattr(event, "event_id", "") or f"sub:{meta['client_order_id']}")
+        if event_id in self._processed_event_ids:
+            return
         self._upsert_order_and_plan_event(
             meta=meta,
             status="SUBMITTED",
@@ -1134,10 +1866,20 @@ class PostgresTelemetryActor(DataActor):
             event_id=event_id,
             reason="Order submitted to execution client",
         )
+        if _is_protective_stop_meta(meta):
+            stop_px = (
+                meta.get("trigger_price")
+                or meta.get("limit_price")
+                or meta.get("stop_loss_price")
+            )
+            if stop_px is not None and _to_decimal(stop_px, "0") > Decimal("0"):
+                self._register_active_stop_leg(meta, meta["quantity"], stop_px)
 
     def on_order_accepted(self, event: OrderAccepted) -> None:
         meta = self._resolve_order_metadata(event)
         event_id = str(getattr(event, "event_id", "") or f"acc:{meta['client_order_id']}")
+        if event_id in self._processed_event_ids:
+            return
         self._upsert_order_and_plan_event(
             meta=meta,
             status="ACCEPTED",
@@ -1145,34 +1887,65 @@ class PostgresTelemetryActor(DataActor):
             event_id=event_id,
             reason="Order accepted by venue",
         )
-        if _is_protective_stop_order_type(meta["order_type"]) and (
-            meta.get("trigger_price") or meta.get("limit_price")
-        ):
-            stop_px = meta.get("trigger_price") or meta.get("limit_price")
-            self._oco_monitor.register_protective_order(
-                symbol=meta["symbol"],
-                covered_qty=meta["quantity"],
-                stop_price=stop_px,
-                broker_order_id=meta["venue_order_id"] or meta["client_order_id"],
-                status="ACTIVE",
+        if _is_protective_stop_meta(meta):
+            stop_px = (
+                meta.get("trigger_price")
+                or meta.get("limit_price")
+                or meta.get("stop_loss_price")
             )
-        elif (
-            not meta.get("is_reduce_only", False)
-            and meta.get("stop_loss_price") is not None
-            and _to_decimal(meta.get("stop_loss_price"), "0") > Decimal("0")
-        ):
-            self._oco_monitor.register_protective_order(
-                symbol=meta["symbol"],
-                covered_qty=meta["quantity"],
-                stop_price=meta["stop_loss_price"],
-                broker_order_id=meta["venue_order_id"] or meta["client_order_id"],
-                status="ACTIVE",
+            if stop_px is not None and _to_decimal(stop_px, "0") > Decimal("0"):
+                self._register_active_stop_leg(meta, meta["quantity"], stop_px)
+
+    def on_order_updated(self, event: OrderUpdated) -> None:
+        meta = self._resolve_order_metadata(event)
+        event_id = str(getattr(event, "event_id", "") or f"upd:{meta['client_order_id']}")
+        if event_id in self._processed_event_ids:
+            return
+        self._upsert_order_and_plan_event(
+            meta=meta,
+            status="ACCEPTED",
+            plan_event_type="ORDER_UPDATED",
+            event_id=event_id,
+            reason="Order updated",
+        )
+        if _is_protective_stop_meta(meta):
+            stop_px = (
+                meta.get("trigger_price")
+                or meta.get("limit_price")
+                or meta.get("stop_loss_price")
+            )
+            if stop_px is not None and _to_decimal(stop_px, "0") > Decimal("0"):
+                self._register_active_stop_leg(meta, meta["quantity"], stop_px)
+
+    def _handle_safe_exit_failure_if_applicable(
+        self,
+        meta: Dict[str, Any],
+        failure_reason: str,
+    ) -> None:
+        sym = _normalize_symbol(meta.get("symbol") or meta.get("instrument_id") or "")
+        if not sym or not self.is_safe_exit_active(sym):
+            return
+        intent_val = str(meta.get("intent") or "").strip().upper()
+        is_reduce_only = bool(meta.get("is_reduce_only", False))
+        if not (is_reduce_only or intent_val in {"EXIT", "FLATTEN", "CLOSE"}):
+            return
+        self.end_safe_exit(sym)
+        pos_qty = self._sync_open_position_qty_from_cache(sym)
+        if pos_qty > Decimal("0"):
+            cid = str(meta.get("client_order_id") or "")
+            vid = str(meta.get("venue_order_id") or "")
+            self._oco_monitor.invalidate_protective_order(
+                symbol=sym,
+                broker_order_id=vid or cid,
+                reason=failure_reason,
             )
 
     def on_order_denied(self, event: OrderDenied) -> None:
         meta = self._resolve_order_metadata(event)
         reason = str(getattr(event, "reason", "ORDER_DENIED") or "ORDER_DENIED")
         event_id = str(getattr(event, "event_id", "") or f"den:{meta['client_order_id']}")
+        if event_id in self._processed_event_ids:
+            return
         self._upsert_order_and_plan_event(
             meta=meta,
             status="DENIED",
@@ -1187,10 +1960,22 @@ class PostgresTelemetryActor(DataActor):
                 "dedup_key": f"telemetry_order_denied:{meta['client_order_id']}:{event_id}",
             },
         )
+        if _is_protective_stop_meta(meta):
+            self._invalidate_stop_leg(
+                meta=meta,
+                reason=f"Protective stop order {meta['client_order_id']} was DENIED: {reason}",
+            )
+        else:
+            self._handle_safe_exit_failure_if_applicable(
+                meta=meta,
+                failure_reason=f"Safe exit order {meta['client_order_id']} was DENIED while position open: {reason}",
+            )
 
     def on_order_canceled(self, event: OrderCanceled) -> None:
         meta = self._resolve_order_metadata(event)
         event_id = str(getattr(event, "event_id", "") or f"can:{meta['client_order_id']}")
+        if event_id in self._processed_event_ids:
+            return
         self._upsert_order_and_plan_event(
             meta=meta,
             status="CANCELED",
@@ -1198,17 +1983,46 @@ class PostgresTelemetryActor(DataActor):
             event_id=event_id,
             reason="Order canceled",
         )
-        if _is_protective_stop_order_type(meta["order_type"]):
-            self._oco_monitor.invalidate_protective_order(
-                symbol=meta["symbol"],
-                broker_order_id=meta["venue_order_id"] or meta["client_order_id"],
+        if _is_protective_stop_meta(meta):
+            self._invalidate_stop_leg(
+                meta=meta,
                 reason=f"Protective stop order {meta['client_order_id']} was CANCELED while position open",
+            )
+        else:
+            self._handle_safe_exit_failure_if_applicable(
+                meta=meta,
+                failure_reason=f"Safe exit order {meta['client_order_id']} was CANCELED while position open",
+            )
+
+    def on_order_expired(self, event: OrderExpired) -> None:
+        meta = self._resolve_order_metadata(event)
+        event_id = str(getattr(event, "event_id", "") or f"exp:{meta['client_order_id']}")
+        if event_id in self._processed_event_ids:
+            return
+        self._upsert_order_and_plan_event(
+            meta=meta,
+            status="EXPIRED",
+            plan_event_type="ORDER_EXPIRED",
+            event_id=event_id,
+            reason="Order expired",
+        )
+        if _is_protective_stop_meta(meta):
+            self._invalidate_stop_leg(
+                meta=meta,
+                reason=f"Protective stop order {meta['client_order_id']} EXPIRED while position open",
+            )
+        else:
+            self._handle_safe_exit_failure_if_applicable(
+                meta=meta,
+                failure_reason=f"Safe exit order {meta['client_order_id']} EXPIRED while position open",
             )
 
     def on_order_rejected(self, event: OrderRejected) -> None:
         meta = self._resolve_order_metadata(event)
         reason = str(getattr(event, "reason", "ORDER_REJECTED") or "ORDER_REJECTED")
         event_id = str(getattr(event, "event_id", "") or f"rej:{meta['client_order_id']}")
+        if event_id in self._processed_event_ids:
+            return
         self._upsert_order_and_plan_event(
             meta=meta,
             status="REJECTED",
@@ -1223,11 +2037,15 @@ class PostgresTelemetryActor(DataActor):
                 "dedup_key": f"telemetry_order_rejected:{meta['client_order_id']}:{event_id}",
             },
         )
-        if _is_protective_stop_order_type(meta["order_type"]):
-            self._oco_monitor.invalidate_protective_order(
-                symbol=meta["symbol"],
-                broker_order_id=meta["venue_order_id"] or meta["client_order_id"],
+        if _is_protective_stop_meta(meta):
+            self._invalidate_stop_leg(
+                meta=meta,
                 reason=f"Protective stop order {meta['client_order_id']} was REJECTED: {reason}",
+            )
+        else:
+            self._handle_safe_exit_failure_if_applicable(
+                meta=meta,
+                failure_reason=f"Safe exit order {meta['client_order_id']} was REJECTED while position open: {reason}",
             )
 
     def on_order_filled(self, event: OrderFilled) -> None:
@@ -1237,6 +2055,8 @@ class PostgresTelemetryActor(DataActor):
         order_id = cid or vid
         trade_id = str(getattr(event, "trade_id", "") or "")
         event_id = str(getattr(event, "event_id", "") or f"fill:{cid}:{trade_id}")
+        if event_id in self._processed_event_ids:
+            return
         last_qty = _to_decimal(getattr(event, "last_qty", None), "0")
         last_px = _to_decimal(getattr(event, "last_px", None), "0")
         commission = _to_decimal(getattr(event, "commission", None), "0")
@@ -1257,6 +2077,54 @@ class PostgresTelemetryActor(DataActor):
             if (total_qty > Decimal("0") and cum_qty >= total_qty)
             else "PARTIALLY_FILLED"
         )
+        if cid in self._order_meta:
+            self._order_meta[cid]["filled_qty"] = cum_qty
+
+        if _is_protective_stop_meta(meta):
+            sym = meta["symbol"]
+            cur_pos_qty = self._oco_monitor.get_position_qty(sym)
+            new_pos_qty = max(Decimal("0"), cur_pos_qty - last_qty)
+            self._oco_monitor._positions_qty[sym] = new_pos_qty
+            leaves_qty = max(Decimal("0"), total_qty - cum_qty)
+            legs = self._active_stop_legs_by_symbol.setdefault(sym, {})
+            if leaves_qty <= Decimal("0"):
+                if cid:
+                    legs.pop(cid, None)
+                    self._replaced_stop_cids.discard(cid)
+                if vid:
+                    legs.pop(vid, None)
+                    self._replaced_stop_cids.discard(vid)
+            else:
+                legs[cid or vid] = leaves_qty
+            total_remaining_cov = sum(legs.values(), Decimal("0"))
+            stop_px = (
+                meta.get("trigger_price")
+                or meta.get("limit_price")
+                or meta.get("stop_loss_price")
+                or Decimal("0")
+            )
+            if total_remaining_cov == Decimal("0") or new_pos_qty == Decimal("0"):
+                legs.clear()
+                closed_cov = ProtectiveOrderCoverage(
+                    symbol=sym,
+                    broker=self._broker,
+                    broker_order_id=vid or cid,
+                    covered_qty=Decimal("0"),
+                    stop_price=_to_decimal(stop_px, "0"),
+                    status="CLOSED",
+                )
+                self._oco_monitor._coverage_by_symbol[sym] = closed_cov
+                if vid or cid:
+                    self._oco_monitor._protective_orders_by_id.pop(vid or cid, None)
+                self._oco_monitor._persist_protective_order(closed_cov)
+            else:
+                self._oco_monitor.register_protective_order(
+                    symbol=sym,
+                    covered_qty=total_remaining_cov,
+                    stop_price=stop_px,
+                    broker_order_id=vid or cid,
+                    status="ACTIVE",
+                )
 
         def _task(cur: Any) -> None:
             cur.execute(
@@ -1341,20 +2209,9 @@ class PostgresTelemetryActor(DataActor):
                 },
             )
 
-        self._async_writer.submit(_task)
+        if self._persist_to_db and self._async_writer is not None:
+            self._async_writer.submit(_task)
         self._processed_event_ids.add(event_id)
-        if (
-            not meta.get("is_reduce_only", False)
-            and meta.get("stop_loss_price") is not None
-            and _to_decimal(meta.get("stop_loss_price"), "0") > Decimal("0")
-        ):
-            self._oco_monitor.register_protective_order(
-                symbol=meta["symbol"],
-                covered_qty=max(meta["quantity"], cum_qty),
-                stop_price=meta["stop_loss_price"],
-                broker_order_id=vid or cid,
-                status="ACTIVE",
-            )
 
     def on_position_opened(self, event: PositionOpened) -> None:
         self._handle_position_lifecycle_event(event, "POSITION_OPENED", is_closed=False)
@@ -1440,7 +2297,8 @@ class PostgresTelemetryActor(DataActor):
                 },
             )
 
-        self._async_writer.submit(_task)
+        if self._persist_to_db and self._async_writer is not None:
+            self._async_writer.submit(_task)
         self._processed_event_ids.add(event_id)
 
     def _handle_position_lifecycle_event(
@@ -1456,6 +2314,8 @@ class PostgresTelemetryActor(DataActor):
         event_id = str(
             getattr(event, "event_id", "") or f"{plan_event_type}:{pos_id}:{symbol}"
         )
+        if event_id in self._processed_event_ids:
+            return
         side_raw = str(getattr(event, "entry", None) or getattr(event, "side", "LONG"))
         side = "short" if ("SHORT" in side_raw.upper() or "SELL" in side_raw.upper()) else "long"
         qty = (
@@ -1466,6 +2326,9 @@ class PostgresTelemetryActor(DataActor):
         avg_px_open = _to_decimal(getattr(event, "avg_px_open", None), "0")
         realized_pnl = _to_decimal(getattr(event, "realized_pnl", None), "0")
         ts_event = int(getattr(event, "ts_event", 0) or 0)
+        self._processed_event_ids.add(
+            f"pos_snap:{pos_id}:{qty}:{is_closed}:{ts_event}"
+        )
 
         self._submit_position_upsert_task(
             symbol=symbol,
@@ -1480,15 +2343,24 @@ class PostgresTelemetryActor(DataActor):
             event_id=event_id,
         )
         if is_closed:
-            self._oco_monitor.verify_position_coverage(symbol=symbol, pos_qty=Decimal("0"))
+            self.end_safe_exit(symbol)
+            self._oco_monitor._positions_qty[symbol] = Decimal("0")
+            if not self._has_open_protective_stop_for_symbol(symbol):
+                self._active_stop_legs_by_symbol.pop(symbol, None)
+                self._oco_monitor.verify_position_coverage(
+                    symbol=symbol, pos_qty=Decimal("0")
+                )
+        elif self.is_safe_exit_active(symbol):
+            self._oco_monitor._positions_qty[symbol] = qty
         elif self._enforce_oco_on_pos or self._oco_monitor.get_coverage(symbol) is not None:
+            self._sync_protective_orders_from_cache(symbol)
             self._oco_monitor.verify_position_coverage(symbol=symbol, pos_qty=qty)
         else:
             self._oco_monitor._positions_qty[symbol] = qty
 
     def _sync_position_snapshot(self, pos: Any) -> None:
         inst_id = str(getattr(pos, "instrument_id", "") or "")
-        symbol = _normalize_symbol(inst_id)
+        symbol = _normalize_symbol(inst_id or getattr(pos, "symbol", ""))
         if not symbol:
             return
         is_closed = bool(getattr(pos, "is_closed", False))
@@ -1497,10 +2369,20 @@ class PostgresTelemetryActor(DataActor):
             if is_closed
             else abs(_to_decimal(getattr(pos, "quantity", None), "0"))
         )
+        if is_closed:
+            self.end_safe_exit(symbol)
+            self._oco_monitor._positions_qty[symbol] = Decimal("0")
+            if not self._has_open_protective_stop_for_symbol(symbol):
+                self._active_stop_legs_by_symbol.pop(symbol, None)
+                self._oco_monitor.verify_position_coverage(
+                    symbol=symbol, pos_qty=Decimal("0")
+                )
         pos_id = str(getattr(pos, "id", "") or "")
         ts_last = int(getattr(pos, "ts_last", 0) or 0)
         synth_event_id = f"pos_snap:{pos_id}:{qty}:{is_closed}:{ts_last}"
         if synth_event_id in self._processed_event_ids:
+            if not is_closed:
+                self._oco_monitor._positions_qty[symbol] = qty
             return
         plan_event_type = (
             "POSITION_CLOSED"
@@ -1529,6 +2411,14 @@ class PostgresTelemetryActor(DataActor):
             plan_event_type=plan_event_type,
             event_id=synth_event_id,
         )
+        if not is_closed:
+            if self.is_safe_exit_active(symbol):
+                self._oco_monitor._positions_qty[symbol] = qty
+            elif self._enforce_oco_on_pos or self._oco_monitor.get_coverage(symbol) is not None:
+                self._sync_protective_orders_from_cache(symbol)
+                self._oco_monitor.verify_position_coverage(symbol=symbol, pos_qty=qty)
+            else:
+                self._oco_monitor._positions_qty[symbol] = qty
 
     def _upsert_order_and_plan_event(
         self,
@@ -1604,7 +2494,8 @@ class PostgresTelemetryActor(DataActor):
                         ),
                     )
 
-        self._async_writer.submit(_task)
+        if self._persist_to_db and self._async_writer is not None:
+            self._async_writer.submit(_task)
         self._processed_event_ids.add(event_id)
 
     def _upsert_order_row_in_tx(

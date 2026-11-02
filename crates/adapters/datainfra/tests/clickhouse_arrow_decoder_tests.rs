@@ -316,13 +316,22 @@ fn test_decode_v_quant_bars_across_all_timeframes_and_symbols_adjusted_and_raw()
         );
     }
 
-    // Check first two bars at ts=1_700_001_000s (AAPL 15m and AAPL 4h)
-    let expected_ts_first = UnixNanos::from(1_700_001_000_000_000_000_u64);
+    // Check first bar: AAPL 15m at bar_start_time=1_700_001_000s -> ts_event = 1_700_001_900s
+    let expected_ts_first = UnixNanos::from(1_700_001_900_000_000_000_u64);
     assert_eq!(bars_from_batch[0].ts_event, expected_ts_first);
     assert_eq!(bars_from_batch[0].ts_init, expected_ts_first);
-    assert_eq!(bars_from_batch[1].ts_event, expected_ts_first);
+    // Second bar: MSFT 1h at bar_start_time=1_700_002_000s -> ts_event = 1_700_005_600s
+    assert_eq!(
+        bars_from_batch[1].ts_event,
+        UnixNanos::from(1_700_005_600_000_000_000_u64)
+    );
+    // Third bar: AAPL 4h at bar_start_time=1_700_001_000s -> ts_event = 1_700_015_400s
+    assert_eq!(
+        bars_from_batch[2].ts_event,
+        UnixNanos::from(1_700_015_400_000_000_000_u64)
+    );
 
-    // Verify last bar is NVDA 1w at ts=1_700_005_000s with Adjusted prices
+    // Verify last bar is NVDA 1w at bar_start_time=1_700_005_000s -> ts_event = 1_700_609_800s with Adjusted prices
     let last_adj = &bars_from_batch[4];
     assert_eq!(
         last_adj.bar_type,
@@ -330,7 +339,7 @@ fn test_decode_v_quant_bars_across_all_timeframes_and_symbols_adjusted_and_raw()
     );
     assert_eq!(
         last_adj.ts_event,
-        UnixNanos::from(1_700_005_000_000_000_000_u64)
+        UnixNanos::from(1_700_609_800_000_000_000_u64)
     );
     assert_eq!(last_adj.open, Price::new(480.25, 2));
     assert_eq!(last_adj.high, Price::new(495.50, 2));
@@ -457,11 +466,11 @@ fn test_decode_bars_filters_synthetic_and_suspect_spike_rows_and_clamps_ts_init(
     let is_synthetic = [false, true, false, true, false];
     let is_suspect_spike = [false, false, true, true, false];
     let ingest_ts_ms = [
-        1_700_100_005_000_i64, // 5 seconds after ts_event
+        1_700_100_905_000_i64, // 5 seconds after ts_event (1_700_100_900s)
         1_700_100_900_000_i64,
         1_700_101_800_000_i64,
         1_700_102_700_000_i64,
-        1_700_100_000_000_i64, // Earlier than 1_700_103_600s -> must clamp to ts_event
+        1_700_100_000_000_i64, // Earlier than ts_event (1_700_104_500s) -> must clamp to ts_event
     ];
 
     let batch = build_v_quant_bars_record_batch(
@@ -479,21 +488,21 @@ fn test_decode_bars_filters_synthetic_and_suspect_spike_rows_and_clamps_ts_init(
     let bars = decode_bars_batches(&[batch], &opts).expect("decode and filter dirty bars");
     assert_eq!(bars.len(), 2, "all 3 dirty rows must be discarded");
 
-    // Row 0: AAPL clean, ts_init preserved (> ts_event)
+    // Row 0: AAPL clean, ts_event = bar_open (1_700_100_000s) + 15m (900s) = 1_700_100_900s, ts_init preserved (> ts_event)
     assert_eq!(
         bars[0].ts_event,
-        UnixNanos::from(1_700_100_000_000_000_000_u64)
+        UnixNanos::from(1_700_100_900_000_000_000_u64)
     );
     assert_eq!(
         bars[0].ts_init,
-        UnixNanos::from(1_700_100_005_000_000_000_u64)
+        UnixNanos::from(1_700_100_905_000_000_000_u64)
     );
     assert!(bars[0].ts_init >= bars[0].ts_event);
 
-    // Row 4: MSFT clean, ts_init clamped to ts_event
+    // Row 4: MSFT clean, ts_event = bar_open (1_700_103_600s) + 15m (900s) = 1_700_104_500s, ts_init clamped to ts_event
     assert_eq!(
         bars[1].ts_event,
-        UnixNanos::from(1_700_103_600_000_000_000_u64)
+        UnixNanos::from(1_700_104_500_000_000_000_u64)
     );
     assert_eq!(bars[1].ts_init, bars[1].ts_event);
 }

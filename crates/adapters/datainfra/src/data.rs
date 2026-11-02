@@ -17,16 +17,23 @@
 //! subscriptions (`Bar`, `QuoteTick`, `InstrumentStatus`), `CalendarSessionGate` RTH
 //! session validation, and ClickHouse historical `RequestBars` / `RequestInstrument` backfill.
 
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
 };
 
 use async_trait::async_trait;
 use indexmap::{IndexMap, IndexSet};
 use nautilus_common::{
     clients::{DataClient, execute_bar_subscriptions, execute_instrument_subscriptions},
-    live::{runner::try_get_data_event_sender, sender::EventSender},
+    live::{
+        runner::try_get_data_event_sender,
+        runtime::get_runtime,
+        sender::EventSender,
+    },
     messages::{
         DataEvent, DataResponse,
         data::{
@@ -48,6 +55,8 @@ use nautilus_model::{
     identifiers::{ClientId, InstrumentId, Venue},
     instruments::{Instrument, InstrumentAny},
 };
+use parking_lot::{Mutex, RwLock};
+use tokio::{sync::watch, task::JoinHandle};
 
 use crate::{
     arrow_decoder::PriceAdjustmentMode,
@@ -60,15 +69,24 @@ use crate::{
     config::DataInfraConfig,
     error::{DataInfraError, DataInfraResult},
     instrument::DataInfraEquityMetadata,
-    mapping::{from_bar_type, from_instrument_id},
+    kafka::{KafkaPayloadSource, TcpKafkaPayloadSource},
+    mapping::{from_bar_type, from_instrument_id, timeframe_step_ns},
     stream::{
-        CanonicalStreamDecoder, DataInfraStreamEvent, KafkaStreamSessionCoordinator,
+        CanonicalStreamDecoder, DEFAULT_DECODER_PRICE_PRECISION, DEFAULT_DECODER_SIZE_PRECISION,
+        DEFAULT_VERSION_TRACKER_CAPACITY, DataInfraStreamEvent, KafkaStreamSessionCoordinator,
         StreamDecodeOutcome, StreamLifecycleListener,
     },
 };
 
 /// Canonical client name for the `DataInfra` market data adapter.
 pub const DATAINFRA: &str = "DATAINFRA";
+
+/// Backoff interval when the Kafka stream source reports no frame immediately ready.
+const STREAM_IDLE_BACKOFF_MS: u64 = 15;
+/// Backoff interval before attempting a broker reconnect after a stream transport error.
+const STREAM_RECONNECT_BACKOFF_MS: u64 = 50;
+/// Maximum buffered background stream events awaiting an in-flight subscription command.
+const MAX_PENDING_STREAM_EVENTS: usize = 256;
 
 /// Default [`StreamLifecycleListener`] for [`DataInfraDataClient`] that logs stream transitions.
 #[derive(Debug, Default)]
@@ -88,6 +106,156 @@ impl StreamLifecycleListener for TracingStreamLifecycleListener {
     }
 }
 
+#[derive(Debug, Default)]
+struct SubscriptionRegistry {
+    bars: RwLock<IndexSet<BarType>>,
+    quotes: RwLock<IndexSet<InstrumentId>>,
+    statuses: RwLock<IndexSet<InstrumentId>>,
+    pending_events: Mutex<Vec<DataInfraStreamEvent>>,
+}
+
+impl SubscriptionRegistry {
+    fn contains_bar(&self, bar_type: &BarType) -> bool {
+        self.bars.read().contains(bar_type)
+    }
+
+    fn contains_quote(&self, instrument_id: &InstrumentId) -> bool {
+        self.quotes.read().contains(instrument_id)
+    }
+
+    fn contains_status(&self, instrument_id: &InstrumentId) -> bool {
+        self.statuses.read().contains(instrument_id)
+    }
+
+    fn buffer_unsubscribed_event(&self, event: DataInfraStreamEvent) {
+        let mut guard = self.pending_events.lock();
+        if guard.len() >= MAX_PENDING_STREAM_EVENTS {
+            guard.remove(0);
+        }
+        guard.push(event);
+    }
+
+    fn drain_matching_bar(&self, bar_type: &BarType) -> Vec<DataInfraStreamEvent> {
+        let mut guard = self.pending_events.lock();
+        let mut matched = Vec::new();
+        guard.retain(|ev| match ev {
+            DataInfraStreamEvent::Bar(b) | DataInfraStreamEvent::UpdatedBar { bar: b, .. }
+                if &b.bar_type == bar_type =>
+            {
+                matched.push(ev.clone());
+                false
+            }
+            _ => true,
+        });
+        matched
+    }
+
+    fn drain_matching_quote(&self, instrument_id: &InstrumentId) -> Vec<DataInfraStreamEvent> {
+        let mut guard = self.pending_events.lock();
+        let mut matched = Vec::new();
+        guard.retain(|ev| match ev {
+            DataInfraStreamEvent::Quote(q) if &q.instrument_id == instrument_id => {
+                matched.push(ev.clone());
+                false
+            }
+            _ => true,
+        });
+        matched
+    }
+
+    fn drain_matching_status(&self, instrument_id: &InstrumentId) -> Vec<DataInfraStreamEvent> {
+        let mut guard = self.pending_events.lock();
+        let mut matched = Vec::new();
+        guard.retain(|ev| match ev {
+            DataInfraStreamEvent::TradingStatus(s) if &s.instrument_id == instrument_id => {
+                matched.push(ev.clone());
+                false
+            }
+            _ => true,
+        });
+        matched
+    }
+
+    fn clear_all(&self) {
+        self.bars.write().clear();
+        self.quotes.write().clear();
+        self.statuses.write().clear();
+        self.pending_events.lock().clear();
+    }
+}
+
+#[derive(Debug)]
+struct ConsumerTaskHandle {
+    shutdown_tx: watch::Sender<bool>,
+    join_handle: JoinHandle<()>,
+}
+
+impl ConsumerTaskHandle {
+    fn signal_and_abort(&self) {
+        let _ = self.shutdown_tx.send(true);
+        self.join_handle.abort();
+    }
+
+    fn is_running(&self) -> bool {
+        !self.join_handle.is_finished()
+    }
+}
+
+fn send_event_via_shared_sender(
+    shared_sender: &RwLock<Option<EventSender<DataEvent>>>,
+    event: DataEvent,
+) -> DataInfraResult<()> {
+    let guard = shared_sender.read();
+    let Some(ref sender) = *guard else {
+        return Err(DataInfraError::Transport(
+            "DataInfraDataClient has no bound DataEvent sender".to_string(),
+        ));
+    };
+    sender.send(event).map_err(|e| {
+        DataInfraError::Transport(format!("Failed to send DataEvent to DataEngine: {e}"))
+    })
+}
+
+fn dispatch_stream_event(
+    event: &DataInfraStreamEvent,
+    subscriptions: &SubscriptionRegistry,
+    shared_sender: &RwLock<Option<EventSender<DataEvent>>>,
+    buffer_if_unsubscribed: bool,
+) -> DataInfraResult<bool> {
+    match event {
+        DataInfraStreamEvent::Bar(bar) | DataInfraStreamEvent::UpdatedBar { bar, .. } => {
+            if !subscriptions.contains_bar(&bar.bar_type) {
+                if buffer_if_unsubscribed {
+                    subscriptions.buffer_unsubscribed_event(event.clone());
+                }
+                return Ok(false);
+            }
+            send_event_via_shared_sender(shared_sender, DataEvent::Data(Data::Bar(*bar)))?;
+            Ok(true)
+        }
+        DataInfraStreamEvent::Quote(quote) => {
+            if !subscriptions.contains_quote(&quote.instrument_id) {
+                if buffer_if_unsubscribed {
+                    subscriptions.buffer_unsubscribed_event(event.clone());
+                }
+                return Ok(false);
+            }
+            send_event_via_shared_sender(shared_sender, DataEvent::Data(Data::Quote(*quote)))?;
+            Ok(true)
+        }
+        DataInfraStreamEvent::TradingStatus(status) => {
+            if !subscriptions.contains_status(&status.instrument_id) {
+                if buffer_if_unsubscribed {
+                    subscriptions.buffer_unsubscribed_event(event.clone());
+                }
+                return Ok(false);
+            }
+            send_event_via_shared_sender(shared_sender, DataEvent::InstrumentStatus(*status))?;
+            Ok(true)
+        }
+    }
+}
+
 /// Real-time and historical [`DataClient`] for `DataInfra` (ClickHouse + Kafka + `calendar-service`).
 #[derive(Debug)]
 pub struct DataInfraDataClient {
@@ -96,15 +264,27 @@ pub struct DataInfraDataClient {
     config: DataInfraConfig,
     clickhouse_transport: Arc<dyn ClickHouseArrowTransport>,
     calendar_gate: CalendarSessionGate,
-    coordinator: KafkaStreamSessionCoordinator,
+    kafka_source: Arc<dyn KafkaPayloadSource>,
+    coordinator: Arc<KafkaStreamSessionCoordinator>,
     is_connected: Arc<AtomicBool>,
     subscribed_bars: IndexSet<BarType>,
     subscribed_quotes: IndexSet<InstrumentId>,
     subscribed_statuses: IndexSet<InstrumentId>,
+    subscriptions: Arc<SubscriptionRegistry>,
     instruments: IndexMap<InstrumentId, InstrumentAny>,
     data_sender: Option<EventSender<DataEvent>>,
+    shared_sender: Arc<RwLock<Option<EventSender<DataEvent>>>>,
+    consumer_task: Option<ConsumerTaskHandle>,
     clock: &'static AtomicTime,
     enforce_calendar_on_connect: bool,
+}
+
+impl Drop for DataInfraDataClient {
+    fn drop(&mut self) {
+        if let Some(ref handle) = self.consumer_task {
+            handle.signal_and_abort();
+        }
+    }
 }
 
 impl DataInfraDataClient {
@@ -161,31 +341,80 @@ impl DataInfraDataClient {
         data_sender: Option<EventSender<DataEvent>>,
         lifecycle_listener: Arc<dyn StreamLifecycleListener>,
     ) -> DataInfraResult<Self> {
+        let kafka_source = Arc::new(TcpKafkaPayloadSource::from_config(&config)?);
+        Self::with_transports_and_kafka_source(
+            client_id,
+            config,
+            clickhouse_transport,
+            calendar_gate,
+            kafka_source,
+            data_sender,
+            lifecycle_listener,
+        )
+    }
+
+    /// Creates a [`DataInfraDataClient`] with explicit ClickHouse, Calendar, Kafka stream source,
+    /// `DataEvent` sender, and [`StreamLifecycleListener`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataInfraError`] if `config.validate()` fails.
+    pub fn with_transports_and_kafka_source(
+        client_id: ClientId,
+        config: DataInfraConfig,
+        clickhouse_transport: Arc<dyn ClickHouseArrowTransport>,
+        calendar_gate: CalendarSessionGate,
+        kafka_source: Arc<dyn KafkaPayloadSource>,
+        data_sender: Option<EventSender<DataEvent>>,
+        lifecycle_listener: Arc<dyn StreamLifecycleListener>,
+    ) -> DataInfraResult<Self> {
         config.validate()?;
         let venue = Venue::from(config.default_venue.as_str());
-        let decoder = CanonicalStreamDecoder::new(&config.default_venue, 2, 0, 4096);
+        let decoder = CanonicalStreamDecoder::new(
+            &config.default_venue,
+            DEFAULT_DECODER_PRICE_PRECISION,
+            DEFAULT_DECODER_SIZE_PRECISION,
+            DEFAULT_VERSION_TRACKER_CAPACITY,
+        );
         let endpoint = config.kafka_brokers.join(",");
-        let coordinator = KafkaStreamSessionCoordinator::new(endpoint, decoder, lifecycle_listener);
+        let coordinator = Arc::new(KafkaStreamSessionCoordinator::new(
+            endpoint,
+            decoder,
+            lifecycle_listener,
+        ));
+        let shared_sender = Arc::new(RwLock::new(data_sender.clone()));
         Ok(Self {
             client_id,
             venue,
             config,
             clickhouse_transport,
             calendar_gate,
+            kafka_source,
             coordinator,
             is_connected: Arc::new(AtomicBool::new(false)),
             subscribed_bars: IndexSet::new(),
             subscribed_quotes: IndexSet::new(),
             subscribed_statuses: IndexSet::new(),
+            subscriptions: Arc::new(SubscriptionRegistry::default()),
             instruments: IndexMap::new(),
             data_sender,
+            shared_sender,
+            consumer_task: None,
             clock: get_atomic_clock_realtime(),
             enforce_calendar_on_connect: true,
         })
     }
 
+    /// Replaces the [`KafkaPayloadSource`] used by the background stream consumer task.
+    #[must_use]
+    pub fn with_kafka_source(mut self, kafka_source: Arc<dyn KafkaPayloadSource>) -> Self {
+        self.kafka_source = kafka_source;
+        self
+    }
+
     /// Binds or replaces the `DataEvent` channel sender toward `DataEngine`.
     pub fn set_data_sender(&mut self, sender: EventSender<DataEvent>) {
+        *self.shared_sender.write() = Some(sender.clone());
         self.data_sender = Some(sender);
     }
 
@@ -194,6 +423,14 @@ impl DataInfraDataClient {
     pub const fn with_calendar_check_on_connect(mut self, enforce: bool) -> Self {
         self.enforce_calendar_on_connect = enforce;
         self
+    }
+
+    /// Returns whether the background Tokio Kafka consumer loop is currently active.
+    #[must_use]
+    pub fn is_consumer_task_running(&self) -> bool {
+        self.consumer_task
+            .as_ref()
+            .is_some_and(ConsumerTaskHandle::is_running)
     }
 
     /// Returns a reference to the [`CalendarSessionGate`].
@@ -268,42 +505,160 @@ impl DataInfraDataClient {
     ///
     /// # Errors
     ///
-    /// Returns [`DataInfraError::Transport`] if no `DataEvent` sender is bound or the channel is closed.
+    /// Returns [`DataInfraError::Transport`] if no `DataEvent` sender is bound or the channel is closed,
+    /// or [`DataInfraError::CalendarGate`] if a bar falls outside the cached RTH session window.
     pub fn forward_stream_event(&self, event: &DataInfraStreamEvent) -> DataInfraResult<bool> {
-        match event {
-            DataInfraStreamEvent::Bar(bar) | DataInfraStreamEvent::UpdatedBar { bar, .. } => {
-                if !self.subscribed_bars.contains(&bar.bar_type) {
-                    return Ok(false);
-                }
-                self.send_data_event(DataEvent::Data(Data::Bar(*bar)))?;
-                Ok(true)
-            }
-            DataInfraStreamEvent::Quote(quote) => {
-                if !self.subscribed_quotes.contains(&quote.instrument_id) {
-                    return Ok(false);
-                }
-                self.send_data_event(DataEvent::Data(Data::Quote(*quote)))?;
-                Ok(true)
-            }
-            DataInfraStreamEvent::TradingStatus(status) => {
-                if !self.subscribed_statuses.contains(&status.instrument_id) {
-                    return Ok(false);
-                }
-                self.send_data_event(DataEvent::InstrumentStatus(*status))?;
-                Ok(true)
+        if let DataInfraStreamEvent::Bar(bar) | DataInfraStreamEvent::UpdatedBar { bar, .. } = event
+            && (self.enforce_calendar_on_connect || self.calendar_gate.cached_status().is_some())
+        {
+            let bar_open_ns = UnixNanos::from(
+                bar.ts_event
+                    .as_u64()
+                    .saturating_sub(timeframe_step_ns(&bar.bar_type)),
+            );
+            if !self.calendar_gate.is_within_cached_rth(bar_open_ns)? {
+                return Err(DataInfraError::CalendarGate(format!(
+                    "live bar {} at bar_open_ns={bar_open_ns} (ts_event={}) is outside cached RTH session window",
+                    bar.bar_type, bar.ts_event
+                )));
             }
         }
+        dispatch_stream_event(event, &self.subscriptions, &self.shared_sender, false)
     }
 
     fn send_data_event(&self, event: DataEvent) -> DataInfraResult<()> {
-        let Some(ref sender) = self.data_sender else {
-            return Err(DataInfraError::Transport(
-                "DataInfraDataClient has no bound DataEvent sender".to_string(),
-            ));
-        };
-        sender.send(event).map_err(|e| {
-            DataInfraError::Transport(format!("Failed to send DataEvent to DataEngine: {e}"))
-        })
+        send_event_via_shared_sender(&self.shared_sender, event)
+    }
+
+    fn spawn_consumer_task(&mut self) {
+        self.abort_consumer_task();
+
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let kafka_source = Arc::clone(&self.kafka_source);
+        let coordinator = Arc::clone(&self.coordinator);
+        let subscriptions = Arc::clone(&self.subscriptions);
+        let shared_sender = Arc::clone(&self.shared_sender);
+        let calendar_gate = self.calendar_gate.clone();
+        let enforce_calendar = self.enforce_calendar_on_connect;
+
+        let handle = tokio::runtime::Handle::try_current()
+            .unwrap_or_else(|_| get_runtime().handle().clone());
+
+        let join_handle = handle.spawn(async move {
+            let mut stream_faulted = false;
+            loop {
+                if *shutdown_rx.borrow() {
+                    break;
+                }
+                tokio::select! {
+                    biased;
+                    _ = shutdown_rx.changed() => {
+                        break;
+                    }
+                    frame_res = kafka_source.next_frame() => {
+                        match frame_res {
+                            Ok(Some(frame)) => {
+                                if stream_faulted {
+                                    coordinator.notify_connected();
+                                    stream_faulted = false;
+                                }
+                                match coordinator.process_kafka_message(&frame.topic, &frame.payload) {
+                                    Ok(StreamDecodeOutcome::Emitted(ref event)) => {
+                                        if let DataInfraStreamEvent::Bar(bar)
+                                        | DataInfraStreamEvent::UpdatedBar { bar, .. } = event
+                                            && (enforce_calendar || calendar_gate.cached_status().is_some())
+                                        {
+                                            let bar_open_ns = UnixNanos::from(
+                                                bar.ts_event
+                                                    .as_u64()
+                                                    .saturating_sub(timeframe_step_ns(&bar.bar_type)),
+                                            );
+                                            match calendar_gate.is_within_cached_rth(bar_open_ns) {
+                                                Ok(true) => {}
+                                                Ok(false) => {
+                                                    log::warn!(
+                                                        "DataInfra background consumer dropped non-RTH bar {} at bar_open_ns={bar_open_ns}",
+                                                        bar.bar_type
+                                                    );
+                                                    continue;
+                                                }
+                                                Err(e) => {
+                                                    log::warn!(
+                                                        "DataInfra background consumer calendar gate rejected bar {}: {e}",
+                                                        bar.bar_type
+                                                    );
+                                                    continue;
+                                                }
+                                            }
+                                        }
+                                        if let Err(e) = dispatch_stream_event(
+                                            event,
+                                            &subscriptions,
+                                            &shared_sender,
+                                            true,
+                                        ) {
+                                            log::error!("DataInfra background consumer failed to dispatch DataEvent: {e}");
+                                        }
+                                    }
+                                    Ok(
+                                        StreamDecodeOutcome::FilteredSynthetic { .. }
+                                        | StreamDecodeOutcome::FilteredSuspectSpike { .. }
+                                        | StreamDecodeOutcome::DuplicateOrStaleVersion { .. },
+                                    ) => {}
+                                    Err(e) => {
+                                        log::warn!(
+                                            "DataInfra background consumer dropped invalid frame on topic '{}': {e}",
+                                            frame.topic
+                                        );
+                                    }
+                                }
+                            }
+                            Ok(None) => {
+                                if stream_faulted {
+                                    coordinator.notify_connected();
+                                    stream_faulted = false;
+                                }
+                                tokio::select! {
+                                    _ = shutdown_rx.changed() => break,
+                                    () = tokio::time::sleep(Duration::from_millis(STREAM_IDLE_BACKOFF_MS)) => {}
+                                }
+                            }
+                            Err(e) => {
+                                if !stream_faulted {
+                                    coordinator.notify_disconnected(&e.to_string());
+                                    stream_faulted = true;
+                                }
+                                tokio::select! {
+                                    _ = shutdown_rx.changed() => break,
+                                    () = tokio::time::sleep(Duration::from_millis(STREAM_RECONNECT_BACKOFF_MS)) => {}
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            let _ = kafka_source.close().await;
+        });
+
+        self.consumer_task = Some(ConsumerTaskHandle {
+            shutdown_tx,
+            join_handle,
+        });
+    }
+
+    fn abort_consumer_task(&mut self) {
+        if let Some(handle) = self.consumer_task.take() {
+            handle.signal_and_abort();
+        }
+    }
+
+    async fn stop_consumer_task(&mut self) {
+        if let Some(handle) = self.consumer_task.take() {
+            let _ = handle.shutdown_tx.send(true);
+            handle.join_handle.abort();
+            let _ = handle.join_handle.await;
+        }
+        let _ = self.kafka_source.close().await;
     }
 
     fn resolve_or_create_instrument(
@@ -338,14 +693,17 @@ impl DataClient for DataInfraDataClient {
     }
 
     fn stop(&mut self) -> anyhow::Result<()> {
+        self.abort_consumer_task();
         self.is_connected.store(false, Ordering::Release);
         Ok(())
     }
 
     fn reset(&mut self) -> anyhow::Result<()> {
+        self.abort_consumer_task();
         self.subscribed_bars.clear();
         self.subscribed_quotes.clear();
         self.subscribed_statuses.clear();
+        self.subscriptions.clear_all();
         self.coordinator.notify_disconnected("client reset");
         self.is_connected.store(false, Ordering::Release);
         Ok(())
@@ -367,13 +725,19 @@ impl DataClient for DataInfraDataClient {
         if self.enforce_calendar_on_connect {
             self.calendar_gate.refresh_session_status(None).await?;
         }
+        self.stop_consumer_task().await;
         self.coordinator.notify_connected();
         self.is_connected.store(true, Ordering::Release);
+        self.spawn_consumer_task();
         Ok(())
     }
 
     async fn disconnect(&mut self) -> anyhow::Result<()> {
-        self.coordinator.notify_disconnected("client disconnect");
+        self.stop_consumer_task().await;
+        self.subscriptions.pending_events.lock().clear();
+        if self.coordinator.is_connected() || self.is_connected.load(Ordering::Acquire) {
+            self.coordinator.notify_disconnected("client disconnect");
+        }
         self.is_connected.store(false, Ordering::Release);
         Ok(())
     }
@@ -402,6 +766,11 @@ impl DataClient for DataInfraDataClient {
         execute_bar_subscriptions(&cmd.bar_types, |bar_type| {
             from_bar_type(&bar_type)?;
             self.subscribed_bars.insert(bar_type);
+            self.subscriptions.bars.write().insert(bar_type);
+            let pending = self.subscriptions.drain_matching_bar(&bar_type);
+            for ev in &pending {
+                let _ = self.forward_stream_event(ev);
+            }
             Ok(())
         })
     }
@@ -409,6 +778,7 @@ impl DataClient for DataInfraDataClient {
     fn unsubscribe_bars(&mut self, cmd: &UnsubscribeBars) -> anyhow::Result<()> {
         execute_bar_subscriptions(&cmd.bar_types, |bar_type| {
             self.subscribed_bars.shift_remove(&bar_type);
+            self.subscriptions.bars.write().shift_remove(&bar_type);
             Ok(())
         })
     }
@@ -417,6 +787,11 @@ impl DataClient for DataInfraDataClient {
         execute_instrument_subscriptions(&cmd.instrument_ids, |inst_id| {
             let _ = from_instrument_id(inst_id);
             self.subscribed_quotes.insert(inst_id);
+            self.subscriptions.quotes.write().insert(inst_id);
+            let pending = self.subscriptions.drain_matching_quote(&inst_id);
+            for ev in &pending {
+                let _ = self.forward_stream_event(ev);
+            }
             Ok(())
         })
     }
@@ -424,6 +799,7 @@ impl DataClient for DataInfraDataClient {
     fn unsubscribe_quotes(&mut self, cmd: &UnsubscribeQuotes) -> anyhow::Result<()> {
         execute_instrument_subscriptions(&cmd.instrument_ids, |inst_id| {
             self.subscribed_quotes.shift_remove(&inst_id);
+            self.subscriptions.quotes.write().shift_remove(&inst_id);
             Ok(())
         })
     }
@@ -432,6 +808,11 @@ impl DataClient for DataInfraDataClient {
         execute_instrument_subscriptions(&cmd.instrument_ids, |inst_id| {
             let _ = from_instrument_id(inst_id);
             self.subscribed_statuses.insert(inst_id);
+            self.subscriptions.statuses.write().insert(inst_id);
+            let pending = self.subscriptions.drain_matching_status(&inst_id);
+            for ev in &pending {
+                let _ = self.forward_stream_event(ev);
+            }
             Ok(())
         })
     }
@@ -442,6 +823,7 @@ impl DataClient for DataInfraDataClient {
     ) -> anyhow::Result<()> {
         execute_instrument_subscriptions(&cmd.instrument_ids, |inst_id| {
             self.subscribed_statuses.shift_remove(&inst_id);
+            self.subscriptions.statuses.write().shift_remove(&inst_id);
             Ok(())
         })
     }

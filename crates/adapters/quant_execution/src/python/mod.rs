@@ -57,6 +57,8 @@ impl RustPlanItemEnvelope {
         valid_until_iso,
         limit_collar_pct,
         limit_collar_atr,
+        initial_stop_price = "0",
+        max_risk_budget_usd = "0",
     ))]
     #[expect(clippy::too_many_arguments)]
     fn py_new(
@@ -73,6 +75,8 @@ impl RustPlanItemEnvelope {
         valid_until_iso: String,
         limit_collar_pct: &str,
         limit_collar_atr: &str,
+        initial_stop_price: &str,
+        max_risk_budget_usd: &str,
     ) -> PyResult<Self> {
         Ok(Self {
             item_id,
@@ -88,6 +92,8 @@ impl RustPlanItemEnvelope {
             valid_until_iso,
             limit_collar_pct: parse_dec(limit_collar_pct, "limit_collar_pct")?,
             limit_collar_atr: parse_dec(limit_collar_atr, "limit_collar_atr")?,
+            initial_stop_price: parse_dec(initial_stop_price, "initial_stop_price")?,
+            max_risk_budget_usd: parse_dec(max_risk_budget_usd, "max_risk_budget_usd")?,
         })
     }
 
@@ -135,10 +141,11 @@ impl RustPlanGateOrderRequest {
         limit_price = None,
         reference_price = None,
         atr = None,
-        collar_market_order = false,
+        collar_market_order = true,
         is_exit_intent = false,
         cache_open_entry_qty = "0",
         cache_filled_entry_qty = "0",
+        stop_loss_price = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn py_new(
@@ -160,6 +167,7 @@ impl RustPlanGateOrderRequest {
         is_exit_intent: bool,
         cache_open_entry_qty: &str,
         cache_filled_entry_qty: &str,
+        stop_loss_price: Option<&str>,
     ) -> PyResult<Self> {
         Ok(Self {
             client_order_id,
@@ -180,6 +188,7 @@ impl RustPlanGateOrderRequest {
             is_exit_intent,
             cache_open_entry_qty: parse_dec(cache_open_entry_qty, "cache_open_entry_qty")?,
             cache_filled_entry_qty: parse_dec(cache_filled_entry_qty, "cache_filled_entry_qty")?,
+            stop_loss_price: parse_opt_dec(stop_loss_price, "stop_loss_price")?,
         })
     }
 }

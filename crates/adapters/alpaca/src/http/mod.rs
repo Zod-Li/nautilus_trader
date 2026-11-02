@@ -19,14 +19,15 @@ pub mod client;
 pub mod models;
 pub mod parse;
 
-pub use client::AlpacaHttpClient;
+pub use client::{ALPACA_ORDERS_PAGE_LIMIT, AlpacaHttpClient};
 pub use models::{
     AlpacaAccountResponse, AlpacaApiErrorPayload, AlpacaAssetResponse, AlpacaOrderRequest,
     AlpacaOrderResponse, AlpacaPositionResponse, AlpacaReplaceOrderRequest, AlpacaStopLossSpec,
     AlpacaTakeProfitSpec,
 };
 pub use parse::{
-    decimal_to_money, decimal_to_price, decimal_to_quantity, parse_account_state,
-    parse_equity_instrument, parse_instrument_id, parse_order_status_report,
+    build_fill_report, build_fill_report_with_qty, decimal_to_money, decimal_to_price,
+    decimal_to_quantity, derive_deterministic_fill_trade_id, parse_account_state,
+    parse_alpaca_trade_id, parse_equity_instrument, parse_instrument_id, parse_order_status_report,
     parse_position_status_report, parse_rfc3339_to_unix_nanos,
 };

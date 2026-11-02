@@ -209,7 +209,8 @@ def list_strategy_archetype_schemas() -> List[Dict[str, Any]]:
 def create_strategy_config_from_contract(
     plan_item: PlanItemContract,
     use_limit_orders: bool = True,
-    submit_protective_stop: bool = False,
+    submit_protective_stop: bool = True,
+    execution_delay_bars: int = 0,
 ) -> BaseArchetypeStrategyConfig:
     """Creates a concrete `StrategyConfig` instance from a locked `PlanItemContract`."""
     descriptor = get_archetype_descriptor(plan_item.strategy_config.archetype_id)
@@ -217,13 +218,15 @@ def create_strategy_config_from_contract(
         plan_item=plan_item,
         use_limit_orders=use_limit_orders,
         submit_protective_stop=submit_protective_stop,
+        execution_delay_bars=execution_delay_bars,
     )
 
 
 def instantiate_strategy_from_contract(
     plan_item: PlanItemContract,
     use_limit_orders: bool = True,
-    submit_protective_stop: bool = False,
+    submit_protective_stop: bool = True,
+    execution_delay_bars: int = 0,
 ) -> BaseArchetypeStrategy:
     """Instantiates the exact pre-audited `Strategy` bound to `plan_item` (1:1 isomorphic)."""
     descriptor = get_archetype_descriptor(plan_item.strategy_config.archetype_id)
@@ -231,6 +234,7 @@ def instantiate_strategy_from_contract(
         plan_item=plan_item,
         use_limit_orders=use_limit_orders,
         submit_protective_stop=submit_protective_stop,
+        execution_delay_bars=execution_delay_bars,
     )
     return descriptor.strategy_cls(config)
 

@@ -931,6 +931,8 @@ impl BacktestEngine {
                     &self.kernel.clock,
                     data,
                 )?;
+                self.drain_command_queues()?;
+                self.settle_venues(ts_init, settlement_scope)?;
                 self.kernel.data_engine.borrow_mut().process_data_ref(data);
                 settlement_scope
             };

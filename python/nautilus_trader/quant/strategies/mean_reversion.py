@@ -53,12 +53,17 @@ class MeanReversionStrategy(BaseArchetypeStrategy):
     def mad_zscores(self) -> List[float]:
         return list(self._mad_zscores)
 
+    def reset_rolling_windows(self) -> None:
+        super().reset_rolling_windows()
+        self._residuals.clear()
+        self._mad_zscores.clear()
+
     def _compute_rolling_vwap_anchor(self, window: int) -> float:
         closes = self._closes[-window:]
         vols = self._volumes[-window:]
         typical_prices = [
-            (h + l + c) / 3.0
-            for h, l, c in zip(
+            (h + lo + c) / 3.0
+            for h, lo, c in zip(
                 self._highs[-window:], self._lows[-window:], closes
             )
         ]
@@ -71,7 +76,10 @@ class MeanReversionStrategy(BaseArchetypeStrategy):
         if bar.bar_type != self._archetype_config.bar_type:
             return
 
-        self._record_primary_bar(bar)
+        if not self._record_primary_bar(bar):
+            return
+        if not self._in_warmup and self._check_and_execute_pending_thesis_exit(bar):
+            return
         n = len(self._closes)
         cfg = self._archetype_config
         if n < cfg.slow_window:
@@ -92,6 +100,9 @@ class MeanReversionStrategy(BaseArchetypeStrategy):
         if len(self._residuals) > max_keep:
             del self._residuals[:-max_keep]
             del self._mad_zscores[:-max_keep]
+
+        if self._in_warmup:
+            return
 
         atr = rolling_atr(self._highs, self._lows, self._closes, cfg.fast_window)
         if atr <= 0.0:
@@ -141,14 +152,20 @@ class MeanReversionStrategy(BaseArchetypeStrategy):
                 self._anchor_target = None
             return
 
-        if n < cfg.lookback_window or self._has_inflight_or_open_entry_order():
+        if (
+            self._exit_only_mode
+            or n < cfg.lookback_window
+            or self._has_inflight_or_open_entry_order()
+        ):
             return
 
         # Oversold tail for LONG mean reversion: (1.0 - z_quantile) >= entry_q and mad_z < 0
         if cfg.plan_side == PlanSide.LONG:
             oversold_quantile = 1.0 - z_quantile
             if oversold_quantile >= entry_q and mad_z < 0.0:
-                stop_px = close_px - (atr_mult * atr)
+                stop_px = self._resolve_entry_stop_price(
+                    close_px, close_px - (atr_mult * atr)
+                )
                 self._trailing_stop_price = stop_px
                 self._anchor_target = vwap_anchor
                 self._submit_plan_gated_entry(
@@ -161,7 +178,9 @@ class MeanReversionStrategy(BaseArchetypeStrategy):
                 )
         elif cfg.plan_side == PlanSide.SHORT:
             if z_quantile >= entry_q and mad_z > 0.0:
-                stop_px = close_px + (atr_mult * atr)
+                stop_px = self._resolve_entry_stop_price(
+                    close_px, close_px + (atr_mult * atr)
+                )
                 self._trailing_stop_price = stop_px
                 self._anchor_target = vwap_anchor
                 self._submit_plan_gated_entry(

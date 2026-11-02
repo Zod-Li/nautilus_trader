@@ -25,7 +25,7 @@
 use std::{future::Future, sync::Arc};
 
 use async_trait::async_trait;
-use indexmap::IndexMap;
+use indexmap::{IndexMap, IndexSet};
 use nautilus_common::{
     cache::{
         CacheView,
@@ -47,21 +47,21 @@ use nautilus_common::{
     },
 };
 use nautilus_core::{
-    Params, UUID4, UnixNanos,
+    Params, UnixNanos,
     time::{AtomicTime, get_atomic_clock_realtime},
 };
 use nautilus_execution::client::core::ExecutionClientCore;
 use nautilus_live::{ExecutionEventEmitter, execution::context::OrderContext};
 use nautilus_model::{
     accounts::AccountAny,
-    enums::{AccountType, LiquiditySide, OmsType, OrderSide, OrderType},
+    enums::{AccountType, LiquiditySide, OmsType, OrderSide, OrderStatus, OrderType},
     identifiers::{
         AccountId, ClientId, ClientOrderId, InstrumentId, StrategyId, TradeId, TraderId, Venue,
         VenueOrderId,
     },
     orders::{Order, OrderAny},
     reports::{ExecutionMassStatus, FillReport, OrderStatusReport, PositionStatusReport},
-    types::{AccountBalance, Currency, MarginBalance, Money},
+    types::{AccountBalance, Currency, MarginBalance, Money, Price, Quantity},
 };
 use parking_lot::Mutex;
 use rust_decimal::Decimal;
@@ -70,7 +70,10 @@ use tokio::task::JoinHandle;
 use crate::{
     common::{
         consts::ALPACA_VENUE,
-        enums::{AlpacaOrderClass, AlpacaOrderSide, AlpacaOrderType, AlpacaTimeInForce},
+        enums::{
+            AlpacaOrderClass, AlpacaOrderSide, AlpacaOrderType, AlpacaTimeInForce,
+            parse_alpaca_order_status,
+        },
     },
     config::AlpacaConfig,
     error::{AlpacaError, AlpacaResult},
@@ -81,8 +84,9 @@ use crate::{
             AlpacaStopLossSpec, AlpacaTakeProfitSpec,
         },
         parse::{
-            DEFAULT_EQUITY_PRICE_PRECISION, DEFAULT_EQUITY_SIZE_PRECISION, decimal_to_price,
-            decimal_to_quantity, parse_account_state, parse_alpaca_trade_id, parse_instrument_id,
+            DEFAULT_EQUITY_PRICE_PRECISION, DEFAULT_EQUITY_SIZE_PRECISION,
+            build_fill_report_with_qty, decimal_to_price, decimal_to_quantity,
+            derive_deterministic_fill_trade_id, parse_account_state, parse_instrument_id,
             parse_order_status_report, parse_position_status_report, parse_rfc3339_to_unix_nanos,
         },
     },
@@ -94,6 +98,7 @@ use crate::{
 };
 
 const DEDUP_CACHE_CAPACITY: usize = 10_000;
+const MAX_FILL_DEDUP_CAPACITY: usize = 50_000;
 
 /// Runs a `Future` to completion from synchronous code without panicking whether or not
 /// the current thread is already inside a Tokio runtime.
@@ -114,13 +119,223 @@ where
     }
 }
 
+#[derive(Debug, Default)]
+struct OrderFillDedupState {
+    seen_trade_ids: IndexSet<TradeId>,
+    emitted_cum_qty_by_venue: IndexMap<VenueOrderId, Decimal>,
+    emitted_cum_qty_by_client: IndexMap<ClientOrderId, Decimal>,
+    emitted_cum_notional_by_venue: IndexMap<VenueOrderId, Decimal>,
+    emitted_cum_notional_by_client: IndexMap<ClientOrderId, Decimal>,
+    rest_reported_cum_qty_by_venue: IndexMap<VenueOrderId, Decimal>,
+    rest_reported_cum_qty_by_client: IndexMap<ClientOrderId, Decimal>,
+    rest_reported_cum_notional_by_venue: IndexMap<VenueOrderId, Decimal>,
+    rest_reported_cum_notional_by_client: IndexMap<ClientOrderId, Decimal>,
+}
+
+impl OrderFillDedupState {
+    fn emitted_cum_qty(
+        &self,
+        venue_order_id: VenueOrderId,
+        client_order_id: Option<ClientOrderId>,
+    ) -> Decimal {
+        let by_venue = self
+            .emitted_cum_qty_by_venue
+            .get(&venue_order_id)
+            .copied()
+            .unwrap_or(Decimal::ZERO);
+        let by_client = client_order_id
+            .and_then(|cid| self.emitted_cum_qty_by_client.get(&cid).copied())
+            .unwrap_or(Decimal::ZERO);
+        by_venue.max(by_client)
+    }
+
+    fn emitted_cum_notional(
+        &self,
+        venue_order_id: VenueOrderId,
+        client_order_id: Option<ClientOrderId>,
+    ) -> Decimal {
+        let by_venue = self
+            .emitted_cum_notional_by_venue
+            .get(&venue_order_id)
+            .copied()
+            .unwrap_or(Decimal::ZERO);
+        let by_client = client_order_id
+            .and_then(|cid| self.emitted_cum_notional_by_client.get(&cid).copied())
+            .unwrap_or(Decimal::ZERO);
+        by_venue.max(by_client)
+    }
+
+    fn effective_cum_qty(
+        &self,
+        venue_order_id: VenueOrderId,
+        client_order_id: Option<ClientOrderId>,
+    ) -> Decimal {
+        let emitted = self.emitted_cum_qty(venue_order_id, client_order_id);
+        let rest_venue = self
+            .rest_reported_cum_qty_by_venue
+            .get(&venue_order_id)
+            .copied()
+            .unwrap_or(Decimal::ZERO);
+        let rest_client = client_order_id
+            .and_then(|cid| self.rest_reported_cum_qty_by_client.get(&cid).copied())
+            .unwrap_or(Decimal::ZERO);
+        emitted.max(rest_venue).max(rest_client)
+    }
+
+    fn effective_cum_notional(
+        &self,
+        venue_order_id: VenueOrderId,
+        client_order_id: Option<ClientOrderId>,
+    ) -> Decimal {
+        let emitted = self.emitted_cum_notional(venue_order_id, client_order_id);
+        let rest_venue = self
+            .rest_reported_cum_notional_by_venue
+            .get(&venue_order_id)
+            .copied()
+            .unwrap_or(Decimal::ZERO);
+        let rest_client = client_order_id
+            .and_then(|cid| self.rest_reported_cum_notional_by_client.get(&cid).copied())
+            .unwrap_or(Decimal::ZERO);
+        emitted.max(rest_venue).max(rest_client)
+    }
+
+    fn prune_map<K: std::hash::Hash + Eq>(map: &mut IndexMap<K, Decimal>) {
+        if map.len() >= MAX_FILL_DEDUP_CAPACITY {
+            let drain_count = map.len() / 2;
+            map.drain(..drain_count);
+        }
+    }
+
+    fn prune_if_needed(&mut self) {
+        if self.seen_trade_ids.len() >= MAX_FILL_DEDUP_CAPACITY {
+            let drain_count = self.seen_trade_ids.len() / 2;
+            self.seen_trade_ids.drain(..drain_count);
+        }
+        Self::prune_map(&mut self.emitted_cum_qty_by_venue);
+        Self::prune_map(&mut self.emitted_cum_notional_by_venue);
+        Self::prune_map(&mut self.emitted_cum_qty_by_client);
+        Self::prune_map(&mut self.emitted_cum_notional_by_client);
+        Self::prune_map(&mut self.rest_reported_cum_qty_by_venue);
+        Self::prune_map(&mut self.rest_reported_cum_notional_by_venue);
+        Self::prune_map(&mut self.rest_reported_cum_qty_by_client);
+        Self::prune_map(&mut self.rest_reported_cum_notional_by_client);
+    }
+
+    fn record_emitted_fill(
+        &mut self,
+        venue_order_id: VenueOrderId,
+        client_order_id: Option<ClientOrderId>,
+        new_cum_qty: Decimal,
+        new_cum_notional: Decimal,
+    ) {
+        self.prune_if_needed();
+
+        let prev_venue_qty = self
+            .emitted_cum_qty_by_venue
+            .get(&venue_order_id)
+            .copied()
+            .unwrap_or(Decimal::ZERO);
+        self.emitted_cum_qty_by_venue
+            .insert(venue_order_id, prev_venue_qty.max(new_cum_qty));
+
+        let prev_venue_notional = self
+            .emitted_cum_notional_by_venue
+            .get(&venue_order_id)
+            .copied()
+            .unwrap_or(Decimal::ZERO);
+        self.emitted_cum_notional_by_venue
+            .insert(venue_order_id, prev_venue_notional.max(new_cum_notional));
+
+        if let Some(cid) = client_order_id {
+            let prev_client_qty = self
+                .emitted_cum_qty_by_client
+                .get(&cid)
+                .copied()
+                .unwrap_or(Decimal::ZERO);
+            self.emitted_cum_qty_by_client
+                .insert(cid, prev_client_qty.max(new_cum_qty));
+
+            let prev_client_notional = self
+                .emitted_cum_notional_by_client
+                .get(&cid)
+                .copied()
+                .unwrap_or(Decimal::ZERO);
+            self.emitted_cum_notional_by_client
+                .insert(cid, prev_client_notional.max(new_cum_notional));
+        }
+
+        self.record_rest_reported_fill(
+            venue_order_id,
+            client_order_id,
+            new_cum_qty,
+            new_cum_notional,
+        );
+    }
+
+    fn record_rest_reported_fill(
+        &mut self,
+        venue_order_id: VenueOrderId,
+        client_order_id: Option<ClientOrderId>,
+        new_cum_qty: Decimal,
+        new_cum_notional: Decimal,
+    ) {
+        self.prune_if_needed();
+
+        let prev_venue_qty = self
+            .rest_reported_cum_qty_by_venue
+            .get(&venue_order_id)
+            .copied()
+            .unwrap_or(Decimal::ZERO);
+        self.rest_reported_cum_qty_by_venue
+            .insert(venue_order_id, prev_venue_qty.max(new_cum_qty));
+
+        let prev_venue_notional = self
+            .rest_reported_cum_notional_by_venue
+            .get(&venue_order_id)
+            .copied()
+            .unwrap_or(Decimal::ZERO);
+        self.rest_reported_cum_notional_by_venue
+            .insert(venue_order_id, prev_venue_notional.max(new_cum_notional));
+
+        if let Some(cid) = client_order_id {
+            let prev_client_qty = self
+                .rest_reported_cum_qty_by_client
+                .get(&cid)
+                .copied()
+                .unwrap_or(Decimal::ZERO);
+            self.rest_reported_cum_qty_by_client
+                .insert(cid, prev_client_qty.max(new_cum_qty));
+
+            let prev_client_notional = self
+                .rest_reported_cum_notional_by_client
+                .get(&cid)
+                .copied()
+                .unwrap_or(Decimal::ZERO);
+            self.rest_reported_cum_notional_by_client
+                .insert(cid, prev_client_notional.max(new_cum_notional));
+        }
+    }
+
+    fn clear(&mut self) {
+        self.seen_trade_ids.clear();
+        self.emitted_cum_qty_by_venue.clear();
+        self.emitted_cum_qty_by_client.clear();
+        self.emitted_cum_notional_by_venue.clear();
+        self.emitted_cum_notional_by_client.clear();
+        self.rest_reported_cum_qty_by_venue.clear();
+        self.rest_reported_cum_qty_by_client.clear();
+        self.rest_reported_cum_notional_by_venue.clear();
+        self.rest_reported_cum_notional_by_client.clear();
+    }
+}
+
 #[derive(Debug, Clone)]
 struct SharedExecutionTracking {
     cached_orders: Arc<Mutex<FifoCacheMap<ClientOrderId, OrderAny, DEDUP_CACHE_CAPACITY>>>,
     order_contexts: Arc<Mutex<FifoCacheMap<ClientOrderId, OrderContext, DEDUP_CACHE_CAPACITY>>>,
     venue_order_ids: Arc<Mutex<IndexMap<ClientOrderId, Vec<VenueOrderId>>>>,
     submitted_orders: Arc<Mutex<FifoCache<ClientOrderId, DEDUP_CACHE_CAPACITY>>>,
-    processed_trades: Arc<Mutex<FifoCache<TradeId, DEDUP_CACHE_CAPACITY>>>,
+    fill_dedup: Arc<Mutex<OrderFillDedupState>>,
     terminal_events:
         Arc<Mutex<FifoCache<(VenueOrderId, AlpacaTradeEventKind), DEDUP_CACHE_CAPACITY>>>,
 }
@@ -132,7 +347,7 @@ impl Default for SharedExecutionTracking {
             order_contexts: Arc::new(Mutex::new(FifoCacheMap::new())),
             venue_order_ids: Arc::new(Mutex::new(IndexMap::new())),
             submitted_orders: Arc::new(Mutex::new(FifoCache::new())),
-            processed_trades: Arc::new(Mutex::new(FifoCache::new())),
+            fill_dedup: Arc::new(Mutex::new(OrderFillDedupState::default())),
             terminal_events: Arc::new(Mutex::new(FifoCache::new())),
         }
     }
@@ -162,12 +377,238 @@ impl SharedExecutionTracking {
             .and_then(|ids| ids.last().copied())
     }
 
+    #[expect(clippy::too_many_arguments)]
+    fn claim_ws_fill(
+        &self,
+        venue_order_id: VenueOrderId,
+        client_order_id: ClientOrderId,
+        trade_id: Option<TradeId>,
+        last_qty: Option<Quantity>,
+        last_px: Option<Price>,
+        cum_qty: Quantity,
+        order_qty: Quantity,
+        size_precision: u8,
+    ) -> Option<(TradeId, Quantity)> {
+        let mut dedup = self.fill_dedup.lock();
+        dedup.prune_if_needed();
+        let already_reported = dedup.effective_cum_qty(venue_order_id, Some(client_order_id));
+        let already_notional = dedup.effective_cum_notional(venue_order_id, Some(client_order_id));
+        let order_cum_dec = cum_qty.as_decimal();
+        let last_qty_dec = last_qty
+            .map(|q| q.as_decimal())
+            .unwrap_or(order_cum_dec)
+            .max(Decimal::ZERO);
+        let slice_px_dec = last_px
+            .map(|p| p.as_decimal())
+            .unwrap_or(Decimal::ZERO)
+            .max(Decimal::ZERO);
+
+        let is_delta = already_reported > Decimal::ZERO;
+        let target_cum = if order_cum_dec > already_reported {
+            order_cum_dec
+        } else {
+            already_reported + last_qty_dec
+        };
+
+        let resolved_trade_id = match trade_id {
+            Some(tid) => {
+                let base_tid =
+                    derive_deterministic_fill_trade_id(venue_order_id.as_str(), target_cum, false)
+                        .ok();
+                if is_delta && base_tid == Some(tid) {
+                    derive_deterministic_fill_trade_id(venue_order_id.as_str(), target_cum, true)
+                        .ok()?
+                } else {
+                    tid
+                }
+            }
+            None => {
+                derive_deterministic_fill_trade_id(venue_order_id.as_str(), target_cum, is_delta)
+                    .ok()?
+            }
+        };
+
+        if dedup.seen_trade_ids.contains(&resolved_trade_id) {
+            return None;
+        }
+
+        if order_cum_dec > Decimal::ZERO && order_cum_dec <= already_reported {
+            dedup.seen_trade_ids.insert(resolved_trade_id);
+            return None;
+        }
+
+        let max_unreported = if order_cum_dec > already_reported {
+            order_cum_dec - already_reported
+        } else if order_cum_dec == Decimal::ZERO && already_reported > Decimal::ZERO {
+            let order_total_dec = order_qty.as_decimal();
+            if order_total_dec > Decimal::ZERO {
+                (order_total_dec - already_reported).max(Decimal::ZERO)
+            } else {
+                Decimal::ZERO
+            }
+        } else {
+            last_qty_dec
+        };
+        let emit_qty_dec = last_qty_dec.min(max_unreported);
+        if emit_qty_dec <= Decimal::ZERO {
+            dedup.seen_trade_ids.insert(resolved_trade_id);
+            return None;
+        }
+
+        let emit_qty = decimal_to_quantity(emit_qty_dec, size_precision).ok()?;
+        let new_cum_qty = already_reported + emit_qty_dec;
+        let new_cum_notional = already_notional + (emit_qty_dec * slice_px_dec);
+
+        dedup.seen_trade_ids.insert(resolved_trade_id);
+        dedup.record_emitted_fill(
+            venue_order_id,
+            Some(client_order_id),
+            new_cum_qty,
+            new_cum_notional,
+        );
+        if let Ok(det_base) =
+            derive_deterministic_fill_trade_id(venue_order_id.as_str(), new_cum_qty, false)
+        {
+            dedup.seen_trade_ids.insert(det_base);
+        }
+        if let Ok(det_delta) =
+            derive_deterministic_fill_trade_id(venue_order_id.as_str(), new_cum_qty, true)
+        {
+            dedup.seen_trade_ids.insert(det_delta);
+        }
+
+        Some((resolved_trade_id, emit_qty))
+    }
+
+    fn claim_submitted_order_fill(
+        &self,
+        venue_order_id: VenueOrderId,
+        client_order_id: Option<ClientOrderId>,
+        filled_qty: Decimal,
+        filled_avg_price: Decimal,
+        price_precision: u8,
+        size_precision: u8,
+    ) -> AlpacaResult<Option<(TradeId, Quantity, Price)>> {
+        if filled_qty <= Decimal::ZERO || filled_avg_price <= Decimal::ZERO {
+            return Ok(None);
+        }
+
+        let mut dedup = self.fill_dedup.lock();
+        dedup.prune_if_needed();
+        let already_known = dedup.effective_cum_qty(venue_order_id, client_order_id);
+        if filled_qty <= already_known {
+            return Ok(None);
+        }
+
+        let already_notional = dedup.effective_cum_notional(venue_order_id, client_order_id);
+        let delta_dec = filled_qty - already_known;
+        let total_notional = filled_qty * filled_avg_price;
+        let delta_notional = total_notional - already_notional;
+        let is_delta = already_known > Decimal::ZERO;
+        let trade_id =
+            derive_deterministic_fill_trade_id(venue_order_id.as_str(), filled_qty, is_delta)?;
+
+        if dedup.seen_trade_ids.contains(&trade_id) {
+            dedup.record_emitted_fill(venue_order_id, client_order_id, filled_qty, total_notional);
+            return Ok(None);
+        }
+
+        let delta_px_dec =
+            if is_delta && delta_notional > Decimal::ZERO && delta_dec > Decimal::ZERO {
+                let dp = u32::from(price_precision.max(DEFAULT_EQUITY_PRICE_PRECISION).min(9));
+                (delta_notional / delta_dec).round_dp(dp)
+            } else {
+                filled_avg_price
+            };
+
+        let delta_qty = decimal_to_quantity(delta_dec, size_precision)?;
+        let delta_px = decimal_to_price(delta_px_dec, price_precision)?;
+        dedup.seen_trade_ids.insert(trade_id);
+        dedup.record_emitted_fill(venue_order_id, client_order_id, filled_qty, total_notional);
+        if let Ok(det_base) =
+            derive_deterministic_fill_trade_id(venue_order_id.as_str(), filled_qty, false)
+        {
+            dedup.seen_trade_ids.insert(det_base);
+        }
+        if let Ok(det_delta) =
+            derive_deterministic_fill_trade_id(venue_order_id.as_str(), filled_qty, true)
+        {
+            dedup.seen_trade_ids.insert(det_delta);
+        }
+
+        Ok(Some((trade_id, delta_qty, delta_px)))
+    }
+
+    fn claim_rest_fill(
+        &self,
+        venue_order_id: VenueOrderId,
+        client_order_id: Option<ClientOrderId>,
+        filled_qty: Decimal,
+        filled_avg_price: Decimal,
+        price_precision: u8,
+        size_precision: u8,
+    ) -> AlpacaResult<Option<(TradeId, Quantity, Price)>> {
+        if filled_qty <= Decimal::ZERO || filled_avg_price <= Decimal::ZERO {
+            return Ok(None);
+        }
+
+        let mut dedup = self.fill_dedup.lock();
+        dedup.prune_if_needed();
+        let already_emitted = dedup.emitted_cum_qty(venue_order_id, client_order_id);
+        if filled_qty <= already_emitted {
+            return Ok(None);
+        }
+
+        let already_notional = dedup.emitted_cum_notional(venue_order_id, client_order_id);
+        let delta_dec = filled_qty - already_emitted;
+        let total_notional = filled_qty * filled_avg_price;
+        let delta_notional = total_notional - already_notional;
+        let is_delta = already_emitted > Decimal::ZERO;
+        let trade_id =
+            derive_deterministic_fill_trade_id(venue_order_id.as_str(), filled_qty, is_delta)?;
+
+        if dedup.seen_trade_ids.contains(&trade_id) {
+            dedup.record_emitted_fill(venue_order_id, client_order_id, filled_qty, total_notional);
+            return Ok(None);
+        }
+
+        let delta_px_dec =
+            if is_delta && delta_notional > Decimal::ZERO && delta_dec > Decimal::ZERO {
+                let dp = u32::from(price_precision.max(DEFAULT_EQUITY_PRICE_PRECISION).min(9));
+                (delta_notional / delta_dec).round_dp(dp)
+            } else {
+                filled_avg_price
+            };
+
+        let delta_qty = decimal_to_quantity(delta_dec, size_precision)?;
+        let delta_px = decimal_to_price(delta_px_dec, price_precision)?;
+        dedup.seen_trade_ids.insert(trade_id);
+        dedup.record_emitted_fill(
+            venue_order_id,
+            client_order_id,
+            filled_qty,
+            total_notional,
+        );
+        if let Ok(det_base) =
+            derive_deterministic_fill_trade_id(venue_order_id.as_str(), filled_qty, false)
+        {
+            dedup.seen_trade_ids.insert(det_base);
+        }
+        if let Ok(det_delta) =
+            derive_deterministic_fill_trade_id(venue_order_id.as_str(), filled_qty, true)
+        {
+            dedup.seen_trade_ids.insert(det_delta);
+        }
+
+        Ok(Some((trade_id, delta_qty, delta_px)))
+    }
+
     fn clear(&self) {
         self.cached_orders.lock().clear();
         self.order_contexts.lock().clear();
         self.venue_order_ids.lock().clear();
         self.submitted_orders.lock().clear();
-        self.processed_trades.lock().clear();
+        self.fill_dedup.lock().clear();
         self.terminal_events.lock().clear();
     }
 }
@@ -291,7 +732,9 @@ impl AlpacaExecutionClient {
             .cloned();
 
         match update.event_kind {
-            AlpacaTradeEventKind::New | AlpacaTradeEventKind::Calculated => {
+            AlpacaTradeEventKind::New
+            | AlpacaTradeEventKind::Calculated
+            | AlpacaTradeEventKind::Stopped => {
                 let key = (update.venue_order_id, AlpacaTradeEventKind::New);
                 if !tracking.terminal_events.lock().insert(key) {
                     log::debug!(
@@ -307,54 +750,66 @@ impl AlpacaExecutionClient {
                 }
             }
             AlpacaTradeEventKind::Fill | AlpacaTradeEventKind::PartialFill => {
-                if let Some(trade_id) = update.trade_id
-                    && !tracking.processed_trades.lock().insert(trade_id)
-                {
-                    log::debug!("Skipping duplicate Alpaca fill trade_id={trade_id}");
-                    return;
-                }
-                if update.event_kind == AlpacaTradeEventKind::Fill {
-                    tracking
-                        .terminal_events
-                        .lock()
-                        .add((update.venue_order_id, AlpacaTradeEventKind::Fill));
-                }
-
-                if let (Some(order), Some(trade_id), Some(last_qty), Some(last_px)) = (
-                    cached_order.as_ref(),
+                let Some((trade_id, emit_qty)) = tracking.claim_ws_fill(
+                    update.venue_order_id,
+                    update.client_order_id,
                     update.trade_id,
                     update.last_qty,
                     update.last_px,
-                ) {
+                    update.cum_qty,
+                    update.order_qty,
+                    DEFAULT_EQUITY_SIZE_PRECISION,
+                ) else {
+                    log::debug!(
+                        "Skipping duplicate or already-reconciled Alpaca fill for venue_order_id={} trade_id={:?}",
+                        update.venue_order_id,
+                        update.trade_id
+                    );
+                    return;
+                };
+
+                {
+                    let mut term = tracking.terminal_events.lock();
+                    term.add((update.venue_order_id, AlpacaTradeEventKind::New));
+                    if update.event_kind == AlpacaTradeEventKind::Fill {
+                        term.add((update.venue_order_id, AlpacaTradeEventKind::Fill));
+                    }
+                }
+
+                if let (Some(order), Some(last_px)) = (cached_order.as_ref(), update.last_px) {
                     let commission = Money::from_decimal(Decimal::ZERO, Currency::USD()).ok();
                     emitter.emit_order_filled(
                         order,
                         update.venue_order_id,
                         None,
                         trade_id,
-                        last_qty,
+                        emit_qty,
                         last_px,
                         Currency::USD(),
                         commission,
                         LiquiditySide::Taker,
                         update.ts_event,
                     );
-                } else if let Some(fill_report) = update.fill_report {
+                } else if let Some(mut fill_report) = update.fill_report {
+                    fill_report.trade_id = trade_id;
+                    fill_report.last_qty = emit_qty;
                     emitter.send_order_with_fills(update.order_report, vec![fill_report]);
                 } else {
                     emitter.send_order_status_report(update.order_report);
                 }
             }
-            AlpacaTradeEventKind::Canceled
-            | AlpacaTradeEventKind::DoneForDay
-            | AlpacaTradeEventKind::Stopped => {
+            AlpacaTradeEventKind::Canceled | AlpacaTradeEventKind::DoneForDay => {
                 let key = (update.venue_order_id, AlpacaTradeEventKind::Canceled);
-                if !tracking.terminal_events.lock().insert(key) {
-                    log::debug!(
-                        "Skipping duplicate Alpaca cancel event for venue_order_id={}",
-                        update.venue_order_id
-                    );
-                    return;
+                {
+                    let mut term = tracking.terminal_events.lock();
+                    term.add((update.venue_order_id, AlpacaTradeEventKind::New));
+                    if !term.insert(key) {
+                        log::debug!(
+                            "Skipping duplicate Alpaca cancel event for venue_order_id={}",
+                            update.venue_order_id
+                        );
+                        return;
+                    }
                 }
                 if let Some(ref order) = cached_order {
                     emitter.emit_order_canceled(
@@ -368,8 +823,12 @@ impl AlpacaExecutionClient {
             }
             AlpacaTradeEventKind::Expired => {
                 let key = (update.venue_order_id, AlpacaTradeEventKind::Expired);
-                if !tracking.terminal_events.lock().insert(key) {
-                    return;
+                {
+                    let mut term = tracking.terminal_events.lock();
+                    term.add((update.venue_order_id, AlpacaTradeEventKind::New));
+                    if !term.insert(key) {
+                        return;
+                    }
                 }
                 if let Some(ref order) = cached_order {
                     emitter.emit_order_expired(
@@ -383,8 +842,12 @@ impl AlpacaExecutionClient {
             }
             AlpacaTradeEventKind::Rejected | AlpacaTradeEventKind::Suspended => {
                 let key = (update.venue_order_id, AlpacaTradeEventKind::Rejected);
-                if !tracking.terminal_events.lock().insert(key) {
-                    return;
+                {
+                    let mut term = tracking.terminal_events.lock();
+                    term.add((update.venue_order_id, AlpacaTradeEventKind::New));
+                    if !term.insert(key) {
+                        return;
+                    }
                 }
                 if let Some(ref order) = cached_order {
                     emitter.emit_order_rejected(
@@ -644,6 +1107,148 @@ impl AlpacaExecutionClient {
         }
         flat
     }
+
+    fn reconcile_submitted_order_response(
+        &self,
+        order: &OrderAny,
+        resp: &AlpacaOrderResponse,
+        ts_now: UnixNanos,
+    ) {
+        let cid = order.client_order_id();
+        let venue_order_id = VenueOrderId::new(resp.id.trim());
+        self.tracking.record_venue_order_id(cid, venue_order_id);
+
+        let ts_accepted = resp
+            .submitted_at
+            .as_deref()
+            .or(Some(resp.created_at.as_str()))
+            .and_then(|s| parse_rfc3339_to_unix_nanos(s).ok())
+            .unwrap_or(ts_now);
+
+        let status = parse_alpaca_order_status(&resp.status).unwrap_or(OrderStatus::Accepted);
+
+        if status == OrderStatus::Rejected {
+            if self
+                .tracking
+                .terminal_events
+                .lock()
+                .insert((venue_order_id, AlpacaTradeEventKind::Rejected))
+            {
+                self.emitter.emit_order_rejected(
+                    order,
+                    &format!("Broker order {} status is rejected", resp.id.trim()),
+                    ts_accepted,
+                    false,
+                );
+            }
+            return;
+        }
+
+        if self
+            .tracking
+            .terminal_events
+            .lock()
+            .insert((venue_order_id, AlpacaTradeEventKind::New))
+        {
+            self.emitter
+                .emit_order_accepted(order, venue_order_id, ts_accepted);
+        }
+
+        let resolved_avg_px = resp
+            .filled_avg_price
+            .filter(|p| *p > Decimal::ZERO)
+            .or_else(|| resp.limit_price.filter(|p| *p > Decimal::ZERO))
+            .or_else(|| resp.stop_price.filter(|p| *p > Decimal::ZERO))
+            .or_else(|| order.price().map(|p| p.as_decimal()).filter(|p| *p > Decimal::ZERO))
+            .or_else(|| {
+                order
+                    .trigger_price()
+                    .map(|p| p.as_decimal())
+                    .filter(|p| *p > Decimal::ZERO)
+            });
+
+        if resp.filled_qty > Decimal::ZERO
+            && let Some(avg_px_dec) = resolved_avg_px
+            && let Ok(Some((trade_id, fill_qty, fill_px))) =
+                self.tracking.claim_submitted_order_fill(
+                    venue_order_id,
+                    Some(cid),
+                    resp.filled_qty,
+                    avg_px_dec,
+                    DEFAULT_EQUITY_PRICE_PRECISION,
+                    DEFAULT_EQUITY_SIZE_PRECISION,
+                )
+        {
+            let ts_filled = resp
+                .filled_at
+                .as_deref()
+                .or(resp.updated_at.as_deref())
+                .or(Some(resp.created_at.as_str()))
+                .and_then(|s| parse_rfc3339_to_unix_nanos(s).ok())
+                .unwrap_or(ts_now);
+            if status == OrderStatus::Filled {
+                self.tracking
+                    .terminal_events
+                    .lock()
+                    .add((venue_order_id, AlpacaTradeEventKind::Fill));
+            }
+            let commission = Money::from_decimal(Decimal::ZERO, Currency::USD()).ok();
+            let liquidity_side = match order.order_type() {
+                OrderType::Limit => LiquiditySide::Maker,
+                _ => LiquiditySide::Taker,
+            };
+            self.emitter.emit_order_filled(
+                order,
+                venue_order_id,
+                None,
+                trade_id,
+                fill_qty,
+                fill_px,
+                Currency::USD(),
+                commission,
+                liquidity_side,
+                ts_filled,
+            );
+        }
+
+        match status {
+            OrderStatus::Canceled => {
+                if self
+                    .tracking
+                    .terminal_events
+                    .lock()
+                    .insert((venue_order_id, AlpacaTradeEventKind::Canceled))
+                {
+                    let ts_canceled = resp
+                        .canceled_at
+                        .as_deref()
+                        .or(resp.updated_at.as_deref())
+                        .and_then(|s| parse_rfc3339_to_unix_nanos(s).ok())
+                        .unwrap_or(ts_now);
+                    self.emitter
+                        .emit_order_canceled(order, Some(venue_order_id), ts_canceled);
+                }
+            }
+            OrderStatus::Expired => {
+                if self
+                    .tracking
+                    .terminal_events
+                    .lock()
+                    .insert((venue_order_id, AlpacaTradeEventKind::Expired))
+                {
+                    let ts_expired = resp
+                        .expired_at
+                        .as_deref()
+                        .or(resp.updated_at.as_deref())
+                        .and_then(|s| parse_rfc3339_to_unix_nanos(s).ok())
+                        .unwrap_or(ts_now);
+                    self.emitter
+                        .emit_order_expired(order, Some(venue_order_id), ts_expired);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 #[async_trait(?Send)]
@@ -818,23 +1423,7 @@ impl ExecutionClient for AlpacaExecutionClient {
 
         match result {
             Ok(resp) => {
-                let venue_order_id = VenueOrderId::new(resp.id.trim());
-                self.tracking.record_venue_order_id(cid, venue_order_id);
-                let ts_accepted = resp
-                    .submitted_at
-                    .as_deref()
-                    .or(Some(resp.created_at.as_str()))
-                    .and_then(|s| parse_rfc3339_to_unix_nanos(s).ok())
-                    .unwrap_or(ts_now);
-                if self
-                    .tracking
-                    .terminal_events
-                    .lock()
-                    .insert((venue_order_id, AlpacaTradeEventKind::New))
-                {
-                    self.emitter
-                        .emit_order_accepted(&order, venue_order_id, ts_accepted);
-                }
+                self.reconcile_submitted_order_response(&order, &resp, ts_now);
             }
             Err(AlpacaError::DeterministicReject { message, .. }) => {
                 self.emitter
@@ -859,7 +1448,9 @@ impl ExecutionClient for AlpacaExecutionClient {
         for order in &orders {
             let cid = order.client_order_id();
             self.tracking.track_order(order);
-            self.tracking.submitted_orders.lock().add(cid);
+            if !self.tracking.submitted_orders.lock().insert(cid) {
+                anyhow::bail!("Duplicate client_order_id {cid} in order list");
+            }
         }
 
         let req = match Self::build_order_list_request(&orders) {
@@ -884,26 +1475,15 @@ impl ExecutionClient for AlpacaExecutionClient {
         match result {
             Ok(resp) => {
                 let parent_order = &orders[0];
-                let parent_vid = VenueOrderId::new(resp.id.trim());
-                self.tracking
-                    .record_venue_order_id(parent_order.client_order_id(), parent_vid);
                 let ts_accepted = resp
                     .submitted_at
                     .as_deref()
                     .or(Some(resp.created_at.as_str()))
                     .and_then(|s| parse_rfc3339_to_unix_nanos(s).ok())
                     .unwrap_or(ts_now);
-                if self
-                    .tracking
-                    .terminal_events
-                    .lock()
-                    .insert((parent_vid, AlpacaTradeEventKind::New))
-                {
-                    self.emitter
-                        .emit_order_accepted(parent_order, parent_vid, ts_accepted);
-                }
+                let resp_legs = resp.legs.clone().unwrap_or_default();
+                self.reconcile_submitted_order_response(parent_order, &resp, ts_now);
 
-                let resp_legs = resp.legs.unwrap_or_default();
                 for (idx, child_order) in orders.iter().enumerate().skip(1) {
                     // Match child leg by OrderType first, then by positional index
                     let matched_leg = resp_legs
@@ -911,20 +1491,21 @@ impl ExecutionClient for AlpacaExecutionClient {
                         .find(|leg| OrderType::from(leg.order_type) == child_order.order_type())
                         .or_else(|| resp_legs.get(idx - 1));
 
-                    let child_vid = match matched_leg {
-                        Some(leg) => VenueOrderId::new(leg.id.trim()),
-                        None => VenueOrderId::new(format!("{}-LEG-{idx}", resp.id.trim())),
-                    };
-                    self.tracking
-                        .record_venue_order_id(child_order.client_order_id(), child_vid);
-                    if self
-                        .tracking
-                        .terminal_events
-                        .lock()
-                        .insert((child_vid, AlpacaTradeEventKind::New))
-                    {
-                        self.emitter
-                            .emit_order_accepted(child_order, child_vid, ts_accepted);
+                    if let Some(leg) = matched_leg {
+                        self.reconcile_submitted_order_response(child_order, leg, ts_now);
+                    } else {
+                        let child_vid = VenueOrderId::new(format!("{}-LEG-{idx}", resp.id.trim()));
+                        self.tracking
+                            .record_venue_order_id(child_order.client_order_id(), child_vid);
+                        if self
+                            .tracking
+                            .terminal_events
+                            .lock()
+                            .insert((child_vid, AlpacaTradeEventKind::New))
+                        {
+                            self.emitter
+                                .emit_order_accepted(child_order, child_vid, ts_accepted);
+                        }
                     }
                 }
             }
@@ -1077,8 +1658,7 @@ impl ExecutionClient for AlpacaExecutionClient {
 
     fn cancel_all_orders(&self, cmd: CancelAllOrders) -> anyhow::Result<()> {
         let http = Arc::clone(&self.http_client);
-        let open_orders =
-            block_on_alpaca_future(async move { http.list_orders(Some("open")).await })?;
+        let open_orders = block_on_alpaca_future(async move { http.list_open_orders().await })?;
         let ts_now = self.clock.get_time_ns();
         let target_symbol = cmd.instrument_id.symbol.as_str();
 
@@ -1247,12 +1827,14 @@ impl ExecutionClient for AlpacaExecutionClient {
             if resp.filled_qty <= Decimal::ZERO {
                 continue;
             }
-            let Some(avg_px_dec) = resp.filled_avg_price else {
+            let Some(avg_px_dec) = resp
+                .filled_avg_price
+                .filter(|p| *p > Decimal::ZERO)
+                .or_else(|| resp.limit_price.filter(|p| *p > Decimal::ZERO))
+                .or_else(|| resp.stop_price.filter(|p| *p > Decimal::ZERO))
+            else {
                 continue;
             };
-            if avg_px_dec <= Decimal::ZERO {
-                continue;
-            }
 
             let instrument_id = parse_instrument_id(&resp.symbol, &self.config.venue)?;
             if let Some(inst_filter) = cmd.instrument_id
@@ -1292,27 +1874,36 @@ impl ExecutionClient for AlpacaExecutionClient {
                 continue;
             }
 
-            let last_qty = decimal_to_quantity(resp.filled_qty, DEFAULT_EQUITY_SIZE_PRECISION)?;
-            let last_px = decimal_to_price(avg_px_dec, DEFAULT_EQUITY_PRICE_PRECISION)?;
-            let commission = Money::from_decimal(Decimal::ZERO, Currency::USD())?;
-            let trade_id = parse_alpaca_trade_id("FILL-", resp.id.trim())?;
+            let Some((trade_id, last_qty, last_px)) = self.tracking.claim_rest_fill(
+                venue_order_id,
+                client_order_id,
+                resp.filled_qty,
+                avg_px_dec,
+                DEFAULT_EQUITY_PRICE_PRECISION,
+                DEFAULT_EQUITY_SIZE_PRECISION,
+            )?
+            else {
+                log::debug!(
+                    "Skipping already-reported Alpaca REST fill for venue_order_id={} filled_qty={}",
+                    venue_order_id,
+                    resp.filled_qty
+                );
+                continue;
+            };
 
-            fills.push(FillReport::new(
+            if let Some(report) = build_fill_report_with_qty(
+                &resp,
                 self.core.account_id,
                 instrument_id,
-                venue_order_id,
-                trade_id,
-                OrderSide::from(resp.side),
-                last_qty,
-                last_px,
-                commission,
-                LiquiditySide::Taker,
-                client_order_id,
-                None,
-                ts_event_ns,
+                DEFAULT_EQUITY_PRICE_PRECISION,
+                DEFAULT_EQUITY_SIZE_PRECISION,
                 ts_init,
-                Some(UUID4::new()),
-            ));
+                last_qty.as_decimal(),
+                Some(trade_id),
+                Some(last_px),
+            )? {
+                fills.push(report);
+            }
         }
 
         Ok(fills)

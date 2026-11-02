@@ -25,6 +25,6 @@ pub use consts::{
 };
 pub use credential::AlpacaCredential;
 pub use enums::{
-    AlpacaEnvironment, AlpacaOrderClass, AlpacaOrderSide, AlpacaOrderType, AlpacaTimeInForce,
-    parse_alpaca_order_status,
+    AlpacaEnvironment, AlpacaOrderClass, AlpacaOrderSide, AlpacaOrderStatus, AlpacaOrderType,
+    AlpacaTimeInForce, parse_alpaca_order_status,
 };

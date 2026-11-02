@@ -16,8 +16,9 @@
 //! Asynchronous REST v2 client for Alpaca Markets built on [`nautilus_network::http::HttpClient`]
 //! and [`nautilus_network::retry::RetryManager`].
 
-use std::{fmt::Debug, num::NonZeroU32};
+use std::{fmt::Debug, num::NonZeroU32, time::Duration};
 
+use ahash::AHashSet;
 use http::Method;
 use nautilus_network::{
     http::{HttpClient, HttpRedirectPolicy, HttpResponse, create_standard_nautilus_headers},
@@ -36,6 +37,12 @@ use crate::{
 };
 
 const ALPACA_RATE_KEY: &str = "alpaca:rest";
+
+/// Maximum page size supported by Alpaca `GET /v2/orders` (`limit=500`).
+pub const ALPACA_ORDERS_PAGE_LIMIT: usize = 500;
+
+/// Maximum pagination pages fetched in a single `list_orders` reconciliation sweep.
+const MAX_ORDER_PAGINATION_PAGES: usize = 50;
 
 /// Alpaca Markets v2 REST API client with rate limiting and retry classification.
 pub struct AlpacaHttpClient {
@@ -139,15 +146,111 @@ impl AlpacaHttpClient {
         .await
     }
 
-    /// Queries `GET /v2/orders?status={status}` (e.g. `"open"`, `"closed"`, `"all"`).
+    /// Queries `GET /v2/orders` with `limit=500` and automatic timestamp-cursor pagination
+    /// so sessions with `> 50` or `> 500` orders are never truncated during reconciliation.
     ///
     /// # Errors
     ///
     /// Returns [`AlpacaError`] if transport, authentication, or deserialization fails.
     pub async fn list_orders(&self, status: Option<&str>) -> AlpacaResult<Vec<AlpacaOrderResponse>> {
-        let params = status.map(|s| vec![("status".to_string(), s.to_string())]);
-        self.request_json::<(), Vec<AlpacaOrderResponse>>(Method::GET, "/v2/orders", params, None)
+        self.list_orders_paginated(status, None, None, ALPACA_ORDERS_PAGE_LIMIT)
             .await
+    }
+
+    /// Queries `GET /v2/orders` with explicit `limit` (clamped to `1..=500`) and automatic
+    /// cursor pagination (`until` / `after`) with deduplication by venue `order.id`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AlpacaError`] if transport, authentication, or deserialization fails.
+    pub async fn list_orders_paginated(
+        &self,
+        status: Option<&str>,
+        after: Option<&str>,
+        until: Option<&str>,
+        page_limit: usize,
+    ) -> AlpacaResult<Vec<AlpacaOrderResponse>> {
+        let effective_limit = page_limit.clamp(1, ALPACA_ORDERS_PAGE_LIMIT);
+        let mut all_orders = Vec::new();
+        let mut seen_ids = AHashSet::new();
+        let mut cursor_after = after.map(str::to_string);
+        let mut cursor_until = until.map(str::to_string);
+        let mut is_ascending = after.is_some() && until.is_none();
+
+        for _page_idx in 0..MAX_ORDER_PAGINATION_PAGES {
+            let mut params = Vec::with_capacity(4);
+            if let Some(s) = status {
+                params.push(("status".to_string(), s.to_string()));
+            }
+            params.push(("limit".to_string(), effective_limit.to_string()));
+            if let Some(ref a) = cursor_after {
+                params.push(("after".to_string(), a.clone()));
+            }
+            if let Some(ref u) = cursor_until {
+                params.push(("until".to_string(), u.clone()));
+            }
+
+            let page = self
+                .request_json::<(), Vec<AlpacaOrderResponse>>(
+                    Method::GET,
+                    "/v2/orders",
+                    Some(params),
+                    None,
+                )
+                .await?;
+
+            let raw_page_len = page.len();
+            let first_created = page.first().map(|o| o.created_at.clone());
+            let last_created = page.last().map(|o| o.created_at.clone());
+
+            let mut newly_added = 0usize;
+            for order in page {
+                if seen_ids.insert(order.id.trim().to_string()) {
+                    all_orders.push(order);
+                    newly_added += 1;
+                }
+            }
+
+            if raw_page_len < effective_limit || newly_added == 0 {
+                break;
+            }
+
+            if let (Some(first_ts), Some(last_ts)) = (first_created, last_created) {
+                if first_ts == last_ts {
+                    break;
+                }
+                if first_ts < last_ts {
+                    is_ascending = true;
+                }
+                let next_cursor = offset_pagination_cursor(&last_ts, if is_ascending { 1 } else { -1 });
+                if cursor_after.as_deref() == Some(next_cursor.as_str())
+                    || cursor_until.as_deref() == Some(next_cursor.as_str())
+                {
+                    break;
+                }
+                if is_ascending {
+                    cursor_after = Some(next_cursor);
+                    cursor_until = None;
+                } else {
+                    cursor_until = Some(next_cursor);
+                    cursor_after = None;
+                }
+            } else {
+                break;
+            }
+        }
+
+        Ok(all_orders)
+    }
+
+    /// Queries open orders via `GET /v2/orders?status=open` and automatically paginates
+    /// if the initial page contains `>= 50` orders.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AlpacaError`] on HTTP transport or deserialization failures.
+    pub async fn list_open_orders(&self) -> AlpacaResult<Vec<AlpacaOrderResponse>> {
+        self.list_orders(Some("open")).await
     }
 
     /// Queries `GET /v2/orders:by_client_order_id?client_order_id={client_order_id}`.
@@ -172,23 +275,132 @@ impl AlpacaHttpClient {
         .await
     }
 
-    /// Submits a new order via `POST /v2/orders` (supports Simple, Limit, Bracket, and OCO orders).
+    /// Queries `GET /v2/orders:by_client_order_id?client_order_id={client_order_id}`
+    /// (alias for [`Self::get_order_by_client_order_id`]).
     ///
     /// # Errors
     ///
-    /// Returns [`AlpacaError::DeterministicReject`] on 403/422 counter rejections (non-retryable)
-    /// or [`AlpacaError`] on transport/rate-limit failures.
+    /// Returns [`AlpacaError`] if the order is not found (`404`) or request fails.
+    pub async fn get_order_by_client_id(
+        &self,
+        client_order_id: &str,
+    ) -> AlpacaResult<AlpacaOrderResponse> {
+        self.get_order_by_client_order_id(client_order_id).await
+    }
+
+    /// Submits a new order via `POST /v2/orders` (supports Simple, Limit, Bracket, and OCO orders)
+    /// with idempotent `get_order_by_client_id` recovery on timeout, transport error, `5xx`, or `409`/`422`.
+    ///
+    /// Never blindly retries `POST /v2/orders` without first checking whether `request.client_order_id`
+    /// already landed on Alpaca. If `get_order_by_client_id` finds the order on the venue, returns
+    /// `Ok(existing_order)` directly so the caller emits `OrderAccepted` instead of a false `OrderRejected`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AlpacaError::DeterministicReject`] when `POST /v2/orders` is rejected with `403`/`422`
+    /// and `get_order_by_client_id` confirms the order does not exist (`404`), or [`AlpacaError`] on
+    /// unrecoverable transport/rate-limit failures.
     pub async fn submit_order(
         &self,
         request: &AlpacaOrderRequest,
     ) -> AlpacaResult<AlpacaOrderResponse> {
-        self.request_json::<AlpacaOrderRequest, AlpacaOrderResponse>(
-            Method::POST,
-            "/v2/orders",
-            None,
-            Some(request),
-        )
-        .await
+        let cid = request.client_order_id.trim();
+        let mut need_pre_post_probe = false;
+        let mut last_err: Option<AlpacaError> = None;
+
+        for attempt in 0..=self.config.max_retries {
+            if attempt > 0 {
+                let delay = self.compute_backoff_delay(attempt);
+                tokio::time::sleep(delay).await;
+            }
+
+            if need_pre_post_probe {
+                match self.get_order_by_client_id_once(cid).await {
+                    Ok(existing_order) => {
+                        log::warn!(
+                            "Recovered Alpaca order id={} (client_order_id={cid}, status={}) on pre-POST probe (attempt={attempt})",
+                            existing_order.id,
+                            existing_order.status
+                        );
+                        return Ok(existing_order);
+                    }
+                    Err(AlpacaError::DeterministicReject { status: 404, .. }) => {
+                        if let Some(prev_err) = &last_err
+                            && !prev_err.is_retryable()
+                        {
+                            return Err(last_err.take().expect("checked Some"));
+                        }
+                    }
+                    Err(probe_err) => {
+                        if !probe_err.is_retryable() {
+                            return Err(probe_err);
+                        }
+                        last_err = Some(probe_err);
+                        continue;
+                    }
+                }
+            }
+
+            match self
+                .request_once_json::<AlpacaOrderRequest, AlpacaOrderResponse>(
+                    Method::POST,
+                    "/v2/orders",
+                    None,
+                    Some(request),
+                )
+                .await
+            {
+                Ok(order_resp) => return Ok(order_resp),
+                Err(post_err) => {
+                    let should_probe = !cid.is_empty()
+                        && match &post_err {
+                            AlpacaError::Transport(_)
+                            | AlpacaError::RetryableServer { .. }
+                            | AlpacaError::RateLimited { .. } => true,
+                            AlpacaError::DeterministicReject { status, .. } => {
+                                *status == 409
+                                    || (*status == 422
+                                        && (attempt > 0
+                                            || is_duplicate_client_order_id_error(&post_err)))
+                            }
+                            _ => false,
+                        };
+                    if !should_probe {
+                        return Err(post_err);
+                    }
+
+                    match self.get_order_by_client_id_once(cid).await {
+                        Ok(existing_order) => {
+                            log::warn!(
+                                "Recovered Alpaca order id={} (client_order_id={cid}, status={}) via get_order_by_client_id after POST /v2/orders error: {post_err}",
+                                existing_order.id,
+                                existing_order.status
+                            );
+                            return Ok(existing_order);
+                        }
+                        Err(AlpacaError::DeterministicReject { status: 404, .. }) => {
+                            if !post_err.is_retryable() {
+                                return Err(post_err);
+                            }
+                            need_pre_post_probe = true;
+                            last_err = Some(post_err);
+                        }
+                        Err(probe_err) => {
+                            let is_dup_cid = is_duplicate_client_order_id_error(&post_err);
+                            if !post_err.is_retryable() && !is_dup_cid {
+                                return Err(post_err);
+                            }
+                            need_pre_post_probe = true;
+                            last_err = Some(if is_dup_cid { probe_err } else { post_err });
+                        }
+                    }
+                }
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| {
+            AlpacaError::Transport("Alpaca submit_order exhausted retry attempts".to_string())
+        }))
     }
 
     /// Modifies/replaces an existing order via `PATCH /v2/orders/{venue_order_id}`.
@@ -233,6 +445,77 @@ impl AlpacaHttpClient {
         ]);
         self.request_json::<(), Vec<AlpacaAssetResponse>>(Method::GET, "/v2/assets", params, None)
             .await
+    }
+
+    async fn get_order_by_client_id_once(
+        &self,
+        client_order_id: &str,
+    ) -> AlpacaResult<AlpacaOrderResponse> {
+        let params = Some(vec![(
+            "client_order_id".to_string(),
+            client_order_id.to_string(),
+        )]);
+        self.request_once_json::<(), AlpacaOrderResponse>(
+            Method::GET,
+            "/v2/orders:by_client_order_id",
+            params,
+            None,
+        )
+        .await
+    }
+
+    fn compute_backoff_delay(&self, attempt: u32) -> Duration {
+        let exp = attempt.saturating_sub(1).min(10);
+        let factor = 1u64.checked_shl(exp).unwrap_or(u64::MAX);
+        let delay_ms = self
+            .config
+            .retry_initial_ms
+            .saturating_mul(factor)
+            .min(self.config.retry_max_ms);
+        Duration::from_millis(delay_ms)
+    }
+
+    async fn request_once_json<Req, Resp>(
+        &self,
+        method: Method,
+        path: &str,
+        params: Option<Vec<(String, String)>>,
+        body_payload: Option<&Req>,
+    ) -> AlpacaResult<Resp>
+    where
+        Req: Serialize + Sync,
+        Resp: DeserializeOwned,
+    {
+        let url = format!("{}{path}", self.config.http_base_url);
+        let serialized_body = match body_payload {
+            Some(payload) => Some(
+                serde_json::to_vec(payload)
+                    .map_err(|e| AlpacaError::Parse(format!("failed to serialize request: {e}")))?,
+            ),
+            None => None,
+        };
+
+        let resp = self
+            .client
+            .request_with_params(
+                method,
+                url,
+                params.as_ref(),
+                None,
+                serialized_body,
+                Some(self.config.timeout_secs),
+                Some(vec![ALPACA_RATE_KEY.to_string()]),
+            )
+            .await
+            .map_err(|e| AlpacaError::Transport(e.to_string()))?;
+        let classified = classify_response(resp)?;
+
+        serde_json::from_slice::<Resp>(&classified.body).map_err(|e| {
+            let preview = String::from_utf8_lossy(&classified.body);
+            AlpacaError::Parse(format!(
+                "failed to deserialize response from {path}: {e} (body='{preview}')"
+            ))
+        })
     }
 
     async fn request_json<Req, Resp>(
@@ -378,4 +661,30 @@ fn classify_response(resp: HttpResponse) -> AlpacaResult<HttpResponse> {
             message,
         }),
     }
+}
+
+fn is_duplicate_client_order_id_error(err: &AlpacaError) -> bool {
+    match err {
+        AlpacaError::DeterministicReject {
+            status: 409 | 422,
+            message,
+            ..
+        } => {
+            let lower = message.to_ascii_lowercase();
+            lower.contains("client_order_id")
+                || lower.contains("unique")
+                || lower.contains("duplicate")
+                || lower.contains("already exists")
+        }
+        _ => false,
+    }
+}
+
+fn offset_pagination_cursor(raw_rfc3339: &str, delta_millis: i64) -> String {
+    if let Ok(ts) = raw_rfc3339.trim().parse::<jiff::Timestamp>()
+        && let Ok(shifted) = ts.checked_add(jiff::Span::new().milliseconds(delta_millis))
+    {
+        return shifted.to_string();
+    }
+    raw_rfc3339.to_string()
 }

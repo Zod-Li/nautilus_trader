@@ -17,20 +17,24 @@
 
 #![allow(linker_messages)]
 
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use nautilus_core::UnixNanos;
 use nautilus_datainfra::{
     BarStreamVersionTracker, CanonicalBarWire, CanonicalQuoteWire, CanonicalStreamDecoder,
-    CanonicalTradingStatusWire, DataInfraError, DataInfraStreamEvent, DataInfraTimeframe,
-    KafkaStreamSessionCoordinator, StreamDecodeOutcome, StreamLifecycleListener, TOPIC_SIP_BARS_1M,
-    TOPIC_SIP_QUOTES, TOPIC_SIP_STATUSES, VersionEvaluation, to_instrument_id,
+    CanonicalTradingStatusWire, CanonicalWireFrame, DEFAULT_SIP_KAFKA_TOPICS, DataInfraConfig,
+    DataInfraError, DataInfraStreamEvent, DataInfraTimeframe, KafkaBrokerEnvelope,
+    KafkaEnvelopePayload, KafkaPayloadFrame, KafkaPayloadSource, KafkaStreamSessionCoordinator,
+    StreamDecodeOutcome, StreamLifecycleListener, TOPIC_SIP_BARS_1M, TOPIC_SIP_QUOTES,
+    TOPIC_SIP_STATUSES, TcpKafkaPayloadSource, VersionEvaluation, parse_broker_wire_frame,
+    to_instrument_id,
 };
 use nautilus_model::{
     enums::MarketStatusAction,
     types::{Price, Quantity},
 };
 use parking_lot::Mutex;
+use tokio::{io::AsyncWriteExt, net::TcpListener};
 use ustr::Ustr;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,7 +119,7 @@ fn test_decode_canonical_bar_quote_and_status_wire_frames() {
             assert_eq!(bar.low, Price::new(169.85, 2));
             assert_eq!(bar.close, Price::new(170.95, 2));
             assert_eq!(bar.volume, Quantity::new(48_200.0, 0));
-            assert_eq!(bar.ts_event, UnixNanos::from(1_711_980_000_000_000_000u64));
+            assert_eq!(bar.ts_event, UnixNanos::from(1_711_980_060_000_000_000u64));
             assert_eq!(bar.ts_init, UnixNanos::from(1_711_980_060_125_000_000u64));
         }
         other => panic!("expected Emitted(Bar), got {other:?}"),
@@ -589,4 +593,214 @@ fn test_kafka_stream_session_coordinator_isolates_lifecycle_and_fails_closed_whe
             },
         ]
     );
+}
+
+#[test]
+fn test_parse_broker_wire_frame_all_supported_formats_and_fail_closed() {
+    assert_eq!(
+        DEFAULT_SIP_KAFKA_TOPICS,
+        [TOPIC_SIP_BARS_1M, TOPIC_SIP_QUOTES, TOPIC_SIP_STATUSES]
+    );
+
+    let bar_wire = CanonicalBarWire {
+        symbol: "AAPL".to_string(),
+        timeframe: "1m".to_string(),
+        bar_ts: 1_711_980_000,
+        open: 170.00,
+        high: 171.00,
+        low: 169.50,
+        close: 170.50,
+        volume: 15_000.0,
+        vwap: Some(170.25),
+        trade_count: Some(120),
+        version: 1,
+        is_synthetic: false,
+        is_correction: false,
+        is_suspect_spike: false,
+        session: "REGULAR".to_string(),
+        provider: "alpaca_sip".to_string(),
+        source_ts_ms: 1_711_980_060_000,
+        ingest_ts_ms: 1_711_980_060_050,
+    };
+    let bar_json_str = serde_json::to_string(&bar_wire).unwrap();
+
+    // 1. Topic-prefixed frames (`\t`, `|`, `:`, space)
+    for sep in ["\t", "|", ":", " "] {
+        let raw = format!("{TOPIC_SIP_BARS_1M}{sep}{bar_json_str}");
+        let parsed = parse_broker_wire_frame(raw.as_bytes()).expect("parse topic-prefixed frame");
+        assert_eq!(parsed.topic, TOPIC_SIP_BARS_1M);
+        let decoded: CanonicalBarWire = serde_json::from_slice(&parsed.payload).unwrap();
+        assert_eq!(decoded, bar_wire);
+    }
+
+    // 2. Strongly typed KafkaBrokerEnvelope with Structured, JsonString (`value`), and JsonBytes (`data`)
+    let env_structured = KafkaBrokerEnvelope {
+        topic: TOPIC_SIP_BARS_1M.to_string(),
+        payload: KafkaEnvelopePayload::Structured(CanonicalWireFrame::Bar(bar_wire.clone())),
+    };
+    let raw_env_struct = serde_json::to_vec(&env_structured).unwrap();
+    let parsed_env_struct =
+        parse_broker_wire_frame(&raw_env_struct).expect("parse structured envelope");
+    assert_eq!(parsed_env_struct.topic, TOPIC_SIP_BARS_1M);
+    let decoded_struct: CanonicalBarWire =
+        serde_json::from_slice(&parsed_env_struct.payload).unwrap();
+    assert_eq!(decoded_struct, bar_wire);
+
+    let raw_env_value = serde_json::json!({
+        "topic": TOPIC_SIP_QUOTES,
+        "value": r#"{"symbol":"AAPL","quote_ts_ms":1711980005000,"bid_price":170.1,"bid_size":100.0,"ask_price":170.2,"ask_size":200.0}"#
+    })
+    .to_string();
+    let parsed_env_val =
+        parse_broker_wire_frame(raw_env_value.as_bytes()).expect("parse value-aliased envelope");
+    assert_eq!(parsed_env_val.topic, TOPIC_SIP_QUOTES);
+
+    let status_bytes = br#"{"symbol":"AAPL","status_ts_ms":1711980010000,"state":"TRADING"}"#.to_vec();
+    let raw_env_data = serde_json::json!({
+        "topic": TOPIC_SIP_STATUSES,
+        "data": status_bytes
+    })
+    .to_string();
+    let parsed_env_data =
+        parse_broker_wire_frame(raw_env_data.as_bytes()).expect("parse data-aliased byte envelope");
+    assert_eq!(parsed_env_data.topic, TOPIC_SIP_STATUSES);
+    assert_eq!(parsed_env_data.payload, status_bytes);
+
+    // 3. Direct CanonicalWireFrame topic inference (1m bar, 15m bar, quote, status)
+    let direct_1m = parse_broker_wire_frame(bar_json_str.as_bytes()).expect("direct 1m bar");
+    assert_eq!(direct_1m.topic, TOPIC_SIP_BARS_1M);
+
+    let mut bar_15m = bar_wire.clone();
+    bar_15m.timeframe = "15m".to_string();
+    let direct_15m =
+        parse_broker_wire_frame(&serde_json::to_vec(&bar_15m).unwrap()).expect("direct 15m bar");
+    assert_eq!(direct_15m.topic, "md.sip.bars.15m");
+
+    let quote_wire = CanonicalQuoteWire {
+        symbol: "AAPL".to_string(),
+        quote_ts_ms: 1_711_980_005_000,
+        ingest_ts_ms: 1_711_980_005_010,
+        bid_price: 170.10,
+        bid_size: 100.0,
+        ask_price: 170.20,
+        ask_size: 200.0,
+        mid_price: 170.15,
+        spread_bps: 5.87,
+        provider: "alpaca_sip".to_string(),
+    };
+    let direct_quote =
+        parse_broker_wire_frame(&serde_json::to_vec(&quote_wire).unwrap()).expect("direct quote");
+    assert_eq!(direct_quote.topic, TOPIC_SIP_QUOTES);
+
+    let status_wire = CanonicalTradingStatusWire {
+        symbol: "AAPL".to_string(),
+        status_ts_ms: 1_711_980_010_000,
+        ingest_ts_ms: 1_711_980_010_005,
+        state: "HALTED".to_string(),
+        reason_code: Some("T1".to_string()),
+        provider: "alpaca_sip".to_string(),
+    };
+    let direct_status =
+        parse_broker_wire_frame(&serde_json::to_vec(&status_wire).unwrap()).expect("direct status");
+    assert_eq!(direct_status.topic, TOPIC_SIP_STATUSES);
+
+    // 4. Fail-closed rejections: empty, non-UTF8, non-JSON, malformed JSON
+    assert!(matches!(
+        parse_broker_wire_frame(b"   \n\t "),
+        Err(DataInfraError::Transport(_))
+    ));
+    assert!(matches!(
+        parse_broker_wire_frame(&[0xff, 0xfe, 0xfd]),
+        Err(DataInfraError::Transport(_))
+    ));
+    assert!(matches!(
+        parse_broker_wire_frame(b"PLAIN_TEXT_NO_JSON"),
+        Err(DataInfraError::Transport(_))
+    ));
+    assert!(matches!(
+        parse_broker_wire_frame(b"{\"unrecognized_schema\": 123}"),
+        Err(DataInfraError::Transport(_))
+    ));
+}
+
+#[tokio::test]
+async fn test_tcp_kafka_payload_source_ephemeral_broker_streaming_failover_and_close() {
+    // Bind two ephemeral listeners; drop the first immediately so its port is unreachable,
+    // verifying seed-broker failover to the second healthy listener.
+    let dead_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let dead_addr = dead_listener.local_addr().unwrap().to_string();
+    drop(dead_listener);
+
+    let live_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let live_addr = live_listener.local_addr().unwrap().to_string();
+
+    let cfg = DataInfraConfig::new_checked(
+        "http://127.0.0.1:8123",
+        "market_data",
+        500,
+        0,
+        vec![dead_addr.clone(), live_addr.clone()],
+        "nautilus-datainfra-tcp-test",
+        "http://127.0.0.1:8012",
+        "ALPACA",
+    )
+    .expect("valid DataInfraConfig");
+
+    let source = TcpKafkaPayloadSource::from_config(&cfg).expect("create TcpKafkaPayloadSource");
+    assert_eq!(source.group_id(), "nautilus-datainfra-tcp-test");
+    assert_eq!(source.brokers(), &[dead_addr, live_addr]);
+
+    let broker_task = tokio::spawn(async move {
+        let (mut socket, _) = live_listener.accept().await.expect("accept client");
+        let lines = [
+            // Frame 1: topic-prefixed 1m bar
+            format!(
+                "{TOPIC_SIP_BARS_1M}\t{}\n",
+                r#"{"symbol":"AAPL","timeframe":"1m","bar_ts":1777896600,"open":185.0,"high":186.0,"low":184.5,"close":185.5,"volume":42000.0,"version":1,"is_synthetic":false,"is_suspect_spike":false}"#
+            ),
+            // Frame 2: blank heartbeat line (should be skipped cleanly) + direct Quote frame
+            format!(
+                "\n{}\n",
+                r#"{"symbol":"AAPL","quote_ts_ms":1777896605000,"bid_price":185.45,"bid_size":200.0,"ask_price":185.55,"ask_size":300.0}"#
+            ),
+            // Frame 3: envelope Status frame
+            format!(
+                "{}\n",
+                r#"{"topic":"md.sip.statuses","payload":{"symbol":"AAPL","status_ts_ms":1777896610000,"state":"TRADING"}}"#
+            ),
+        ];
+        for line in lines {
+            socket.write_all(line.as_bytes()).await.unwrap();
+            socket.flush().await.unwrap();
+        }
+        // Keep socket open briefly so client reads all 3 frames, then close to trigger EOF
+        tokio::time::sleep(Duration::from_millis(80)).await;
+    });
+
+    let mut received: Vec<KafkaPayloadFrame> = Vec::new();
+    while received.len() < 3 {
+        if let Some(frame) = source
+            .next_frame()
+            .await
+            .expect("next_frame should succeed while stream is open")
+        {
+            received.push(frame);
+        }
+    }
+
+    assert_eq!(received[0].topic, TOPIC_SIP_BARS_1M);
+    assert_eq!(received[1].topic, TOPIC_SIP_QUOTES);
+    assert_eq!(received[2].topic, TOPIC_SIP_STATUSES);
+
+    broker_task.await.unwrap();
+
+    // Subsequent poll after broker closed TCP socket must report Transport EOF error (fail-closed)
+    let eof_err = source
+        .next_frame()
+        .await
+        .expect_err("EOF on established session must fail closed with Transport error");
+    assert!(matches!(eof_err, DataInfraError::Transport(ref msg) if msg.contains("EOF")));
+
+    // Closing the source resets the established session state
+    source.close().await.expect("close TcpKafkaPayloadSource");
 }

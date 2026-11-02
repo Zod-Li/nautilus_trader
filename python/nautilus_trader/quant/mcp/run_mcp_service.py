@@ -71,7 +71,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(description="Nautilus MCP Server Daemon")
     parser.add_argument(
         "--host",
-        default=os.environ.get("NAUTILUS_MCP_HOST", "0.0.0.0"),
+        default=os.environ.get("NAUTILUS_MCP_HOST", "127.0.0.1"),
         help="Bind host for HTTP JSON-RPC MCP server",
     )
     parser.add_argument(

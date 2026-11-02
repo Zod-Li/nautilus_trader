@@ -3,16 +3,28 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from enum import Enum
 from types import MappingProxyType
 from typing import Any, Dict, Mapping, Optional
 from uuid import UUID
+from zoneinfo import ZoneInfo
 
 from evolution_engine.config_center.envelope import Envelope, load_envelope
 
+NY_SESSION_TZ = ZoneInfo("America/New_York")
+
 SUPPORTED_TIMEFRAMES = ("1m", "15m", "1h", "4h", "1d", "1w")
+BAR_TIMEFRAME_DELTAS: Dict[str, timedelta] = {
+    "1m": timedelta(minutes=1),
+    "5m": timedelta(minutes=5),
+    "15m": timedelta(minutes=15),
+    "1h": timedelta(hours=1),
+    "4h": timedelta(hours=4),
+    "1d": timedelta(days=1),
+    "1w": timedelta(days=7),
+}
 VALID_ITEM_STATUSES = (
     "ARMED",
     "TRIGGERED",
@@ -22,6 +34,83 @@ VALID_ITEM_STATUSES = (
     "CANCELLED",
     "CLOSED",
 )
+
+
+def compute_intraday_entry_valid_until(
+    trading_date: date,
+    bar_timeframe: str = "15m",
+    entry_ttl_bars: int = 2,
+    *,
+    rth_open_utc: Optional[datetime] = None,
+    rth_close_utc: Optional[datetime] = None,
+    anchor_ts_utc: Optional[datetime] = None,
+) -> datetime:
+    """Computes the intraday entry `valid_until` UTC timestamp for a daily `TradingPlan` item.
+
+    Converts `entry_ttl_bars` into `entry_ttl_bars * bar_timeframe` duration anchored at
+    regular trading hours open (`09:30:00 America/New_York`, or `anchor_ts_utc` when within RTH)
+    and strictly clamps the result to `rth_close_utc` (`16:00:00 America/New_York`) on `trading_date`.
+    """
+    if rth_open_utc is None:
+        rth_open_et = datetime(
+            trading_date.year,
+            trading_date.month,
+            trading_date.day,
+            9,
+            30,
+            0,
+            tzinfo=NY_SESSION_TZ,
+        )
+        open_utc = rth_open_et.astimezone(timezone.utc)
+    else:
+        open_utc = (
+            rth_open_utc.astimezone(timezone.utc)
+            if rth_open_utc.tzinfo is not None
+            else rth_open_utc.replace(tzinfo=timezone.utc)
+        )
+
+    if rth_close_utc is None:
+        rth_close_et = datetime(
+            trading_date.year,
+            trading_date.month,
+            trading_date.day,
+            16,
+            0,
+            0,
+            tzinfo=NY_SESSION_TZ,
+        )
+        close_utc = rth_close_et.astimezone(timezone.utc)
+    else:
+        close_utc = (
+            rth_close_utc.astimezone(timezone.utc)
+            if rth_close_utc.tzinfo is not None
+            else rth_close_utc.replace(tzinfo=timezone.utc)
+        )
+
+    if close_utc < open_utc:
+        close_utc = open_utc
+
+    tf_key = str(bar_timeframe or "15m").strip()
+    bar_delta = BAR_TIMEFRAME_DELTAS.get(tf_key, timedelta(minutes=15))
+    ttl_bars = max(1, int(entry_ttl_bars))
+
+    if bar_delta >= timedelta(days=1):
+        return close_utc
+
+    if anchor_ts_utc is not None:
+        norm_anchor = (
+            anchor_ts_utc.astimezone(timezone.utc)
+            if anchor_ts_utc.tzinfo is not None
+            else anchor_ts_utc.replace(tzinfo=timezone.utc)
+        )
+        start_anchor = (
+            open_utc if norm_anchor < open_utc else min(norm_anchor, close_utc)
+        )
+    else:
+        start_anchor = open_utc
+
+    raw_expiry = start_anchor + (bar_delta * ttl_bars)
+    return min(raw_expiry, close_utc)
 
 
 class PlanContractValidationError(ValueError):
@@ -299,6 +388,13 @@ class PlanRiskEnvelope:
 
         self.validate_intrinsic()
 
+    @property
+    def reference_price(self) -> Decimal:
+        """Implied plan reference price (`target_notional_usd / target_qty`)."""
+        if self.target_qty > Decimal("0"):
+            return self.target_notional_usd / self.target_qty
+        return Decimal("0")
+
     def validate_intrinsic(self) -> None:
         if self.target_qty <= Decimal("0"):
             raise PlanContractValidationError(f"target_qty must be > 0, got {self.target_qty}")
@@ -470,11 +566,23 @@ class PlanItemContract:
 
     def to_trigger_spec_dict(self) -> Dict[str, Any]:
         """Serialize the isomorphic `StrategyConfig` and `MarketableLimitCollar` into `trading_plan_items.trigger_spec`."""
+        ref_px = (
+            float(self.risk_envelope.target_notional_usd / self.risk_envelope.target_qty)
+            if self.risk_envelope.target_qty > Decimal("0")
+            else 0.0
+        )
+        atr_mult = float(self.strategy_config.atr_stop_multiplier)
+        stop_dist = abs(ref_px - float(self.risk_envelope.initial_stop_price))
+        est_atr = (stop_dist / atr_mult) if (ref_px > 0.0 and atr_mult > 0.0) else 0.0
         return {
             "schema_version": 2,
             "venue": self.venue,
             "strategy_config": self.strategy_config.to_dict(),
             "collar": self.collar_dict(),
+            "reference_price": round(ref_px, 4) if ref_px > 0.0 else None,
+            "atr": round(est_atr, 4) if est_atr > 0.0 else None,
+            "limit_collar_atr": float(self.risk_envelope.collar.limit_collar_atr),
+            "limit_collar_pct": float(self.risk_envelope.collar.limit_collar_pct),
         }
 
     def collar_dict(self) -> Dict[str, str]:

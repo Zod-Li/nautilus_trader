@@ -61,11 +61,12 @@ use nautilus_common::{
 use nautilus_core::{Params, UUID4, UnixNanos};
 use nautilus_data::engine::{DataEngine, config::DataEngineConfig};
 use nautilus_datainfra::{
-    CalendarSessionGate, DATAINFRA, DATAINFRA_CATALOG_FACTORY_NAME, DataInfraCatalog,
-    DataInfraConfig, DataInfraDataClient, DataInfraDataClientFactory, DataInfraEquityMetadata,
-    DataInfraError, HttpClickHouseArrowTransport, StreamDecodeOutcome, StreamLifecycleListener,
-    TOPIC_SIP_BARS_1M, TOPIC_SIP_QUOTES, TOPIC_SIP_STATUSES, parse_datainfra_bar_type,
-    to_instrument_id,
+    CALENDAR_SESSION_STATUS_PATH, CALENDAR_SESSION_STATUS_V1_PATH, CalendarSessionGate,
+    CalendarSessionStatus, CalendarTransport, DATAINFRA, DATAINFRA_CATALOG_FACTORY_NAME,
+    DEFAULT_CALENDAR_MARKET, DataInfraCatalog, DataInfraConfig, DataInfraDataClient,
+    DataInfraDataClientFactory, DataInfraEquityMetadata, DataInfraError, HttpCalendarTransport,
+    HttpClickHouseArrowTransport, StreamDecodeOutcome, StreamLifecycleListener, TOPIC_SIP_BARS_1M,
+    TOPIC_SIP_QUOTES, TOPIC_SIP_STATUSES, parse_datainfra_bar_type, to_instrument_id,
 };
 use nautilus_model::{
     data::{
@@ -574,11 +575,12 @@ async fn test_datainfra_catalog_reader_query_batch_session_missing_intervals_and
     };
     assert_eq!(bars_vec.len(), 4);
     // Verify chronological ordering even though Arrow batch had scrambled rows
+    // Note: ts_event / ts_init of a 15m bar is bar_open_ns + 900_000_000_000 (bar-close timestamp)
     let expected_ts: Vec<u64> = vec![
-        1_700_000_000_000_000_000,
         1_700_000_900_000_000_000,
         1_700_001_800_000_000_000,
         1_700_002_700_000_000_000,
+        1_700_003_600_000_000_000,
     ];
     assert_eq!(
         bars_vec.iter().map(|b| b.ts_init.as_u64()).collect::<Vec<_>>(),
@@ -609,7 +611,7 @@ async fn test_datainfra_catalog_reader_query_batch_session_missing_intervals_and
             Some("AAPL.ALPACA-15-MINUTE-LAST-EXTERNAL"),
         )
         .expect("query_last_timestamp");
-    assert_eq!(last_ts, Some(1_700_002_700_000_000_000_u64));
+    assert_eq!(last_ts, Some(1_700_003_600_000_000_000_u64));
 
     // 4. `get_missing_intervals_for_request`
     let missing = catalog
@@ -625,11 +627,7 @@ async fn test_datainfra_catalog_reader_query_batch_session_missing_intervals_and
         vec![
             (
                 1_699_999_000_000_000_000_u64,
-                1_700_000_000_000_000_000_u64 - 1
-            ),
-            (
-                1_700_002_700_000_000_000_u64 + 1,
-                1_700_003_000_000_000_000_u64
+                1_700_000_900_000_000_000_u64 - 1
             ),
         ]
     );
@@ -876,9 +874,15 @@ async fn test_calendar_session_gate_rth_open_early_close_holiday_and_fail_closed
         gate.is_within_cached_rth(UnixNanos::from(1_783_092_300_000_000_000_u64))
             .unwrap()
     );
-    // 13:00 ET (1_783_093_200) -> exact early close boundary (inclusive)
+    // 09:30 ET (1_783_080_600) -> exact RTH open boundary (inclusive in `[open_ns, close_ns)`)
     assert!(
-        gate.is_within_cached_rth(UnixNanos::from(1_783_093_200_000_000_000_u64))
+        gate.is_within_cached_rth(UnixNanos::from(1_783_080_600_000_000_000_u64))
+            .unwrap()
+    );
+    // 13:00 ET (1_783_093_200) -> exact early close boundary (exclusive in `[open_ns, close_ns)`)
+    assert!(
+        !gate
+            .is_within_cached_rth(UnixNanos::from(1_783_093_200_000_000_000_u64))
             .unwrap()
     );
     // 13:15 ET (1_783_094_100) -> REJECTED on early-close day!
@@ -936,20 +940,27 @@ async fn test_calendar_session_gate_rth_open_early_close_holiday_and_fail_closed
 struct RecordingLifecycleObserver {
     connected: AtomicUsize,
     disconnected: AtomicUsize,
+    reconnected: AtomicUsize,
+    last_endpoint: Mutex<Option<String>>,
     last_disconnect_reason: Mutex<Option<String>>,
 }
 
 impl StreamLifecycleListener for RecordingLifecycleObserver {
-    fn on_stream_connected(&self, _endpoint: &str) {
+    fn on_stream_connected(&self, endpoint: &str) {
         self.connected.fetch_add(1, Ordering::SeqCst);
+        *self.last_endpoint.lock() = Some(endpoint.to_string());
     }
 
-    fn on_stream_disconnected(&self, _endpoint: &str, reason: &str) {
+    fn on_stream_disconnected(&self, endpoint: &str, reason: &str) {
         self.disconnected.fetch_add(1, Ordering::SeqCst);
+        *self.last_endpoint.lock() = Some(endpoint.to_string());
         *self.last_disconnect_reason.lock() = Some(reason.to_string());
     }
 
-    fn on_stream_reconnected(&self, _endpoint: &str, _attempt: u32) {}
+    fn on_stream_reconnected(&self, endpoint: &str, _attempt: u32) {
+        self.reconnected.fetch_add(1, Ordering::SeqCst);
+        *self.last_endpoint.lock() = Some(endpoint.to_string());
+    }
 }
 
 #[derive(Debug)]
@@ -1214,7 +1225,7 @@ async fn test_datainfra_data_client_connect_fail_closed_subscriptions_requests_a
     let aapl_bar_json = br#"{
         "symbol": "AAPL",
         "timeframe": "1m",
-        "bar_ts": 1711980060,
+        "bar_ts": 1777896660,
         "open": 185.10,
         "high": 186.25,
         "low": 184.90,
@@ -1228,8 +1239,8 @@ async fn test_datainfra_data_client_connect_fail_closed_subscriptions_requests_a
         "is_suspect_spike": false,
         "session": "REGULAR",
         "provider": "alpaca_sip",
-        "source_ts_ms": 1711980120000,
-        "ingest_ts_ms": 1711980120050
+        "source_ts_ms": 1777896720000,
+        "ingest_ts_ms": 1777896720050
     }"#;
     client
         .ingest_kafka_payload(TOPIC_SIP_BARS_1M, aapl_bar_json, UnixNanos::default())
@@ -1237,8 +1248,8 @@ async fn test_datainfra_data_client_connect_fail_closed_subscriptions_requests_a
 
     let aapl_quote_json = br#"{
         "symbol": "AAPL",
-        "quote_ts_ms": 1711980121000,
-        "ingest_ts_ms": 1711980121010,
+        "quote_ts_ms": 1777896721000,
+        "ingest_ts_ms": 1777896721010,
         "bid_price": 185.95,
         "bid_size": 300.0,
         "ask_price": 186.05,
@@ -1253,8 +1264,8 @@ async fn test_datainfra_data_client_connect_fail_closed_subscriptions_requests_a
 
     let aapl_status_json = br#"{
         "symbol": "AAPL",
-        "status_ts_ms": 1711980122000,
-        "ingest_ts_ms": 1711980122005,
+        "status_ts_ms": 1777896722000,
+        "ingest_ts_ms": 1777896722005,
         "state": "LULD_PAUSE",
         "reason_code": "LULD_T5",
         "provider": "alpaca_sip"
@@ -1431,4 +1442,462 @@ async fn test_datainfra_data_client_connect_fail_closed_subscriptions_requests_a
 
     cal_server.await.expect("calendar server completed cleanly");
     ch_server.abort();
+}
+
+#[tokio::test]
+async fn test_http_calendar_transport_fetch_session_status_v1_fallback_and_sanity_invariants() {
+    assert_eq!(DEFAULT_CALENDAR_MARKET, "US_EQUITY");
+    assert_eq!(
+        CALENDAR_SESSION_STATUS_PATH,
+        "/api/v1/calendar/session-status"
+    );
+    assert_eq!(
+        CALENDAR_SESSION_STATUS_V1_PATH,
+        "/v1/calendar/session-status"
+    );
+
+    // 1. Direct sanity validation checks on `CalendarSessionStatus`
+    let valid_status = CalendarSessionStatus {
+        market: "US_EQUITY".to_string(),
+        queried_at_utc: 1_783_085_000,
+        trading_date: "2026-07-03".to_string(),
+        is_trading_day: true,
+        is_rth_open: true,
+        rth_open_utc: 1_783_080_600,
+        rth_close_utc: 1_783_093_200, // 13:00 ET early close
+        is_early_close: true,
+        next_rth_open_utc: Some(1_783_339_800),
+        source: "ALPACA".to_string(),
+    };
+    valid_status
+        .validate_sanity()
+        .expect("valid early-close status should pass");
+
+    let empty_date = CalendarSessionStatus {
+        trading_date: "  ".to_string(),
+        ..valid_status.clone()
+    };
+    assert!(empty_date.validate_sanity().is_err());
+
+    let unsynced = CalendarSessionStatus {
+        source: "unsynced".to_string(),
+        ..valid_status.clone()
+    };
+    assert!(unsynced.validate_sanity().is_err());
+
+    let inverted_bounds = CalendarSessionStatus {
+        rth_open_utc: 1_783_093_200,
+        rth_close_utc: 1_783_080_600,
+        ..valid_status.clone()
+    };
+    assert!(inverted_bounds.validate_sanity().is_err());
+
+    let closed_but_rth_open = CalendarSessionStatus {
+        is_trading_day: false,
+        is_rth_open: true,
+        rth_open_utc: 0,
+        rth_close_utc: 0,
+        ..valid_status
+    };
+    assert!(closed_but_rth_open.validate_sanity().is_err());
+
+    // 2. Test `HttpCalendarTransport::fetch_session_status` directly against an ephemeral HTTP server:
+    //    - Call 1: `/api/v1/calendar/session-status` returns 404 -> falls back to `/v1/calendar/session-status` (200 OK early close)
+    //    - Call 2: `/api/v1/calendar/session-status` returns 200 OK with `source: "UNSYNCED"` -> fails closed
+    let cal_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let cal_addr = cal_listener.local_addr().unwrap();
+
+    let server_task = tokio::spawn(async move {
+        // Call 1a: `/api/v1/calendar/session-status` -> 404 Not Found
+        let (mut s1, _) = cal_listener.accept().await.unwrap();
+        let req1 = read_http_request(&mut s1).await;
+        assert!(req1.contains("GET /api/v1/calendar/session-status?market=US_EQUITY&at_ts=1783085000"));
+        write_http_response(&mut s1, "404 Not Found", "text/plain", b"not mounted at /api").await;
+
+        // Call 1b: fallback `/v1/calendar/session-status` -> 200 OK early-close (`13:00 ET`)
+        let (mut s2, _) = cal_listener.accept().await.unwrap();
+        let req2 = read_http_request(&mut s2).await;
+        assert!(req2.contains("GET /v1/calendar/session-status?market=US_EQUITY&at_ts=1783085000"));
+        write_http_response(
+            &mut s2,
+            "200 OK",
+            "application/json",
+            br#"{
+                "market": "US_EQUITY",
+                "queried_at_utc": 1783085000,
+                "trading_date": "2026-07-03",
+                "is_trading_day": true,
+                "is_rth_open": true,
+                "rth_open_utc": 1783080600,
+                "rth_close_utc": 1783093200,
+                "is_early_close": true,
+                "next_rth_open_utc": 1783339800,
+                "source": "ALPACA"
+            }"#,
+        )
+        .await;
+
+        // Call 2: `/api/v1/calendar/session-status` -> 200 OK with UNSYNCED source
+        let (mut s3, _) = cal_listener.accept().await.unwrap();
+        let req3 = read_http_request(&mut s3).await;
+        assert!(req3.contains("GET /api/v1/calendar/session-status?market=US_EQUITY"));
+        write_http_response(
+            &mut s3,
+            "200 OK",
+            "application/json",
+            br#"{
+                "market": "US_EQUITY",
+                "queried_at_utc": 1783085000,
+                "trading_date": "2026-07-03",
+                "is_trading_day": true,
+                "is_rth_open": true,
+                "rth_open_utc": 1783080600,
+                "rth_close_utc": 1783093200,
+                "is_early_close": true,
+                "next_rth_open_utc": 1783339800,
+                "source": "UNSYNCED"
+            }"#,
+        )
+        .await;
+    });
+
+    let cfg = make_test_config(
+        "http://127.0.0.1:8123",
+        &format!("http://{cal_addr}"),
+        "ALPACA",
+    );
+    let transport = HttpCalendarTransport::new(&cfg).expect("create HttpCalendarTransport");
+
+    // Verify 404 fallback + early close 13:00 ET validation
+    let status = transport
+        .fetch_session_status("US_EQUITY", Some(1_783_085_000))
+        .await
+        .expect("fetch_session_status should succeed via /v1 fallback");
+    assert_eq!(status.trading_date, "2026-07-03");
+    assert!(status.is_trading_day);
+    assert!(status.is_early_close);
+    assert_eq!(status.rth_open_utc, 1_783_080_600);
+    assert_eq!(status.rth_close_utc, 1_783_093_200);
+    assert!(status.contains_rth_timestamp_ns(UnixNanos::from(1_783_080_600_000_000_000_u64)));
+    assert!(status.contains_rth_timestamp_ns(UnixNanos::from(1_783_093_199_000_000_000_u64)));
+    assert!(!status.contains_rth_timestamp_ns(UnixNanos::from(1_783_093_200_000_000_000_u64)));
+    assert!(!status.contains_rth_timestamp_ns(UnixNanos::from(1_783_093_201_000_000_000_u64)));
+
+    // Verify UNSYNCED fails closed
+    let err_unsynced = transport
+        .fetch_session_status("US_EQUITY", None)
+        .await
+        .expect_err("UNSYNCED status must fail closed");
+    assert!(matches!(err_unsynced, DataInfraError::CalendarGate(ref m) if m.contains("UNSYNCED")));
+
+    server_task.await.unwrap();
+
+    // Verify unreachable server fails closed
+    let err_unreachable = transport
+        .fetch_session_status("US_EQUITY", None)
+        .await
+        .expect_err("unreachable calendar-service must fail closed");
+    assert!(matches!(err_unreachable, DataInfraError::CalendarGate(_)));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_datainfra_data_client_ephemeral_tcp_kafka_broker_e2e_async_streaming_and_disconnect()
+{
+    // 1. Spin up ephemeral calendar-service HTTP listener (`/api/v1/calendar/session-status`)
+    let cal_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral calendar-service listener");
+    let cal_addr = cal_listener.local_addr().unwrap();
+
+    let cal_server = tokio::spawn(async move {
+        let (mut socket, _) = cal_listener.accept().await.unwrap();
+        let req = read_http_request(&mut socket).await;
+        assert!(req.contains("/api/v1/calendar/session-status"));
+        assert!(req.contains("market=US_EQUITY"));
+        write_http_response(
+            &mut socket,
+            "200 OK",
+            "application/json",
+            br#"{
+                "market": "US_EQUITY",
+                "queried_at_utc": 1777900000,
+                "trading_date": "2026-05-04",
+                "is_trading_day": true,
+                "is_rth_open": true,
+                "rth_open_utc": 1777896600,
+                "rth_close_utc": 1777920000,
+                "is_early_close": false,
+                "next_rth_open_utc": 1777983000,
+                "source": "ALPACA"
+            }"#,
+        )
+        .await;
+    });
+
+    // 2. Spin up ephemeral TCP listener acting as the Kafka broker wire endpoint (`config.kafka_brokers`)
+    let kafka_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral Kafka TCP broker listener");
+    let kafka_addr = kafka_listener.local_addr().unwrap();
+
+    let (broker_done_tx, broker_done_rx) = tokio::sync::oneshot::channel::<()>();
+
+    // Stream realistic 1m CanonicalBar frames (`md.sip.bars.1m`), CanonicalQuote frames (`md.sip.quotes`),
+    // and CanonicalTradingStatus frames (`md.sip.statuses`) over the TCP broker connection:
+    //   - Frame 1: Normal 1m bar for AAPL at bar_ts=1777896600 (v1, close=185.50, vol=42000) -> EMITTED
+    //   - Frame 2: Synthetic +3s placeholder 1m bar for AAPL at bar_ts=1777896660 (is_synthetic=true, vol=0) -> FILTERED
+    //   - Frame 3: Suspect spike 1m bar for AAPL at bar_ts=1777896660 (is_suspect_spike=true, high=299.99) -> FILTERED
+    //   - Frame 4: Duplicate v1 1m bar for AAPL at bar_ts=1777896600 (v1) -> DROPPED (DuplicateOrStaleVersion)
+    //   - Frame 5: Version-upgraded v2 late correction 1m bar for AAPL at bar_ts=1777896600 (v2, close=186.10, vol=45500) -> EMITTED
+    //   - Frame 6: Normal 1m bar for AAPL at bar_ts=1777896660 (v1, close=186.75, vol=38100) -> EMITTED
+    //              (proves filtered synthetic/spike frames at 1777896660 did NOT pollute BarStreamVersionTracker!)
+    //   - Frame 7: Normal 1m bar for MSFT at bar_ts=1777896600 (v1, close=420.50, vol=19000) -> BUFFERED until subscribed
+    //   - Frame 8: CanonicalQuote for AAPL on `md.sip.quotes` (bid=186.70, ask=186.75) -> EMITTED
+    //   - Frame 9: CanonicalTradingStatus for AAPL on `md.sip.statuses` (state="LULD_PAUSE", reason="LULD_T5") -> EMITTED
+    let kafka_broker_task = tokio::spawn(async move {
+        let (mut socket, _) = kafka_listener
+            .accept()
+            .await
+            .expect("accept DataInfraDataClient TCP consumer");
+
+        let frames = [
+            // 1. Normal AAPL 1m bar (topic-prefixed wire format)
+            format!(
+                "{TOPIC_SIP_BARS_1M}\t{}\n",
+                r#"{"symbol":"AAPL","timeframe":"1m","bar_ts":1777896600,"open":185.00,"high":185.90,"low":184.80,"close":185.50,"volume":42000.0,"vwap":185.35,"trade_count":310,"version":1,"is_synthetic":false,"is_correction":false,"is_suspect_spike":false,"session":"REGULAR","provider":"alpaca_sip","source_ts_ms":1777896660000,"ingest_ts_ms":1777896660020}"#
+            ),
+            // 2. Synthetic +3s zero-volume placeholder bar (must be filtered out)
+            format!(
+                "{TOPIC_SIP_BARS_1M}\t{}\n",
+                r#"{"symbol":"AAPL","timeframe":"1m","bar_ts":1777896660,"open":185.50,"high":185.50,"low":185.50,"close":185.50,"volume":0.0,"version":1,"is_synthetic":true,"is_correction":false,"is_suspect_spike":false,"session":"REGULAR","provider":"alpaca_sip","source_ts_ms":1777896723000,"ingest_ts_ms":1777896723005}"#
+            ),
+            // 3. Suspect price spike bar (must be filtered out)
+            format!(
+                "{TOPIC_SIP_BARS_1M}\t{}\n",
+                r#"{"symbol":"AAPL","timeframe":"1m","bar_ts":1777896660,"open":185.50,"high":299.99,"low":185.50,"close":299.99,"volume":100.0,"version":1,"is_synthetic":false,"is_correction":false,"is_suspect_spike":true,"session":"REGULAR","provider":"alpaca_sip","source_ts_ms":1777896724000,"ingest_ts_ms":1777896724005}"#
+            ),
+            // 4. Duplicate v1 bar at 1777896600 (must be suppressed)
+            format!(
+                "{TOPIC_SIP_BARS_1M}\t{}\n",
+                r#"{"symbol":"AAPL","timeframe":"1m","bar_ts":1777896600,"open":185.00,"high":185.90,"low":184.80,"close":185.50,"volume":42000.0,"version":1,"is_synthetic":false,"is_correction":false,"is_suspect_spike":false,"session":"REGULAR","provider":"alpaca_sip","source_ts_ms":1777896660000,"ingest_ts_ms":1777896660020}"#
+            ),
+            // 5. Version-upgraded v2 late correction bar at 1777896600 (KafkaBrokerEnvelope wire format)
+            format!(
+                "{}\n",
+                r#"{"topic":"md.sip.bars.1m","payload":{"symbol":"AAPL","timeframe":"1m","bar_ts":1777896600,"open":185.00,"high":186.40,"low":184.80,"close":186.10,"volume":45500.0,"vwap":185.60,"trade_count":340,"version":2,"is_synthetic":false,"is_correction":true,"is_suspect_spike":false,"session":"REGULAR","provider":"alpaca_sip","source_ts_ms":1777896665000,"ingest_ts_ms":1777896665010}}"#
+            ),
+            // 6. Real v1 bar at 1777896660 (direct CanonicalWireFrame format)
+            format!(
+                "{}\n",
+                r#"{"symbol":"AAPL","timeframe":"1m","bar_ts":1777896660,"open":186.10,"high":186.90,"low":186.00,"close":186.75,"volume":38100.0,"vwap":186.50,"trade_count":290,"version":1,"is_synthetic":false,"is_correction":false,"is_suspect_spike":false,"session":"REGULAR","provider":"alpaca_sip","source_ts_ms":1777896725000,"ingest_ts_ms":1777896725015}"#
+            ),
+            // 7. Unsubscribed MSFT 1m bar (buffered in pending_events until MSFT is subscribed)
+            format!(
+                "{TOPIC_SIP_BARS_1M}\t{}\n",
+                r#"{"symbol":"MSFT","timeframe":"1m","bar_ts":1777896600,"open":420.00,"high":421.00,"low":419.50,"close":420.50,"volume":19000.0,"version":1,"is_synthetic":false,"is_correction":false,"is_suspect_spike":false,"session":"REGULAR","provider":"alpaca_sip","source_ts_ms":1777896660000,"ingest_ts_ms":1777896660030}"#
+            ),
+            // 8. CanonicalQuote for AAPL on `md.sip.quotes`
+            format!(
+                "{TOPIC_SIP_QUOTES}\t{}\n",
+                r#"{"symbol":"AAPL","quote_ts_ms":1777896726000,"ingest_ts_ms":1777896726005,"bid_price":186.70,"bid_size":500.0,"ask_price":186.75,"ask_size":700.0,"mid_price":186.725,"spread_bps":2.68,"provider":"alpaca_sip"}"#
+            ),
+            // 9. CanonicalTradingStatus for AAPL on `md.sip.statuses`
+            format!(
+                "{TOPIC_SIP_STATUSES}\t{}\n",
+                r#"{"symbol":"AAPL","status_ts_ms":1777896727000,"ingest_ts_ms":1777896727004,"state":"LULD_PAUSE","reason_code":"LULD_T5","provider":"alpaca_sip"}"#
+            ),
+        ];
+
+        for frame in frames {
+            socket.write_all(frame.as_bytes()).await.unwrap();
+            socket.flush().await.unwrap();
+        }
+
+        // Wait until the test signals disconnect before dropping the broker socket
+        let _ = broker_done_rx.await;
+    });
+
+    let cfg = DataInfraConfig::new_checked(
+        "http://127.0.0.1:8123",
+        "market_data",
+        2_000,
+        0,
+        vec![kafka_addr.to_string()],
+        "nautilus-datainfra-e2e-group",
+        format!("http://{cal_addr}"),
+        "ALPACA",
+    )
+    .expect("valid DataInfraConfig with ephemeral Kafka broker");
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    let sender = EventSender::from(tx);
+    let ch_transport = Arc::new(HttpClickHouseArrowTransport::new(cfg.clone()).unwrap());
+    let cal_gate = CalendarSessionGate::from_config(&cfg).unwrap();
+    let observer = Arc::new(RecordingLifecycleObserver::default());
+
+    let mut client = DataInfraDataClient::with_transports_and_listener(
+        ClientId::from(DATAINFRA),
+        cfg,
+        ch_transport,
+        cal_gate,
+        Some(sender),
+        observer.clone(),
+    )
+    .expect("create DataInfraDataClient");
+
+    let venue = Venue::from("ALPACA");
+    let aapl_id = to_instrument_id("AAPL", "ALPACA").unwrap();
+    let aapl_1m_bar_type = parse_datainfra_bar_type("AAPL", "ALPACA", "1m").unwrap();
+    let msft_1m_bar_type = parse_datainfra_bar_type("MSFT", "ALPACA", "1m").unwrap();
+
+    // Register AAPL subscriptions prior to `connect()`
+    client
+        .subscribe_bars(SubscribeBars::new(
+            vec![aapl_1m_bar_type],
+            Some(ClientId::from(DATAINFRA)),
+            Some(venue),
+            UUID4::new(),
+            UnixNanos::from(1_u64),
+            None,
+            None,
+        ))
+        .expect("subscribe AAPL 1m bars");
+    client
+        .subscribe_quotes(SubscribeQuotes::new(
+            vec![aapl_id],
+            Some(ClientId::from(DATAINFRA)),
+            Some(venue),
+            UUID4::new(),
+            UnixNanos::from(2_u64),
+            None,
+            None,
+        ))
+        .expect("subscribe AAPL quotes");
+    client
+        .subscribe_instrument_status(SubscribeInstrumentStatus::new(
+            vec![aapl_id],
+            Some(ClientId::from(DATAINFRA)),
+            Some(venue),
+            UUID4::new(),
+            UnixNanos::from(3_u64),
+            None,
+            None,
+        ))
+        .expect("subscribe AAPL statuses");
+
+    // Connect: validates calendar-service RTH and spawns the background Tokio Kafka consumer loop
+    client.connect().await.expect("DataInfraDataClient::connect");
+    assert!(client.is_connected());
+    assert!(client.is_consumer_task_running());
+    assert_eq!(observer.connected.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        observer.last_endpoint.lock().as_deref(),
+        Some(kafka_addr.to_string().as_str())
+    );
+
+    // Collect the 5 expected AAPL events emitted asynchronously by the background Tokio task
+    // (3 valid AAPL bars + 1 AAPL quote + 1 AAPL trading status) WITHOUT calling `ingest_kafka_payload`!
+    let mut emitted_bars: Vec<Bar> = Vec::new();
+    let mut emitted_quotes: Vec<QuoteTick> = Vec::new();
+    let mut emitted_statuses: Vec<InstrumentStatus> = Vec::new();
+
+    for _ in 0..5 {
+        let evt = tokio::time::timeout(Duration::from_secs(3), rx.recv())
+            .await
+            .expect("timed out waiting for background Kafka stream DataEvent")
+            .expect("DataEvent channel closed unexpectedly");
+        match evt {
+            DataEvent::Data(Data::Bar(bar)) => emitted_bars.push(bar),
+            DataEvent::Data(Data::Quote(quote)) => emitted_quotes.push(quote),
+            DataEvent::InstrumentStatus(status) => emitted_statuses.push(status),
+            other => panic!("unexpected DataEvent on stream channel: {other:?}"),
+        }
+    }
+
+    // Verify no extra (synthetic, spike, duplicate, or unsubscribed MSFT) events leaked into the channel
+    assert!(
+        rx.try_recv().is_err(),
+        "synthetic, suspect spike, duplicate version, and unsubscribed frames must NOT be emitted"
+    );
+
+    // Verify the 3 emitted AAPL 1m bars:
+    // 1) bar_ts=1777896600 v1 (close=185.50, ts_event = bar_open_ns + 60s = 1777896660s)
+    // 2) bar_ts=1777896600 v2 upgrade (close=186.10, high=186.40, ts_event = 1777896660s)
+    // 3) bar_ts=1777896660 v1 (close=186.75, ts_event = 1777896720s)
+    assert_eq!(emitted_bars.len(), 3);
+    assert_eq!(emitted_bars[0].bar_type, aapl_1m_bar_type);
+    assert_eq!(
+        emitted_bars[0].ts_event,
+        UnixNanos::from(1_777_896_660_000_000_000_u64)
+    );
+    assert_eq!(emitted_bars[0].close, Price::new(185.50, 2));
+
+    assert_eq!(emitted_bars[1].bar_type, aapl_1m_bar_type);
+    assert_eq!(
+        emitted_bars[1].ts_event,
+        UnixNanos::from(1_777_896_660_000_000_000_u64)
+    );
+    assert_eq!(emitted_bars[1].high, Price::new(186.40, 2));
+    assert_eq!(emitted_bars[1].close, Price::new(186.10, 2));
+
+    assert_eq!(emitted_bars[2].bar_type, aapl_1m_bar_type);
+    assert_eq!(
+        emitted_bars[2].ts_event,
+        UnixNanos::from(1_777_896_720_000_000_000_u64)
+    );
+    assert_eq!(emitted_bars[2].close, Price::new(186.75, 2));
+
+    // Verify the emitted AAPL QuoteTick
+    assert_eq!(emitted_quotes.len(), 1);
+    assert_eq!(emitted_quotes[0].instrument_id, aapl_id);
+    assert_eq!(emitted_quotes[0].bid_price, Price::new(186.70, 2));
+    assert_eq!(emitted_quotes[0].ask_price, Price::new(186.75, 2));
+
+    // Verify the emitted AAPL InstrumentStatus
+    assert_eq!(emitted_statuses.len(), 1);
+    assert_eq!(emitted_statuses[0].instrument_id, aapl_id);
+    assert_eq!(emitted_statuses[0].action, MarketStatusAction::Pause);
+
+    // Subscribe to MSFT 1m bars after the MSFT frame arrived on the background stream ->
+    // buffered event in `SubscriptionRegistry` is immediately drained and forwarded!
+    client
+        .subscribe_bars(SubscribeBars::new(
+            vec![msft_1m_bar_type],
+            Some(ClientId::from(DATAINFRA)),
+            Some(venue),
+            UUID4::new(),
+            UnixNanos::from(4_u64),
+            None,
+            None,
+        ))
+        .expect("subscribe MSFT 1m bars");
+
+    let msft_evt = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+        .await
+        .expect("timed out waiting for drained MSFT bar")
+        .expect("channel closed");
+    match msft_evt {
+        DataEvent::Data(Data::Bar(msft_bar)) => {
+            assert_eq!(msft_bar.bar_type, msft_1m_bar_type);
+            assert_eq!(msft_bar.close, Price::new(420.50, 2));
+        }
+        other => panic!("expected DataEvent::Data(Data::Bar) for MSFT, got {other:?}"),
+    }
+
+    // Disconnect: cleanly stops the background consumer task and notifies StreamLifecycleListener
+    client
+        .disconnect()
+        .await
+        .expect("DataInfraDataClient::disconnect");
+    assert!(client.is_disconnected());
+    assert!(!client.is_consumer_task_running());
+    assert_eq!(observer.disconnected.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        observer.last_disconnect_reason.lock().as_deref(),
+        Some("client disconnect")
+    );
+
+    let _ = broker_done_tx.send(());
+    kafka_broker_task.await.expect("kafka broker task finished");
+    cal_server.await.expect("calendar server finished");
 }
