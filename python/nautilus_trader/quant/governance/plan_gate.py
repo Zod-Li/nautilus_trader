@@ -926,7 +926,7 @@ class _AsyncPlanGateDbWorker:
                 INSERT INTO trading_plan_events (
                     plan_id, item_id, event_type, actor, reason, payload
                 ) VALUES (
-                    %s, %s, 'ORDER_ADMITTED', %s, %s, %s::jsonb
+                    %s, (SELECT item_id FROM trading_plan_items WHERE item_id = %s), 'ORDER_ADMITTED', %s, %s, %s::jsonb
                 )
                 """,
                 (
@@ -977,7 +977,7 @@ class _AsyncPlanGateDbWorker:
                     INSERT INTO trading_plan_events (
                         plan_id, item_id, event_type, actor, reason, payload
                     ) VALUES (
-                        %s, %s, 'ORDER_DENIED', %s, %s, %s::jsonb
+                        %s, (SELECT item_id FROM trading_plan_items WHERE item_id = %s), 'ORDER_DENIED', %s, %s, %s::jsonb
                     )
                     """,
                     (

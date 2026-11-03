@@ -564,6 +564,7 @@ class IsomorphicBacktestRunner:
         )
         plan_gate: Optional[PlanGateExecAlgorithm] = None
         telemetry_actor: Optional[PostgresTelemetryActor] = None
+        strategy: Optional[Any] = None
         try:
             eff_maker = self._maker_fee_rate * Decimal(str(max(0.0, fee_multiplier)))
             eff_taker = self._taker_fee_rate * Decimal(str(max(0.0, fee_multiplier)))
@@ -658,10 +659,17 @@ class IsomorphicBacktestRunner:
                 effective_trials=effective_trials,
             )
         finally:
+            if strategy is not None:
+                if hasattr(strategy, "_telemetry_actor"):
+                    strategy._telemetry_actor = None
+                if hasattr(strategy, "_plan_gate"):
+                    strategy._plan_gate = None
             if telemetry_actor is not None:
                 telemetry_actor.close()
             if plan_gate is not None:
                 plan_gate.close()
+                plan_gate._telemetry_actor = None
+                plan_gate._oco_monitor = None
             engine.dispose()
 
     def run_walk_forward(
