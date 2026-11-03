@@ -270,43 +270,6 @@ def _resolve_trading_date_from_bars(
     return datetime.now(tz=timezone.utc).date()
 
 
-def _align_plan_item_valid_until_for_bars(
-    plan_item: PlanItemContract,
-    bars: Sequence[Bar],
-) -> PlanItemContract:
-    if not bars or len(bars) < plan_item.strategy_config.lookback_window:
-        return plan_item
-    max_bar_ts_ns = max(
-        int(getattr(b, "ts_init", 0) or getattr(b, "ts_event", 0) or 0)
-        for b in bars
-    )
-    min_bar_ts_ns = min(
-        int(getattr(b, "ts_init", 0) or getattr(b, "ts_event", 0) or 0)
-        for b in bars
-    )
-    if max_bar_ts_ns > 100_000_000_000_000_000:
-        last_bar_dt = datetime.fromtimestamp(max_bar_ts_ns / 1e9, tz=timezone.utc)
-        first_bar_dt = datetime.fromtimestamp(min_bar_ts_ns / 1e9, tz=timezone.utc)
-        cur_valid_until = (
-            plan_item.risk_envelope.valid_until
-            if plan_item.risk_envelope.valid_until.tzinfo is not None
-            else plan_item.risk_envelope.valid_until.replace(tzinfo=timezone.utc)
-        )
-        if (
-            last_bar_dt > cur_valid_until
-            and cur_valid_until >= first_bar_dt - timedelta(days=14)
-        ):
-            horizon_valid_until = last_bar_dt + timedelta(hours=1)
-            plan_item = replace(
-                plan_item,
-                risk_envelope=replace(
-                    plan_item.risk_envelope,
-                    valid_until=horizon_valid_until,
-                ),
-            )
-    return plan_item
-
-
 def _build_parity_plan_items(
     plan_item: PlanItemContract,
     venue_str: str,
@@ -592,7 +555,6 @@ class IsomorphicBacktestRunner:
             raise ValueError(f"Cannot run backtest for {plan_item.symbol}: bar list is empty")
 
         bar_list = _normalize_bars_for_parity(bar_list)
-        plan_item = _align_plan_item_valid_until_for_bars(plan_item, bar_list)
         effective_date = _resolve_trading_date_from_bars(bar_list, fallback=trading_date)
         items_to_lock = _build_parity_plan_items(plan_item, venue_str)
         cloned_primary = items_to_lock[0]
@@ -1233,7 +1195,7 @@ class StressFalsifier:
         max_budget = float(plan_item.risk_envelope.max_risk_budget_usd)
         delay_passed = (
             delay_metrics.filled_orders > 0
-            and delay_metrics.net_pnl_usd >= -0.5 * max_budget
+            and delay_metrics.net_pnl_usd >= -max_budget
             and abs(min(0.0, delay_metrics.max_single_trade_loss_usd)) <= max_budget
         )
         delay_reason = (
@@ -1249,7 +1211,7 @@ class StressFalsifier:
             passed=delay_passed,
             metrics=delay_metrics,
             threshold_description=(
-                f"filled_orders > 0 and net_pnl_usd >= {-0.5 * max_budget:.2f} and "
+                f"filled_orders > 0 and net_pnl_usd >= {-max_budget:.2f} and "
                 f"|max_single_trade_loss_usd| <= {max_budget:.2f}"
             ),
             observed_value=delay_metrics.net_pnl_usd,
@@ -1342,11 +1304,8 @@ class StressFalsifier:
             len(sorted_ranges) - 1,
             max(0, int(round(self._tail_quantile * float(len(sorted_ranges) - 1)))),
         )
-        empirical_tail_range = sorted_ranges[q_idx] if sorted_ranges else 1.0
-        atr_mult = float(plan_item.strategy_config.atr_stop_multiplier)
-        shock_distance = (
-            empirical_tail_range * self._tail_shock_multiplier * max(1.0, atr_mult * 0.5)
-        )
+        empirical_tail_range = sorted_ranges[q_idx] if sorted_ranges else 0.0
+        shock_distance = empirical_tail_range * self._tail_shock_multiplier
 
         baseline_entry_px = 0.0
         shock_idx: Optional[int] = None

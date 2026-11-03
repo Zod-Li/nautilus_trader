@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import gc
 import json
 import logging
 import math
@@ -55,7 +56,6 @@ from nautilus_trader.quant.governance.telemetry_actor import (
 )
 from nautilus_trader.quant.nodes.backtest_runner import (
     IsomorphicBacktestRunner,
-    _align_plan_item_valid_until_for_bars,
     _build_parity_plan_items,
     _create_default_equity,
     _normalize_bars_for_parity,
@@ -1000,30 +1000,12 @@ class DailyPlanReconciler:
         strategy: Optional[BaseArchetypeStrategy],
         pos_qty: Decimal,
     ) -> PlanItemContract:
-        abs_qty = max(Decimal("1"), abs(pos_qty))
         if strategy is not None:
             cfg = strategy.archetype_config
             env = strategy.risk_envelope
             if env is None:
-                stop_px = (
-                    Decimal(f"{strategy.trailing_stop_price:.2f}")
-                    if strategy.trailing_stop_price is not None
-                    and strategy.trailing_stop_price > 0.0
-                    else Decimal("1.00")
-                )
-                env = PlanRiskEnvelope(
-                    side=cfg.plan_side,
-                    target_qty=abs_qty,
-                    approved_qty_cap=abs_qty,
-                    target_notional_usd=abs_qty * Decimal("100.00"),
-                    max_risk_budget_usd=abs_qty * Decimal("10.00"),
-                    initial_stop_price=stop_px,
-                    take_profit_price=None,
-                    collar=MarketableLimitCollar(
-                        limit_collar_pct=Decimal("0.50"),
-                        limit_collar_atr=Decimal("0.50"),
-                    ),
-                    valid_until=datetime.now(timezone.utc),
+                raise ValueError(
+                    f"Cannot build carry-over contract for {symbol}: mounted Strategy has no PlanRiskEnvelope"
                 )
             venue = (
                 str(cfg.instrument_id).split(".", 1)[1].strip().upper()
@@ -1869,16 +1851,15 @@ def _capture_pipeline_order_intents(
     in `BacktestEngine` and extracts the chronological sequence of `ParityOrderIntent`s.
     """
     normalized_bars = _normalize_bars_for_parity(bars)
-    effective_plan_item = _align_plan_item_valid_until_for_bars(plan_item, normalized_bars)
-    venue_str = effective_plan_item.strategy_config.instrument_id.split(".", 1)[1].strip().upper()
-    symbols = [effective_plan_item.symbol]
-    if effective_plan_item.strategy_config.secondary_instrument_id:
-        sec_sym = effective_plan_item.strategy_config.secondary_instrument_id.split(".", 1)[0].strip().upper()
+    venue_str = plan_item.strategy_config.instrument_id.split(".", 1)[1].strip().upper()
+    symbols = [plan_item.symbol]
+    if plan_item.strategy_config.secondary_instrument_id:
+        sec_sym = plan_item.strategy_config.secondary_instrument_id.split(".", 1)[0].strip().upper()
         if sec_sym and sec_sym not in symbols:
             symbols.append(sec_sym)
 
     equities: List[Equity] = [_create_default_equity(sym, venue_str) for sym in symbols]
-    items_to_lock = _build_parity_plan_items(effective_plan_item, venue_str)
+    items_to_lock = _build_parity_plan_items(plan_item, venue_str)
     can_persist = bool(
         include_telemetry_actor
         and str(environment_label).upper() != "BACKTEST"
@@ -1993,7 +1974,6 @@ def _capture_live_node_order_intents(
     and extracts the chronological sequence of `ParityOrderIntent`s.
     """
     normalized_bars = _normalize_bars_for_parity(bars)
-    effective_plan_item = _align_plan_item_valid_until_for_bars(plan_item, normalized_bars)
     owns_bundle = bundle is None
     if bundle is None:
         resolved_date = trading_date or (
@@ -2004,8 +1984,8 @@ def _capture_live_node_order_intents(
             if normalized_bars
             else datetime.now(tz=timezone.utc).date()
         )
-        venue_str = effective_plan_item.strategy_config.instrument_id.split(".", 1)[1].strip().upper()
-        items_to_lock = _build_parity_plan_items(effective_plan_item, venue_str)
+        venue_str = plan_item.strategy_config.instrument_id.split(".", 1)[1].strip().upper()
+        items_to_lock = _build_parity_plan_items(plan_item, venue_str)
         can_persist_live = _has_existing_locked_plan_for_parity(
             dsn, resolved_date, items_to_lock
         )
@@ -2034,11 +2014,11 @@ def _capture_live_node_order_intents(
     try:
         return _drive_live_node_bundle_order_intents(
             bundle=bundle,
-            plan_item=effective_plan_item,
+            plan_item=plan_item,
             bars=normalized_bars,
         )
     finally:
-        if owns_bundle:
+        if owns_bundle and bundle is not None:
             try:
                 if bundle.plan_gate.is_running():
                     bundle.plan_gate.stop()
@@ -2052,6 +2032,41 @@ def _capture_live_node_order_intents(
             bundle.plan_gate.close()
             bundle.telemetry_actor.close()
             bundle.node.dispose()
+            bundle = None  # type: ignore[assignment]
+
+
+def _match_next_bar_best_price_fill(
+    ord_obj: Any,
+    bar: Bar,
+) -> Tuple[Optional[float], Any]:
+    """Evaluates `BestPriceFillModel` bar-OHLC execution for an admitted `LiveNode` order
+    during offline parity replay (`LiveNode` binds `AlpacaExecutionClient` in `Environment.LIVE`
+    and its `PyDataActor` instances are permanently bound to `TRADER-LIVE-001` in Rust).
+    """
+    from nautilus_trader.model import LiquiditySide
+
+    open_px = float(bar.open)
+    high_px = float(bar.high)
+    low_px = float(bar.low)
+    otype = str(getattr(ord_obj, "order_type", "")).upper().split(".")[-1]
+    oside_raw = str(getattr(ord_obj, "side", "")).upper()
+    oside = "BUY" if "BUY" in oside_raw else ("SELL" if "SELL" in oside_raw else oside_raw)
+
+    if otype == "MARKET":
+        return open_px, LiquiditySide.TAKER
+    if otype == "LIMIT":
+        lim_px = float(ord_obj.price)
+        if oside == "BUY" and low_px <= lim_px + 1e-9:
+            return min(open_px, lim_px), LiquiditySide.MAKER
+        if oside == "SELL" and high_px >= lim_px - 1e-9:
+            return max(open_px, lim_px), LiquiditySide.MAKER
+    elif otype == "STOP_MARKET":
+        trig_px = float(ord_obj.trigger_price)
+        if oside == "SELL" and low_px <= trig_px + 1e-9:
+            return min(open_px, trig_px), LiquiditySide.TAKER
+        if oside == "BUY" and high_px >= trig_px - 1e-9:
+            return max(open_px, trig_px), LiquiditySide.TAKER
+    return None, LiquiditySide.TAKER
 
 
 def _drive_live_node_bundle_order_intents(
@@ -2060,6 +2075,24 @@ def _drive_live_node_bundle_order_intents(
     plan_item: PlanItemContract,
     bars: Sequence[Bar],
 ) -> Tuple[ParityOrderIntent, ...]:
+    from nautilus_trader.common import Clock, OrderFactory
+    from nautilus_trader.core import UUID4
+    from nautilus_trader.model import (
+        AccountId,
+        ClientOrderId,
+        OrderAccepted,
+        OrderCanceled,
+        OrderFilled,
+        OrderSubmitted,
+        PositionId,
+        Price,
+        Quantity,
+        StrategyId,
+        TradeId,
+        TraderId,
+        VenueOrderId,
+    )
+
     matching_strategies = [
         s
         for s in bundle.strategies
@@ -2076,103 +2109,220 @@ def _drive_live_node_bundle_order_intents(
         )
 
     live_strat = matching_strategies[0]
-    live_cfg = live_strat.archetype_config
     venue_str = plan_item.strategy_config.instrument_id.split(".", 1)[1].strip().upper()
-    symbols = [plan_item.symbol]
-    if plan_item.strategy_config.secondary_instrument_id:
-        sec_sym = (
-            plan_item.strategy_config.secondary_instrument_id.split(".", 1)[0]
-            .strip()
-            .upper()
-        )
-        if sec_sym and sec_sym not in symbols:
-            symbols.append(sec_sym)
-
-    equities: List[Equity] = [_create_default_equity(sym, venue_str) for sym in symbols]
     sorted_bars = _normalize_bars_for_parity(bars)
-    effective_item = _align_plan_item_valid_until_for_bars(plan_item, sorted_bars)
-    items_to_lock = _build_parity_plan_items(effective_item, venue_str)
+    items_to_lock = _build_parity_plan_items(plan_item, venue_str)
+    if hasattr(bundle.plan_gate.backend, "upsert_plan_item"):
+        for item in items_to_lock:
+            bundle.plan_gate.backend.upsert_plan_item(item)
+    elif hasattr(bundle.plan_gate.backend, "lock_plan"):
+        bundle.plan_gate.backend.lock_plan(plan_item.trading_date, items_to_lock)
+    if hasattr(bundle.plan_gate, "sync_from_db"):
+        bundle.plan_gate.sync_from_db()
 
-    engine = BacktestEngine(
-        BacktestEngineConfig(bypass_logging=True, run_analysis=False)
+    bar_clock = Clock.new_test()
+    prev_cached_of = live_strat._cached_order_factory
+    live_strat._cached_order_factory = OrderFactory(
+        TraderId(str(bundle.node.trader_id)),
+        StrategyId(live_strat._resolve_strategy_id_str()),
+        bar_clock,
     )
-    driver_plan_gate: Optional[PlanGateExecAlgorithm] = None
-    driver_telemetry: Optional[PostgresTelemetryActor] = None
-    try:
-        engine.add_venue(
-            venue=Venue(venue_str),
-            oms_type=OmsType.NETTING,
-            account_type=AccountType.MARGIN,
-            starting_balances=[Money.from_str("100000.00 USD")],
-            base_currency=Currency.from_str("USD"),
-            fill_model=BestPriceFillModel(prob_fill_on_limit=1.0, prob_slippage=0.0),
-            fee_model=MakerTakerFeeModel(
-                maker_rate=Decimal("0.0002"),
-                taker_rate=Decimal("0.0005"),
-            ),
-            latency_model=StaticLatencyModel(
-                base_latency_nanos=0,
-                insert_latency_nanos=1,
-                update_latency_nanos=0,
-                cancel_latency_nanos=0,
-            ),
-        )
-        for eq in equities:
-            engine.add_instrument(eq)
 
-        driver_telemetry = PostgresTelemetryActor(
-            bundle.telemetry_actor._telemetry_config,
-            oco_monitor=bundle.telemetry_actor.oco_monitor,
-        )
-        driver_plan_gate = PlanGateExecAlgorithm(
-            backend=bundle.plan_gate.backend,
-            telemetry_actor=driver_telemetry,
-            oco_monitor=(
-                getattr(bundle.plan_gate, "_oco_monitor", None)
-                or bundle.telemetry_actor.oco_monitor
-            ),
-            config=PlanGateExecAlgorithmConfig(
-                exec_algorithm_id=PLAN_GATE_EXEC_ALGORITHM_ID,
-                collar_market_orders=bool(getattr(live_cfg, "use_limit_orders", True)),
-            ),
-        )
-        engine.add_actor(driver_telemetry)
-        engine.add_exec_algorithm(driver_plan_gate)
+    bundle.telemetry_actor.start()
+    bundle.plan_gate.start()
 
-        driver_strategy = instantiate_strategy_from_contract(
-            items_to_lock[0],
-            use_limit_orders=bool(getattr(live_cfg, "use_limit_orders", True)),
-            submit_protective_stop=bool(getattr(live_cfg, "submit_protective_stop", True)),
-        )
-        driver_strategy.bind_telemetry_actor(driver_telemetry)
-        if hasattr(driver_strategy, "bind_plan_gate"):
-            driver_strategy.bind_plan_gate(driver_plan_gate)
-        engine.add_strategy(driver_strategy)
+    accepted_cids: set[str] = set()
+    filled_cids: set[str] = set()
+    canceled_cids: set[str] = set()
+    venue_id_by_cid: Dict[str, VenueOrderId] = {}
+    net_pos_by_inst: Dict[str, float] = {}
+    trade_seq = 0
+    venue_seq = 0
 
-        engine.add_data(sorted_bars)
-        engine.run()
+    for b in sorted_bars:
+        bar_ts = int(b.ts_init)
+        bar_clock.set_time(bar_ts)
+        inst_obj = b.bar_type.instrument_id
+        inst_str = str(inst_obj)
 
-        driver_telemetry.sync_from_cache()
-        driver_telemetry.flush()
-        bundle.plan_gate._decisions.update(driver_plan_gate._decisions)
-        bundle.plan_gate._spawn_to_primary_cid.update(
-            driver_plan_gate._spawn_to_primary_cid
-        )
-        bundle.telemetry_actor._processed_event_ids.update(
-            driver_telemetry._processed_event_ids
-        )
-        bundle.telemetry_actor._order_meta.update(
-            driver_telemetry._order_meta
-        )
+        for ord_obj in list(live_strat.submitted_orders):
+            cid = str(ord_obj.client_order_id)
+            if (
+                cid in filled_cids
+                or cid in canceled_cids
+                or cid in live_strat._canceled_order_ids_audit
+                or str(ord_obj.instrument_id) != inst_str
+                or int(getattr(ord_obj, "ts_init", bar_ts)) >= bar_ts
+            ):
+                continue
+            decision = bundle.plan_gate.decisions.get(cid)
+            if decision is not None and not decision.allowed:
+                canceled_cids.add(cid)
+                continue
+            cached_ord = bundle.node.cache.order(ClientOrderId(cid))
+            status_str = live_strat._normalized_order_status(cached_ord or ord_obj)
+            if status_str in ("CANCELED", "DENIED", "REJECTED", "EXPIRED", "FILLED"):
+                canceled_cids.add(cid)
+                continue
 
-        return _extract_parity_order_intents(
-            orders=list(engine.cache.orders() or []),
-            decisions=bundle.plan_gate.decisions,
-        )
-    finally:
-        if driver_telemetry is not None:
-            driver_telemetry.flush()
-        engine.dispose()
+            if cid not in accepted_cids:
+                accepted_cids.add(cid)
+                venue_seq += 1
+                v_oid = VenueOrderId(f"{venue_str}-1-{venue_seq}")
+                venue_id_by_cid[cid] = v_oid
+                sub_ev = OrderSubmitted(
+                    TraderId(str(bundle.node.trader_id)),
+                    StrategyId(str(ord_obj.strategy_id)),
+                    inst_obj,
+                    ord_obj.client_order_id,
+                    AccountId(f"{venue_str}-001"),
+                    UUID4(),
+                    bar_ts,
+                    bar_ts,
+                )
+                acc_ev = OrderAccepted(
+                    TraderId(str(bundle.node.trader_id)),
+                    StrategyId(str(ord_obj.strategy_id)),
+                    inst_obj,
+                    ord_obj.client_order_id,
+                    v_oid,
+                    AccountId(f"{venue_str}-001"),
+                    UUID4(),
+                    bar_ts,
+                    bar_ts,
+                    False,
+                )
+                for target_ord in (cached_ord, ord_obj):
+                    if target_ord is None:
+                        continue
+                    t_status = live_strat._normalized_order_status(target_ord)
+                    try:
+                        if t_status == "INITIALIZED":
+                            target_ord.apply(sub_ev)
+                            target_ord.apply(acc_ev)
+                        elif t_status == "SUBMITTED":
+                            target_ord.apply(acc_ev)
+                    except Exception:
+                        pass
+                bundle.telemetry_actor.on_order_submitted(sub_ev)
+                if cached_ord is not None:
+                    try:
+                        bundle.node.cache.update_order(cached_ord)
+                    except Exception:
+                        pass
+
+            fill_px, liq_side = _match_next_bar_best_price_fill(ord_obj, b)
+            if fill_px is None:
+                continue
+
+            filled_cids.add(cid)
+            trade_seq += 1
+            qty_f = float(ord_obj.quantity)
+            v_oid = venue_id_by_cid.get(cid, VenueOrderId(f"V-{trade_seq}"))
+            fill_ev = OrderFilled(
+                TraderId(str(bundle.node.trader_id)),
+                StrategyId(str(ord_obj.strategy_id)),
+                inst_obj,
+                ord_obj.client_order_id,
+                v_oid,
+                AccountId(f"{venue_str}-001"),
+                TradeId(f"T-{trade_seq}"),
+                ord_obj.side,
+                ord_obj.order_type,
+                Quantity.from_str(str(ord_obj.quantity)),
+                Price.from_str(f"{fill_px:.2f}"),
+                Currency.from_str("USD"),
+                liq_side,
+                UUID4(),
+                bar_ts,
+                bar_ts,
+                False,
+                PositionId(f"P-{inst_str}"),
+                Money.from_str("0.00 USD"),
+            )
+            for target_ord in (cached_ord, ord_obj):
+                if target_ord is None:
+                    continue
+                try:
+                    target_ord.apply(fill_ev)
+                except Exception:
+                    pass
+            if cached_ord is not None:
+                try:
+                    bundle.node.cache.update_order(cached_ord)
+                except Exception:
+                    pass
+            bundle.plan_gate.on_order_filled(fill_ev)
+            bundle.telemetry_actor.on_order_filled(fill_ev)
+            live_strat.on_order_filled(fill_ev)
+
+            oside_raw = str(getattr(ord_obj, "side", "")).upper()
+            prev_pos = net_pos_by_inst.get(inst_str, 0.0)
+            new_pos = prev_pos + (qty_f if "BUY" in oside_raw else -qty_f)
+            net_pos_by_inst[inst_str] = new_pos
+            if abs(prev_pos) > 1e-9 and abs(new_pos) <= 1e-9:
+                pos_closed = type(" _LivePosClosed", (), {"instrument_id": inst_obj})()
+                bundle.telemetry_actor.on_position_closed(pos_closed)
+                live_strat.on_position_closed(pos_closed)
+
+        live_strat.on_bar(b)
+
+        for cid in list(live_strat._canceled_order_ids_audit):
+            if cid in canceled_cids or cid in filled_cids or cid not in accepted_cids:
+                continue
+            canceled_cids.add(cid)
+            ord_obj = live_strat._submitted_orders_by_cid.get(cid)
+            cached_ord = bundle.node.cache.order(ClientOrderId(cid))
+            target_ref = cached_ord or ord_obj
+            if target_ref is None:
+                continue
+            if (
+                cached_ord is not None
+                and live_strat._normalized_order_status(cached_ord) != "CANCELED"
+            ):
+                try:
+                    live_strat.cancel_order(cached_ord)
+                except Exception:
+                    pass
+                cached_ord = bundle.node.cache.order(ClientOrderId(cid))
+            v_oid = venue_id_by_cid.get(cid, VenueOrderId(f"{venue_str}-1-0"))
+            can_ev = OrderCanceled(
+                TraderId(str(bundle.node.trader_id)),
+                StrategyId(str(target_ref.strategy_id)),
+                target_ref.instrument_id,
+                target_ref.client_order_id,
+                UUID4(),
+                bar_ts,
+                bar_ts,
+                False,
+                v_oid,
+                AccountId(f"{venue_str}-001"),
+            )
+            for target_ord in (cached_ord, ord_obj):
+                if target_ord is None:
+                    continue
+                if live_strat._normalized_order_status(target_ord) != "CANCELED":
+                    try:
+                        target_ord.apply(can_ev)
+                    except Exception:
+                        pass
+            if cached_ord is not None:
+                try:
+                    bundle.node.cache.update_order(cached_ord)
+                except Exception:
+                    pass
+            bundle.plan_gate.on_order_canceled(can_ev)
+            bundle.telemetry_actor.on_order_canceled(can_ev)
+            live_strat.on_order_canceled(can_ev)
+
+    bundle.telemetry_actor.sync_from_cache()
+    bundle.telemetry_actor.flush()
+    live_strat._cached_order_factory = prev_cached_of
+
+    return _extract_parity_order_intents(
+        orders=list(bundle.node.cache.orders() or []),
+        decisions=bundle.plan_gate.decisions,
+    )
 
 
 def verify_backtest_to_live_parity(
@@ -2186,13 +2336,12 @@ def verify_backtest_to_live_parity(
 ) -> IsomorphicParityReport:
     """Executes the Backtest-to-Live 100% Parity Gate for `plan_item` over `bars`."""
     normalized_bars = _normalize_bars_for_parity(bars)
-    effective_plan_item = _align_plan_item_valid_until_for_bars(plan_item, normalized_bars)
-    venue_str = effective_plan_item.strategy_config.instrument_id.split(".", 1)[1].strip().upper()
-    items_to_lock = _build_parity_plan_items(effective_plan_item, venue_str)
+    venue_str = plan_item.strategy_config.instrument_id.split(".", 1)[1].strip().upper()
+    items_to_lock = _build_parity_plan_items(plan_item, venue_str)
 
     # 1. Capture BacktestEngine order intents with SnapshotPlanGateBackend + ProtectiveOcoMonitor
     bt_intents = _capture_pipeline_order_intents(
-        plan_item=effective_plan_item,
+        plan_item=plan_item,
         bars=normalized_bars,
         dsn=None,
         trading_date=trading_date,
@@ -2231,25 +2380,27 @@ def verify_backtest_to_live_parity(
     try:
         live_intents = _capture_live_node_order_intents(
             bundle=bundle,
-            plan_item=effective_plan_item,
+            plan_item=plan_item,
             bars=normalized_bars,
             use_limit_orders=use_limit_orders,
             submit_protective_stop=submit_protective_stop,
         )
     finally:
-        try:
-            if bundle.plan_gate.is_running():
-                bundle.plan_gate.stop()
-        except Exception:
-            pass
-        try:
-            if bundle.telemetry_actor.is_running():
-                bundle.telemetry_actor.stop()
-        except Exception:
-            pass
-        bundle.plan_gate.close()
-        bundle.telemetry_actor.close()
-        bundle.node.dispose()
+        if bundle is not None:
+            try:
+                if bundle.plan_gate.is_running():
+                    bundle.plan_gate.stop()
+            except Exception:
+                pass
+            try:
+                if bundle.telemetry_actor.is_running():
+                    bundle.telemetry_actor.stop()
+            except Exception:
+                pass
+            bundle.plan_gate.close()
+            bundle.telemetry_actor.close()
+            bundle.node.dispose()
+            bundle = None  # type: ignore[assignment]
 
     mismatches: List[str] = []
     if len(bt_intents) == 0:

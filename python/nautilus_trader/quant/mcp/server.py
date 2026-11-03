@@ -395,6 +395,8 @@ class NautilusMcpServer:
                 "bar_count": len(sorted_bars),
                 "status": "OK",
                 "last_close": round(last_close, 4),
+                "window_min_low": round(min(lows), 4) if lows else round(last_close, 4),
+                "window_max_high": round(max(highs), 4) if highs else round(last_close, 4),
                 "return_volatility": round(ret_vol, 6),
                 "current_atr": round(current_atr, 4),
                 "atr_quantiles": {
@@ -459,11 +461,10 @@ class NautilusMcpServer:
             bars=bars,
             bar_timeframe=strat_cfg.bar_timeframe,
         )
-        bt_env = self._align_backtest_envelope_horizon(env, bars)
         plan_item = self._make_plan_item_contract(
             symbol=sym,
             strategy_config=strat_cfg,
-            risk_envelope=bt_env,
+            risk_envelope=env,
         )
         eff_trials = self._resolve_effective_trials(
             increment=(2 if walk_forward else 1),
@@ -523,11 +524,10 @@ class NautilusMcpServer:
             bars=bars,
             bar_timeframe=strat_cfg.bar_timeframe,
         )
-        bt_env = self._align_backtest_envelope_horizon(env, bars)
         plan_item = self._make_plan_item_contract(
             symbol=sym,
             strategy_config=strat_cfg,
-            risk_envelope=bt_env,
+            risk_envelope=env,
         )
         eff_trials = self._resolve_effective_trials(
             increment=1,
@@ -620,7 +620,6 @@ class NautilusMcpServer:
             arch_id = str(raw_item["archetype_id"]).strip()
             params = dict(raw_item["params"])
             raw_env = dict(raw_item["risk_envelope"])
-            conviction = float(raw_item.get("conviction", 0.85))
             raw_sector = str(raw_item.get("sector") or "").strip().upper()
             if not raw_sector:
                 raw_sector = get_gics_sector_map([sym], dsn=self._dsn).get(sym, "UNCLASSIFIED")
@@ -631,6 +630,12 @@ class NautilusMcpServer:
             sector = raw_sector
 
             strat_cfg = self._build_strategy_config(sym, arch_id, params)
+            raw_conviction = raw_item.get("conviction")
+            conviction = float(
+                raw_conviction
+                if raw_conviction is not None
+                else strat_cfg.entry_quantile_threshold
+            )
             req_env = self._build_risk_envelope(
                 sym,
                 raw_env,
@@ -1065,49 +1070,6 @@ class NautilusMcpServer:
             secondary_instrument_id=(str(sec_id).strip() if sec_id is not None else None),
         )
 
-    @staticmethod
-    def _align_backtest_envelope_horizon(
-        envelope: PlanRiskEnvelope,
-        bars: Optional[Sequence[Bar]],
-        *,
-        primary_symbol: Optional[str] = None,
-        atr_stop_multiplier: float = 2.0,
-    ) -> PlanRiskEnvelope:
-        """Aligns `valid_until` and historical stop floor across calibration/falsification bar windows
-        when a candidate's intraday entry window (`entry_ttl_bars * bar_timeframe`) or end-of-window
-        stop floor differs from the historical bar series used by `IsomorphicBacktestRunner`.
-        """
-        if not bars:
-            return envelope
-        max_ts_ns = max(int(b.ts_init) for b in bars)
-        last_bar_dt = datetime.fromtimestamp(max_ts_ns / 1_000_000_000.0, tz=timezone.utc)
-        new_valid_until = (
-            last_bar_dt + timedelta(minutes=1)
-            if last_bar_dt > envelope.valid_until
-            else envelope.valid_until
-        )
-        sym_bars = [
-            b
-            for b in bars
-            if primary_symbol is None
-            or str(b.bar_type.instrument_id).upper().startswith(primary_symbol.upper())
-        ] or list(bars)
-        lows = [float(b.low) for b in sym_bars]
-        highs = [float(b.high) for b in sym_bars]
-        ranges = [max(0.01, h - lo) for h, lo in zip(highs, lows)]
-        max_range = max(ranges) if ranges else 1.0
-        stop_buf = max(max_range * (float(atr_stop_multiplier) + 1.5), min(lows) * 0.05)
-        new_stop = envelope.initial_stop_price
-        if envelope.side == PlanSide.LONG:
-            hist_floor = Decimal(f"{max(0.01, min(lows) - stop_buf):.2f}")
-            if hist_floor < new_stop:
-                new_stop = hist_floor
-        else:
-            hist_ceil = Decimal(f"{max(highs) + stop_buf:.2f}")
-            if hist_ceil > new_stop:
-                new_stop = hist_ceil
-        return replace(envelope, valid_until=new_valid_until, initial_stop_price=new_stop)
-
     def _build_risk_envelope(
         self,
         symbol: str,
@@ -1136,11 +1098,14 @@ class NautilusMcpServer:
             max_ts_ns = max(int(b.ts_init) for b in bars)
             last_bar_dt = datetime.fromtimestamp(max_ts_ns / 1_000_000_000.0, tz=timezone.utc)
             inferred_date = last_bar_dt.astimezone(ny_tz).date()
-            default_valid_until = compute_intraday_entry_valid_until(
-                trading_date=inferred_date,
-                bar_timeframe=bar_timeframe,
-                entry_ttl_bars=ttl_bars,
-                anchor_ts_utc=last_bar_dt,
+            default_valid_until = max(
+                last_bar_dt,
+                compute_intraday_entry_valid_until(
+                    trading_date=inferred_date,
+                    bar_timeframe=bar_timeframe,
+                    entry_ttl_bars=ttl_bars,
+                    anchor_ts_utc=last_bar_dt,
+                ),
             )
         else:
             now_utc = datetime.now(timezone.utc)
@@ -1208,8 +1173,10 @@ class NautilusMcpServer:
                     raise ValueError(
                         f"risk_envelope for {symbol} missing 'initial_stop_price' and no empirical ATR available"
                     )
+                emp_floor_px = min(bar_lows) if bar_lows else emp_last_px
+                emp_ceil_px = max(bar_highs) if bar_highs else emp_last_px
                 initial_stop = Decimal(
-                    f"{max(0.01, emp_last_px - emp_atr if side == PlanSide.LONG else emp_last_px + emp_atr):.2f}"
+                    f"{max(0.01, emp_floor_px - emp_atr if side == PlanSide.LONG else emp_ceil_px + emp_atr):.2f}"
                 )
             else:
                 initial_stop = Decimal(str(raw_stop))
@@ -1382,42 +1349,26 @@ class NautilusMcpServer:
                     mining_trials = 0
 
                     if reg_row.get("zoo_reg") is not None:
-                        cur.execute("SELECT * FROM factor_zoo_registry LIMIT 500")
-                        zoo_rows = cur.fetchall() or []
-                        for r in zoo_rows:
-                            for col in (
-                                "effective_trials",
-                                "total_trials",
-                                "trial_count",
-                                "eval_count",
-                                "total_experiments",
-                            ):
-                                if r.get(col) is not None:
-                                    zoo_trials += max(0, int(r[col]))
-                                    break
-                            else:
-                                zoo_trials += 1
+                        cur.execute("SELECT COUNT(*) AS total FROM factor_zoo_registry")
+                        zoo_trials = int((cur.fetchone() or {}).get("total") or 0)
 
                     if reg_row.get("af_reg") is not None:
-                        cur.execute("SELECT * FROM alpha_factors LIMIT 1000")
-                        af_rows = cur.fetchall() or []
-                        for r in af_rows:
-                            for col in ("eval_count", "trial_count", "effective_trials"):
-                                if r.get(col) is not None and int(r[col]) > 0:
-                                    af_trials += int(r[col])
-                                    break
-                            else:
-                                af_trials += 1
+                        cur.execute(
+                            """
+                            SELECT COALESCE(SUM(GREATEST(COALESCE(eval_count, 1), 1)), 0) AS total
+                            FROM alpha_factors
+                            """
+                        )
+                        af_trials = int((cur.fetchone() or {}).get("total") or 0)
 
                     if reg_row.get("amr_reg") is not None:
-                        cur.execute("SELECT * FROM alpha_mining_runs LIMIT 500")
-                        amr_rows = cur.fetchall() or []
-                        for r in amr_rows:
-                            cand_gen = r.get("candidates_generated") or r.get("total_trials")
-                            if cand_gen is not None and int(cand_gen) > 0:
-                                mining_trials += int(cand_gen)
-                            else:
-                                mining_trials += 1
+                        cur.execute(
+                            """
+                            SELECT COALESCE(SUM(GREATEST(COALESCE(candidates_generated, 1), 1)), 0) AS total
+                            FROM alpha_mining_runs
+                            """
+                        )
+                        mining_trials = int((cur.fetchone() or {}).get("total") or 0)
 
                     return max(zoo_trials, af_trials, mining_trials, zoo_trials + af_trials)
         except Exception as exc:
@@ -1777,6 +1728,54 @@ class NautilusMcpServer:
         side: PlanSide,
     ) -> float:
         if side == PlanSide.LONG:
-            return min(entry_price * 0.99, max(0.01, stop_loss_price))
-        dist = max(0.01 * entry_price, stop_loss_price - entry_price)
-        return max(0.01, entry_price - dist)
+            return stop_loss_price
+        if stop_loss_price <= entry_price:
+            return entry_price
+        dist = stop_loss_price - entry_price
+        return entry_price - dist
+
+
+def build_datainfra_config_from_env() -> DataInfraConfig:
+    """Constructs `DataInfraConfig` from container environment variables."""
+    from urllib.parse import quote
+
+    ch_url = os.environ.get("CLICKHOUSE_URL", "").strip()
+    if not ch_url:
+        ch_host = os.environ.get("CH_HOST", "127.0.0.1").strip()
+        ch_port = (os.environ.get("CH_HTTP_PORT") or os.environ.get("CH_PORT") or "8123").strip()
+        ch_user = os.environ.get("CH_USER", "").strip()
+        ch_pw = os.environ.get("CH_PASSWORD", "").strip()
+        if ch_user:
+            ch_url = f"http://{ch_host}:{ch_port}/?user={quote(ch_user)}&password={quote(ch_pw)}"
+        else:
+            ch_url = f"http://{ch_host}:{ch_port}"
+    ch_db = (
+        os.environ.get("CLICKHOUSE_DATABASE")
+        or os.environ.get("CH_DB")
+        or "market_data"
+    ).strip()
+    brokers_raw = os.environ.get("KAFKA_BROKERS", "127.0.0.1:9092")
+    brokers = [b.strip() for b in brokers_raw.split(",") if b.strip()]
+    cal_url = os.environ.get("CALENDAR_SERVICE_URL", "http://127.0.0.1:8012").strip()
+    venue = os.environ.get("DEFAULT_VENUE", "ALPACA").strip().upper()
+    return DataInfraConfig(
+        clickhouse_url=ch_url,
+        clickhouse_database=ch_db,
+        kafka_brokers=brokers,
+        kafka_group_id=os.environ.get("KAFKA_GROUP_ID", "nautilus-mcp-service"),
+        calendar_service_url=cal_url,
+        default_venue=venue,
+    )
+
+
+def create_production_mcp_server(dsn: Optional[str] = None) -> NautilusMcpServer:
+    """Instantiates `NautilusMcpServer` backed by PostgreSQL and `DataInfraConfig`."""
+    resolved_dsn = resolve_database_dsn(dsn)
+    datainfra_cfg = build_datainfra_config_from_env()
+    capital_basis = Decimal(os.environ.get("CAPITAL_BASIS_USD", "100000.00"))
+    return NautilusMcpServer(
+        dsn=resolved_dsn,
+        datainfra_config=datainfra_cfg,
+        capital_basis_usd=capital_basis,
+        venue_name=os.environ.get("DEFAULT_VENUE", "ALPACA"),
+    )

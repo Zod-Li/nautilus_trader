@@ -22,7 +22,7 @@ from zoneinfo import ZoneInfo
 
 from evolution_engine.db.dsn import resolve_database_dsn
 from evolution_engine.db_migrate import apply_migrations
-from nautilus_trader.quant.mcp.run_mcp_service import (
+from nautilus_trader.quant.mcp.server import (
     build_datainfra_config_from_env,
     create_production_mcp_server,
 )

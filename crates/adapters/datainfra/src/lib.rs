@@ -50,8 +50,8 @@ pub use arrow_decoder::{
     decode_quotes_batches, decode_statuses_arrow_stream, decode_statuses_batches,
 };
 pub use calendar::{
-    CALENDAR_SESSION_STATUS_PATH, CALENDAR_SESSION_STATUS_V1_PATH, CalendarSessionGate,
-    CalendarSessionStatus, CalendarTransport, DEFAULT_CALENDAR_MARKET, HttpCalendarTransport,
+    CALENDAR_SESSION_STATUS_PATH, CalendarSessionGate, CalendarSessionStatus, CalendarTransport,
+    DEFAULT_CALENDAR_MARKET, HttpCalendarTransport,
 };
 pub use catalog::{DATAINFRA_CATALOG_FACTORY_NAME, DataInfraCatalog};
 pub use clickhouse::{

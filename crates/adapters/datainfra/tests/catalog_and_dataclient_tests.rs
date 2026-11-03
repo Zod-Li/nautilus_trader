@@ -58,15 +58,17 @@ use nautilus_common::{
         switchboard::{get_bars_topic, get_instrument_status_topic, get_quotes_topic},
     },
 };
+use async_trait::async_trait;
 use nautilus_core::{Params, UUID4, UnixNanos};
 use nautilus_data::engine::{DataEngine, config::DataEngineConfig};
 use nautilus_datainfra::{
-    CALENDAR_SESSION_STATUS_PATH, CALENDAR_SESSION_STATUS_V1_PATH, CalendarSessionGate,
-    CalendarSessionStatus, CalendarTransport, DATAINFRA, DATAINFRA_CATALOG_FACTORY_NAME,
-    DEFAULT_CALENDAR_MARKET, DataInfraCatalog, DataInfraConfig, DataInfraDataClient,
-    DataInfraDataClientFactory, DataInfraEquityMetadata, DataInfraError, HttpCalendarTransport,
-    HttpClickHouseArrowTransport, StreamDecodeOutcome, StreamLifecycleListener, TOPIC_SIP_BARS_1M,
-    TOPIC_SIP_QUOTES, TOPIC_SIP_STATUSES, parse_datainfra_bar_type, to_instrument_id,
+    CALENDAR_SESSION_STATUS_PATH, CalendarSessionGate, CalendarSessionStatus, CalendarTransport,
+    DATAINFRA, DATAINFRA_CATALOG_FACTORY_NAME, DEFAULT_CALENDAR_MARKET, DataInfraCatalog,
+    DataInfraConfig, DataInfraDataClient, DataInfraDataClientFactory, DataInfraEquityMetadata,
+    DataInfraError, DataInfraResult, HttpCalendarTransport, HttpClickHouseArrowTransport,
+    KafkaPayloadFrame, KafkaPayloadSource, StreamDecodeOutcome, StreamLifecycleListener,
+    TOPIC_SIP_BARS_1M, TOPIC_SIP_QUOTES, TOPIC_SIP_STATUSES, parse_broker_wire_frame,
+    parse_datainfra_bar_type, to_instrument_id,
 };
 use nautilus_model::{
     data::{
@@ -731,7 +733,7 @@ async fn test_calendar_session_gate_rth_open_early_close_holiday_and_fail_closed
         // Request 1: Normal RTH open day
         let (mut s1, _) = listener.accept().await.unwrap();
         let req1 = read_http_request(&mut s1).await;
-        assert!(req1.contains("/api/v1/calendar/session-status"));
+        assert!(req1.contains("/v1/calendar/session-status"));
         assert!(req1.contains("market=US_EQUITY"));
         write_http_response(
             &mut s1,
@@ -1125,7 +1127,8 @@ async fn test_datainfra_data_client_connect_fail_closed_subscriptions_requests_a
         Some(sender),
         observer.clone(),
     )
-    .expect("create DataInfraDataClient");
+    .expect("create DataInfraDataClient")
+    .with_payload_source(Arc::new(IdleKafkaPayloadSource));
 
     // A. First `connect()` must fail closed because calendar-service returned HTTP 500
     let err_connect = client
@@ -1444,15 +1447,74 @@ async fn test_datainfra_data_client_connect_fail_closed_subscriptions_requests_a
     ch_server.abort();
 }
 
+#[derive(Debug, Default)]
+struct IdleKafkaPayloadSource;
+
+#[async_trait]
+impl KafkaPayloadSource for IdleKafkaPayloadSource {
+    async fn next_frame(&self) -> DataInfraResult<Option<KafkaPayloadFrame>> {
+        Ok(None)
+    }
+}
+
+#[derive(Debug)]
+struct EphemeralTcpWireKafkaSource {
+    endpoint: String,
+    reader: tokio::sync::Mutex<Option<tokio::io::BufReader<tokio::net::TcpStream>>>,
+}
+
+impl EphemeralTcpWireKafkaSource {
+    fn new(endpoint: impl Into<String>) -> Self {
+        Self {
+            endpoint: endpoint.into(),
+            reader: tokio::sync::Mutex::new(None),
+        }
+    }
+}
+
+#[async_trait]
+impl KafkaPayloadSource for EphemeralTcpWireKafkaSource {
+    async fn next_frame(&self) -> DataInfraResult<Option<KafkaPayloadFrame>> {
+        use tokio::io::AsyncBufReadExt;
+        let mut guard = self.reader.lock().await;
+        if guard.is_none() {
+            let stream = tokio::net::TcpStream::connect(&self.endpoint)
+                .await
+                .map_err(|e| DataInfraError::Transport(format!("tcp connect failed: {e}")))?;
+            *guard = Some(tokio::io::BufReader::new(stream));
+        }
+        let Some(ref mut reader) = *guard else {
+            return Ok(None);
+        };
+        let mut line = String::new();
+        match tokio::time::timeout(Duration::from_millis(50), reader.read_line(&mut line)).await {
+            Ok(Ok(0)) => {
+                *guard = None;
+                Ok(None)
+            }
+            Ok(Ok(_)) => {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    Ok(None)
+                } else {
+                    let frame = parse_broker_wire_frame(trimmed.as_bytes())?;
+                    Ok(Some(frame))
+                }
+            }
+            Ok(Err(e)) => {
+                *guard = None;
+                Err(DataInfraError::Transport(format!("tcp read error: {e}")))
+            }
+            Err(_) => Ok(None),
+        }
+    }
+}
+
 #[tokio::test]
 async fn test_http_calendar_transport_fetch_session_status_v1_fallback_and_sanity_invariants() {
     assert_eq!(DEFAULT_CALENDAR_MARKET, "US_EQUITY");
     assert_eq!(
         CALENDAR_SESSION_STATUS_PATH,
-        "/api/v1/calendar/session-status"
-    );
-    assert_eq!(
-        CALENDAR_SESSION_STATUS_V1_PATH,
         "/v1/calendar/session-status"
     );
 
@@ -1502,19 +1564,20 @@ async fn test_http_calendar_transport_fetch_session_status_v1_fallback_and_sanit
     assert!(closed_but_rth_open.validate_sanity().is_err());
 
     // 2. Test `HttpCalendarTransport::fetch_session_status` directly against an ephemeral HTTP server:
-    //    - Call 1: `/api/v1/calendar/session-status` returns 404 -> falls back to `/v1/calendar/session-status` (200 OK early close)
-    //    - Call 2: `/api/v1/calendar/session-status` returns 200 OK with `source: "UNSYNCED"` -> fails closed
+    //    - Call 1: `/v1/calendar/session-status` returns 404 -> fails closed (no fallback)
+    //    - Call 2: `/v1/calendar/session-status` returns 200 OK early close (`13:00 ET`)
+    //    - Call 3: `/v1/calendar/session-status` returns 200 OK with `source: "UNSYNCED"` -> fails closed
     let cal_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let cal_addr = cal_listener.local_addr().unwrap();
 
     let server_task = tokio::spawn(async move {
-        // Call 1a: `/api/v1/calendar/session-status` -> 404 Not Found
+        // Call 1: `/v1/calendar/session-status` -> 404 Not Found (must fail closed)
         let (mut s1, _) = cal_listener.accept().await.unwrap();
         let req1 = read_http_request(&mut s1).await;
-        assert!(req1.contains("GET /api/v1/calendar/session-status?market=US_EQUITY&at_ts=1783085000"));
-        write_http_response(&mut s1, "404 Not Found", "text/plain", b"not mounted at /api").await;
+        assert!(req1.contains("GET /v1/calendar/session-status?market=US_EQUITY&at_ts=1783085000"));
+        write_http_response(&mut s1, "404 Not Found", "text/plain", b"not found").await;
 
-        // Call 1b: fallback `/v1/calendar/session-status` -> 200 OK early-close (`13:00 ET`)
+        // Call 2: `/v1/calendar/session-status` -> 200 OK early-close (`13:00 ET`)
         let (mut s2, _) = cal_listener.accept().await.unwrap();
         let req2 = read_http_request(&mut s2).await;
         assert!(req2.contains("GET /v1/calendar/session-status?market=US_EQUITY&at_ts=1783085000"));
@@ -1537,10 +1600,10 @@ async fn test_http_calendar_transport_fetch_session_status_v1_fallback_and_sanit
         )
         .await;
 
-        // Call 2: `/api/v1/calendar/session-status` -> 200 OK with UNSYNCED source
+        // Call 3: `/v1/calendar/session-status` -> 200 OK with UNSYNCED source
         let (mut s3, _) = cal_listener.accept().await.unwrap();
         let req3 = read_http_request(&mut s3).await;
-        assert!(req3.contains("GET /api/v1/calendar/session-status?market=US_EQUITY"));
+        assert!(req3.contains("GET /v1/calendar/session-status?market=US_EQUITY"));
         write_http_response(
             &mut s3,
             "200 OK",
@@ -1568,11 +1631,18 @@ async fn test_http_calendar_transport_fetch_session_status_v1_fallback_and_sanit
     );
     let transport = HttpCalendarTransport::new(&cfg).expect("create HttpCalendarTransport");
 
-    // Verify 404 fallback + early close 13:00 ET validation
+    // Verify 404 fails closed without fallback
+    let err_404 = transport
+        .fetch_session_status("US_EQUITY", Some(1_783_085_000))
+        .await
+        .expect_err("HTTP 404 must fail closed");
+    assert!(matches!(err_404, DataInfraError::CalendarGate(ref m) if m.contains("404")));
+
+    // Verify 200 OK early close 13:00 ET validation
     let status = transport
         .fetch_session_status("US_EQUITY", Some(1_783_085_000))
         .await
-        .expect("fetch_session_status should succeed via /v1 fallback");
+        .expect("fetch_session_status should succeed on 200 OK /v1/calendar/session-status");
     assert_eq!(status.trading_date, "2026-07-03");
     assert!(status.is_trading_day);
     assert!(status.is_early_close);
@@ -1603,7 +1673,7 @@ async fn test_http_calendar_transport_fetch_session_status_v1_fallback_and_sanit
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_datainfra_data_client_ephemeral_tcp_kafka_broker_e2e_async_streaming_and_disconnect()
 {
-    // 1. Spin up ephemeral calendar-service HTTP listener (`/api/v1/calendar/session-status`)
+    // 1. Spin up ephemeral calendar-service HTTP listener (`/v1/calendar/session-status`)
     let cal_listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind ephemeral calendar-service listener");
@@ -1612,7 +1682,7 @@ async fn test_datainfra_data_client_ephemeral_tcp_kafka_broker_e2e_async_streami
     let cal_server = tokio::spawn(async move {
         let (mut socket, _) = cal_listener.accept().await.unwrap();
         let req = read_http_request(&mut socket).await;
-        assert!(req.contains("/api/v1/calendar/session-status"));
+        assert!(req.contains("/v1/calendar/session-status"));
         assert!(req.contains("market=US_EQUITY"));
         write_http_response(
             &mut socket,
@@ -1743,7 +1813,10 @@ async fn test_datainfra_data_client_ephemeral_tcp_kafka_broker_e2e_async_streami
         Some(sender),
         observer.clone(),
     )
-    .expect("create DataInfraDataClient");
+    .expect("create DataInfraDataClient")
+    .with_payload_source(Arc::new(EphemeralTcpWireKafkaSource::new(
+        kafka_addr.to_string(),
+    )));
 
     let venue = Venue::from("ALPACA");
     let aapl_id = to_instrument_id("AAPL", "ALPACA").unwrap();

@@ -18,17 +18,24 @@
 //! `md.sip.quotes`, `md.sip.statuses`).
 
 use std::{
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    collections::{HashMap, VecDeque},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
-use tokio::{
-    io::{AsyncBufReadExt, BufReader},
-    net::TcpStream,
-    sync::Mutex as AsyncMutex,
+use rskafka::{
+    BackoffConfig,
+    client::{
+        Client, ClientBuilder,
+        partition::{OffsetAt, PartitionClient, UnknownTopicHandling},
+    },
 };
+use serde::{Deserialize, Serialize};
+use tokio::sync::Mutex as AsyncMutex;
 
 use crate::{
     config::DataInfraConfig,
@@ -46,9 +53,6 @@ pub use crate::stream::{
 
 /// Canonical alias for the real-time Kafka market stream decoder.
 pub type KafkaMarketStreamDecoder = CanonicalStreamDecoder;
-
-/// Default initial read readiness probe window after establishing a TCP broker connection.
-const INITIAL_READ_PROBE_MS: u64 = 20;
 
 /// Canonical list of SIP real-time Kafka topics consumed by `DataInfraDataClient`.
 pub const DEFAULT_SIP_KAFKA_TOPICS: [&str; 3] =
@@ -228,20 +232,31 @@ pub trait KafkaPayloadSource: Send + Sync + std::fmt::Debug {
 }
 
 #[derive(Debug)]
-struct ActiveTcpSession {
-    broker: String,
-    reader: BufReader<TcpStream>,
+struct PartitionCursor {
+    topic: String,
+    partition: i32,
+    client: Arc<PartitionClient>,
+    next_offset: i64,
 }
 
-/// Production TCP broker stream reader connecting to `config.kafka_brokers`.
+#[derive(Debug)]
+struct ActiveKafkaSession {
+    _client: Arc<Client>,
+    cursors: Vec<PartitionCursor>,
+    buffered: VecDeque<KafkaPayloadFrame>,
+    cursor_idx: usize,
+}
+
+/// Production Kafka broker partition consumer connecting to `config.kafka_brokers` via `rskafka`.
 #[derive(Debug)]
 pub struct TcpKafkaPayloadSource {
     brokers: Vec<String>,
     group_id: String,
+    topics: Vec<String>,
     connect_timeout: Duration,
-    next_broker_idx: AtomicUsize,
     has_established_session: AtomicBool,
-    session: AsyncMutex<Option<ActiveTcpSession>>,
+    session: AsyncMutex<Option<ActiveKafkaSession>>,
+    offsets: AsyncMutex<HashMap<(String, i32), i64>>,
 }
 
 impl TcpKafkaPayloadSource {
@@ -251,15 +266,34 @@ impl TcpKafkaPayloadSource {
     ///
     /// Returns [`DataInfraError::InvalidConfig`] if `config.validate()` fails.
     pub fn from_config(config: &DataInfraConfig) -> DataInfraResult<Self> {
+        let topics = DEFAULT_SIP_KAFKA_TOPICS
+            .iter()
+            .map(|t| (*t).to_string())
+            .collect();
+        Self::with_topics(config, topics)
+    }
+
+    /// Creates a [`TcpKafkaPayloadSource`] subscribed to an explicit list of Kafka topics.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DataInfraError::InvalidConfig`] if `config.validate()` fails or `topics` is empty.
+    pub fn with_topics(config: &DataInfraConfig, topics: Vec<String>) -> DataInfraResult<Self> {
         config.validate()?;
+        if topics.is_empty() {
+            return Err(DataInfraError::InvalidConfig(
+                "Kafka topic list cannot be empty".to_string(),
+            ));
+        }
         let connect_timeout_ms = config.request_timeout_ms.clamp(100, 2_000);
         Ok(Self {
             brokers: config.kafka_brokers.clone(),
             group_id: config.kafka_group_id.clone(),
+            topics,
             connect_timeout: Duration::from_millis(connect_timeout_ms),
-            next_broker_idx: AtomicUsize::new(0),
             has_established_session: AtomicBool::new(false),
             session: AsyncMutex::new(None),
+            offsets: AsyncMutex::new(HashMap::new()),
         })
     }
 
@@ -275,35 +309,205 @@ impl TcpKafkaPayloadSource {
         &self.brokers
     }
 
-    async fn read_line_frame(
-        session: &mut ActiveTcpSession,
-    ) -> DataInfraResult<Option<KafkaPayloadFrame>> {
-        let mut line = String::new();
-        loop {
-            line.clear();
-            match session.reader.read_line(&mut line).await {
-                Ok(0) => {
-                    return Err(DataInfraError::Transport(format!(
-                        "Kafka broker {} closed TCP stream (EOF)",
-                        session.broker
-                    )));
-                }
-                Ok(_) => {
-                    let trimmed = line.trim();
-                    if trimmed.is_empty() {
-                        continue;
-                    }
-                    let frame = parse_broker_wire_frame(trimmed.as_bytes())?;
-                    return Ok(Some(frame));
-                }
-                Err(e) => {
-                    return Err(DataInfraError::Transport(format!(
-                        "Kafka broker {} stream read error: {e}",
-                        session.broker
-                    )));
-                }
+    async fn connect_kafka_session(&self) -> DataInfraResult<ActiveKafkaSession> {
+        let backoff = BackoffConfig {
+            init_backoff: Duration::from_millis(20),
+            max_backoff: Duration::from_millis(80),
+            base: 1.5,
+            deadline: Some(self.connect_timeout),
+        };
+        let client = tokio::time::timeout(
+            self.connect_timeout,
+            ClientBuilder::new(self.brokers.clone())
+                .client_id(self.group_id.clone())
+                .backoff_config(backoff)
+                .build(),
+        )
+        .await
+        .map_err(|_| {
+            DataInfraError::Transport(format!(
+                "Kafka broker connect timed out after {:?}",
+                self.connect_timeout
+            ))
+        })?
+        .map_err(|e| DataInfraError::Transport(format!("Kafka broker connect error: {e}")))?;
+
+        let client = Arc::new(client);
+        let topics_meta = tokio::time::timeout(self.connect_timeout, client.list_topics())
+            .await
+            .map_err(|_| DataInfraError::Transport("Kafka list_topics timed out".to_string()))?
+            .map_err(|e| DataInfraError::Transport(format!("Kafka list_topics error: {e}")))?;
+
+        let mut offsets_guard = self.offsets.lock().await;
+        let mut cursors = Vec::new();
+        for target_topic in &self.topics {
+            let topic_meta = topics_meta
+                .iter()
+                .find(|t| &t.name == target_topic)
+                .ok_or_else(|| {
+                    DataInfraError::Transport(format!(
+                        "Kafka required topic '{target_topic}' does not exist on broker"
+                    ))
+                })?;
+            if topic_meta.partitions.is_empty() {
+                return Err(DataInfraError::Transport(format!(
+                    "Kafka topic '{target_topic}' has 0 partitions"
+                )));
+            }
+            let partitions: Vec<i32> = topic_meta.partitions.iter().copied().collect();
+
+            for part_id in partitions {
+                let p_client = tokio::time::timeout(
+                    self.connect_timeout,
+                    client.partition_client(
+                        target_topic.clone(),
+                        part_id,
+                        UnknownTopicHandling::Retry,
+                    ),
+                )
+                .await
+                .map_err(|_| {
+                    DataInfraError::Transport(format!(
+                        "Kafka partition_client({target_topic}[{part_id}]) timed out"
+                    ))
+                })?
+                .map_err(|e| {
+                    DataInfraError::Transport(format!(
+                        "Kafka partition_client({target_topic}[{part_id}]) error: {e}"
+                    ))
+                })?;
+
+                let key = (target_topic.clone(), part_id);
+                let start_offset = if let Some(&saved_offset) = offsets_guard.get(&key) {
+                    saved_offset
+                } else {
+                    let latest = tokio::time::timeout(
+                        self.connect_timeout,
+                        p_client.get_offset(OffsetAt::Latest),
+                    )
+                    .await
+                    .map_err(|_| {
+                        DataInfraError::Transport(format!(
+                            "Kafka get_offset(Latest) timed out for {target_topic}[{part_id}]"
+                        ))
+                    })?
+                    .map_err(|e| {
+                        DataInfraError::Transport(format!(
+                            "Kafka get_offset(Latest) failed for {target_topic}[{part_id}]: {e}"
+                        ))
+                    })?;
+                    offsets_guard.insert(key, latest);
+                    latest
+                };
+
+                cursors.push(PartitionCursor {
+                    topic: target_topic.clone(),
+                    partition: part_id,
+                    client: Arc::new(p_client),
+                    next_offset: start_offset,
+                });
             }
         }
+
+        Ok(ActiveKafkaSession {
+            _client: client,
+            cursors,
+            buffered: VecDeque::new(),
+            cursor_idx: 0,
+        })
+    }
+
+    async fn poll_session_frames(
+        &self,
+        session: &mut ActiveKafkaSession,
+        fetch_timeout: Duration,
+    ) -> DataInfraResult<Option<KafkaPayloadFrame>> {
+        if let Some(frame) = session.buffered.pop_front() {
+            return Ok(Some(frame));
+        }
+        let num_cursors = session.cursors.len();
+        if num_cursors == 0 {
+            return Ok(None);
+        }
+
+        for _ in 0..num_cursors {
+            let idx = session.cursor_idx % num_cursors;
+            session.cursor_idx = session.cursor_idx.wrapping_add(1);
+            let cursor = &mut session.cursors[idx];
+
+            let fetch_res = tokio::time::timeout(
+                fetch_timeout,
+                cursor
+                    .client
+                    .fetch_records(cursor.next_offset, 1..1_048_576, 15),
+            )
+            .await
+            .map_err(|_| {
+                DataInfraError::Transport(format!(
+                    "Kafka fetch_records timed out on {}[{}] (EOF/disconnect)",
+                    cursor.topic, cursor.partition
+                ))
+            })?
+            .map_err(|e| {
+                DataInfraError::Transport(format!(
+                    "Kafka fetch_records failed on {}[{}] (EOF): {e}",
+                    cursor.topic, cursor.partition
+                ))
+            })?;
+
+            let (records, _high_watermark) = fetch_res;
+            for rec_and_off in records {
+                cursor.next_offset = rec_and_off.offset.saturating_add(1);
+                self.offsets
+                    .lock()
+                    .await
+                    .insert((cursor.topic.clone(), cursor.partition), cursor.next_offset);
+                if let Some(raw_bytes) = rec_and_off.record.value {
+                    let text = std::str::from_utf8(&raw_bytes).map_err(|e| {
+                        DataInfraError::Transport(format!(
+                            "Kafka record on {}[{}] is not valid UTF-8: {e}",
+                            cursor.topic, cursor.partition
+                        ))
+                    })?;
+                    let trimmed = text.trim();
+                    if trimmed.is_empty() {
+                        return Err(DataInfraError::Transport(format!(
+                            "Kafka record on {}[{}] is empty",
+                            cursor.topic, cursor.partition
+                        )));
+                    }
+                    let parsed: serde_json::Value = serde_json::from_str(trimmed).map_err(|e| {
+                        DataInfraError::Transport(format!(
+                            "Kafka record on {}[{}] is not valid JSON: {e}",
+                            cursor.topic, cursor.partition
+                        ))
+                    })?;
+                    let frame = if parsed
+                        .as_object()
+                        .is_some_and(|obj| obj.contains_key("topic") && obj.contains_key("payload"))
+                    {
+                        let envelope: KafkaBrokerEnvelope =
+                            serde_json::from_value(parsed).map_err(|e| {
+                                DataInfraError::Transport(format!(
+                                    "Kafka envelope on {}[{}] failed validation: {e}",
+                                    cursor.topic, cursor.partition
+                                ))
+                            })?;
+                        let payload_bytes = envelope.payload.into_payload_bytes()?;
+                        KafkaPayloadFrame::new(envelope.topic.trim().to_string(), payload_bytes)
+                    } else {
+                        KafkaPayloadFrame::new(cursor.topic.clone(), trimmed.as_bytes().to_vec())
+                    };
+                    session.buffered.push_back(frame);
+                }
+            }
+
+            if let Some(frame) = session.buffered.pop_front() {
+                return Ok(Some(frame));
+            }
+        }
+
+        Ok(None)
     }
 }
 
@@ -313,73 +517,23 @@ impl KafkaPayloadSource for TcpKafkaPayloadSource {
         let mut guard = self.session.lock().await;
 
         if guard.is_none() {
-            let mut last_connect_err: Option<String> = None;
-            let count = self.brokers.len();
-            for _ in 0..count {
-                let idx = self.next_broker_idx.fetch_add(1, Ordering::Relaxed) % count;
-                let broker = &self.brokers[idx];
-                match tokio::time::timeout(self.connect_timeout, TcpStream::connect(broker)).await {
-                    Ok(Ok(stream)) => {
-                        let _ = stream.set_nodelay(true);
-                        self.has_established_session.store(true, Ordering::Release);
-                        let mut active = ActiveTcpSession {
-                            broker: broker.clone(),
-                            reader: BufReader::new(stream),
-                        };
-                        let probe = tokio::time::timeout(
-                            Duration::from_millis(INITIAL_READ_PROBE_MS),
-                            active.reader.fill_buf(),
-                        )
-                        .await;
-                        match probe {
-                            Err(_) => {
-                                *guard = Some(active);
-                                return Ok(None);
-                            }
-                            Ok(Ok(buf)) if buf.is_empty() => {
-                                return Err(DataInfraError::Transport(format!(
-                                    "Kafka broker {broker} closed stream immediately after connect"
-                                )));
-                            }
-                            Ok(Ok(_)) => {
-                                let res = Self::read_line_frame(&mut active).await;
-                                if res.is_ok() {
-                                    *guard = Some(active);
-                                }
-                                return res;
-                            }
-                            Ok(Err(e)) => {
-                                return Err(DataInfraError::Transport(format!(
-                                    "Kafka broker {broker} read probe error: {e}"
-                                )));
-                            }
-                        }
-                    }
-                    Ok(Err(e)) => {
-                        last_connect_err =
-                            Some(format!("Kafka broker {broker} connect error: {e}"));
-                    }
-                    Err(_) => {
-                        last_connect_err = Some(format!(
-                            "Kafka broker {broker} connect timed out after {:?}",
-                            self.connect_timeout
-                        ));
-                    }
-                }
+            let mut active = self.connect_kafka_session().await?;
+            self.has_established_session.store(true, Ordering::Release);
+            let res = self
+                .poll_session_frames(&mut active, self.connect_timeout)
+                .await;
+            if res.is_ok() {
+                *guard = Some(active);
             }
-
-            if self.has_established_session.load(Ordering::Acquire) {
-                return Err(DataInfraError::Transport(last_connect_err.unwrap_or_else(
-                    || "all configured Kafka brokers unreachable".to_string(),
-                )));
-            }
-            return Ok(None);
+            return res;
         }
 
         let Some(active) = guard.as_mut() else {
             return Ok(None);
         };
-        let res = Self::read_line_frame(active).await;
+        let res = self
+            .poll_session_frames(active, self.connect_timeout)
+            .await;
         if res.is_err() {
             *guard = None;
         }

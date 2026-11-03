@@ -22,6 +22,7 @@ from nautilus_trader.quant.governance.plan_gate import PLAN_GATE_EXEC_ALGORITHM_
 from nautilus_trader.model import (
     Bar,
     BarType,
+    ClientOrderId,
     ExecAlgorithmId,
     InstrumentId,
     OrderSide,
@@ -336,7 +337,6 @@ class BaseArchetypeStrategy(Strategy):
         self._post_warmup_bar_seq: int = 0
         self._delayed_order_queue: List[Dict[str, Any]] = []
         self._flushing_delayed_orders: bool = False
-        self._standalone_order_factory: Optional[OrderFactory] = None
         self._standalone_clock: Optional[Any] = None
         self._cached_order_factory: Optional[OrderFactory] = None
         self._cached_clock: Optional[Any] = None
@@ -489,7 +489,7 @@ class BaseArchetypeStrategy(Strategy):
             pass
         try:
             of = getattr(self, "order_factory", None)
-            if of is not None:
+            if of is not None and self._cached_order_factory is None:
                 self._cached_order_factory = of
         except Exception:
             pass
@@ -501,6 +501,8 @@ class BaseArchetypeStrategy(Strategy):
             pass
 
     def _get_order_factory(self) -> OrderFactory:
+        if self._cached_order_factory is not None:
+            return self._cached_order_factory
         if self._is_owner_thread():
             try:
                 of = self.order_factory
@@ -515,8 +517,6 @@ class BaseArchetypeStrategy(Strategy):
                     return of
             except Exception:
                 pass
-        if self._cached_order_factory is not None:
-            return self._cached_order_factory
         return self.order_factory
 
     _resolve_order_factory = _get_order_factory
@@ -600,25 +600,7 @@ class BaseArchetypeStrategy(Strategy):
                 pass
 
     def _resolve_telemetry_actor(self) -> Optional[Any]:
-        if self._telemetry_actor_ref is not None:
-            return self._telemetry_actor_ref
-        if not self._is_owner_thread():
-            return None
-        try:
-            from nautilus_trader.quant.governance.telemetry_actor import (
-                _resolve_active_telemetry_actor,
-            )
-
-            cache_obj = getattr(self, "cache", None)
-            clock_obj = getattr(self, "clock", None)
-            actor = _resolve_active_telemetry_actor(
-                cache=cache_obj, clock=clock_obj
-            )
-            if actor is not None:
-                self._telemetry_actor_ref = actor
-            return actor
-        except Exception:
-            return None
+        return self._telemetry_actor_ref
 
     def _symbol_from_instrument_id(
         self, instrument_id: Optional[InstrumentId] = None
@@ -1025,6 +1007,9 @@ class BaseArchetypeStrategy(Strategy):
             open_orders = []
             inflight_orders = []
         for order in list(open_orders or []) + list(inflight_orders or []):
+            cid = str(getattr(order, "client_order_id", "") or "")
+            if cid in self._canceled_order_ids_audit or self._is_order_denied_or_rejected(cid):
+                continue
             if not bool(getattr(order, "is_reduce_only", False)):
                 return True
         return False
@@ -1114,7 +1099,7 @@ class BaseArchetypeStrategy(Strategy):
         result: List[Any] = []
         for order in open_orders + inflight_orders:
             cid = str(getattr(order, "client_order_id", "") or "")
-            if not cid or cid in seen_cids:
+            if not cid or cid in seen_cids or cid in self._canceled_order_ids_audit:
                 continue
             status_str = self._normalized_order_status(order)
             if status_str in ("DENIED", "REJECTED", "CANCELED", "EXPIRED", "FILLED"):
@@ -1168,6 +1153,28 @@ class BaseArchetypeStrategy(Strategy):
         if self._in_submit_order_call and self._is_trader_registered():
             self._pending_reentrant_cancels.append(order_or_cid)
             return
+        tracked_ord = (
+            self._submitted_orders_by_cid.get(cid_str)
+            or self._stop_orders_by_cid.get(cid_str)
+        )
+        if self._is_trader_registered() and cid_str:
+            try:
+                cached_ord = self.cache.order(ClientOrderId(cid_str))
+                if (
+                    cached_ord is not None
+                    and self._normalized_order_status(cached_ord) == "INITIALIZED"
+                    and (
+                        cid_str in self._stop_orders_by_cid
+                        or (
+                            tracked_ord is not None
+                            and self._normalized_order_status(tracked_ord)
+                            != "INITIALIZED"
+                        )
+                    )
+                ):
+                    return
+            except Exception:
+                pass
         prev_in_cancel = self._in_cancel_order_call
         self._in_cancel_order_call = True
         order_arg = order_or_cid
@@ -1210,11 +1217,24 @@ class BaseArchetypeStrategy(Strategy):
             self._in_cancel_order_call = prev_in_cancel
             if reentrant_borrowed:
                 self._pending_reentrant_cancels.append(order_or_cid)
-            elif not self._in_cancel_order_call and self._pending_reentrant_orders:
-                pending = list(self._pending_reentrant_orders)
-                self._pending_reentrant_orders.clear()
-                for queued_order in pending:
-                    self._submit_order_safely(queued_order)
+            elif not self._in_cancel_order_call:
+                try:
+                    cid_str = str(getattr(order_or_cid, "client_order_id", order_or_cid))
+                    cid_obj = ClientOrderId(cid_str)
+                    if self._is_trader_registered() and self.cache is not None:
+                        cached = self.cache.order(cid_obj)
+                        if (
+                            cached is not None
+                            and self._normalized_order_status(cached) == "CANCELED"
+                        ):
+                            self.on_order_canceled(cached)
+                except Exception:
+                    pass
+                if self._pending_reentrant_orders:
+                    pending = list(self._pending_reentrant_orders)
+                    self._pending_reentrant_orders.clear()
+                    for queued_order in pending:
+                        self._submit_order_safely(queued_order)
 
     _dispatch_cancel_order = _cancel_single_order_safely
 

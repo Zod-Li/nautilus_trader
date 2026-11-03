@@ -73,6 +73,7 @@ jiff = { workspace = true }
 log = { workspace = true }
 parking_lot = { workspace = true }
 parquet = { workspace = true }
+rskafka = { workspace = true }
 rust_decimal = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

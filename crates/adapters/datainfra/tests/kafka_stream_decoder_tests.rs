@@ -17,7 +17,7 @@
 
 #![allow(linker_messages)]
 
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 
 use nautilus_core::UnixNanos;
 use nautilus_datainfra::{
@@ -34,7 +34,14 @@ use nautilus_model::{
     types::{Price, Quantity},
 };
 use parking_lot::Mutex;
-use tokio::{io::AsyncWriteExt, net::TcpListener};
+use rskafka::{
+    client::{
+        ClientBuilder,
+        partition::{Compression, UnknownTopicHandling},
+    },
+    record::Record,
+};
+use tokio::net::TcpListener;
 use ustr::Ustr;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -725,19 +732,44 @@ fn test_parse_broker_wire_frame_all_supported_formats_and_fail_closed() {
 
 #[tokio::test]
 async fn test_tcp_kafka_payload_source_ephemeral_broker_streaming_failover_and_close() {
-    // Bind two ephemeral listeners; drop the first immediately so its port is unreachable,
-    // verifying seed-broker failover to the second healthy listener.
     let dead_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let dead_addr = dead_listener.local_addr().unwrap().to_string();
     drop(dead_listener);
 
-    let live_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let live_addr = live_listener.local_addr().unwrap().to_string();
+    // 1. Unreachable broker must fail closed with Err(DataInfraError::Transport) on first next_frame()
+    let dead_cfg = DataInfraConfig::new_checked(
+        "http://127.0.0.1:8123",
+        "market_data",
+        300,
+        0,
+        vec![dead_addr.clone()],
+        "nautilus-datainfra-dead-test",
+        "http://127.0.0.1:8012",
+        "ALPACA",
+    )
+    .expect("valid DataInfraConfig for unreachable broker");
+    let dead_source =
+        TcpKafkaPayloadSource::from_config(&dead_cfg).expect("create dead TcpKafkaPayloadSource");
+    let dead_err = dead_source
+        .next_frame()
+        .await
+        .expect_err("unreachable broker must fail closed on initial next_frame");
+    assert!(matches!(dead_err, DataInfraError::Transport(_)));
 
+    let live_addr = std::env::var("KAFKA_BROKERS").unwrap_or_else(|_| "127.0.0.1:9092".to_string());
+    let run_id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let bar_topic = format!("md.sip.bars.1m.test.{run_id}");
+    let quote_topic = format!("md.sip.quotes.test.{run_id}");
+    let status_topic = format!("md.sip.statuses.test.{run_id}");
+
+    // 2. Non-existent topic must fail closed with Err(DataInfraError::Transport)
     let cfg = DataInfraConfig::new_checked(
         "http://127.0.0.1:8123",
         "market_data",
-        500,
+        2_000,
         0,
         vec![dead_addr.clone(), live_addr.clone()],
         "nautilus-datainfra-tcp-test",
@@ -746,61 +778,134 @@ async fn test_tcp_kafka_payload_source_ephemeral_broker_streaming_failover_and_c
     )
     .expect("valid DataInfraConfig");
 
-    let source = TcpKafkaPayloadSource::from_config(&cfg).expect("create TcpKafkaPayloadSource");
+    let missing_topic_source =
+        TcpKafkaPayloadSource::with_topics(&cfg, vec![format!("missing.topic.{run_id}")])
+            .expect("create TcpKafkaPayloadSource with missing topic");
+    let missing_err = missing_topic_source
+        .next_frame()
+        .await
+        .expect_err("missing topic on broker must fail closed");
+    assert!(matches!(missing_err, DataInfraError::Transport(_)));
+
+    // 3. Create topics and verify OffsetAt::Latest initialization + offset persistence across reconnects
+    let producer_client = ClientBuilder::new(vec![live_addr.clone()])
+        .build()
+        .await
+        .expect("connect to local Kafka broker on 127.0.0.1:9092");
+    if let Ok(ctrl) = producer_client.controller_client() {
+        for t in [&bar_topic, &quote_topic, &status_topic] {
+            let _ = ctrl.create_topic(t.as_str(), 1, 1, 5_000).await;
+        }
+    }
+
+    let source = TcpKafkaPayloadSource::with_topics(
+        &cfg,
+        vec![bar_topic.clone(), quote_topic.clone(), status_topic.clone()],
+    )
+    .expect("create TcpKafkaPayloadSource");
     assert_eq!(source.group_id(), "nautilus-datainfra-tcp-test");
     assert_eq!(source.brokers(), &[dead_addr, live_addr]);
 
-    let broker_task = tokio::spawn(async move {
-        let (mut socket, _) = live_listener.accept().await.expect("accept client");
-        let lines = [
-            // Frame 1: topic-prefixed 1m bar
-            format!(
-                "{TOPIC_SIP_BARS_1M}\t{}\n",
-                r#"{"symbol":"AAPL","timeframe":"1m","bar_ts":1777896600,"open":185.0,"high":186.0,"low":184.5,"close":185.5,"volume":42000.0,"version":1,"is_synthetic":false,"is_suspect_spike":false}"#
-            ),
-            // Frame 2: blank heartbeat line (should be skipped cleanly) + direct Quote frame
-            format!(
-                "\n{}\n",
-                r#"{"symbol":"AAPL","quote_ts_ms":1777896605000,"bid_price":185.45,"bid_size":200.0,"ask_price":185.55,"ask_size":300.0}"#
-            ),
-            // Frame 3: envelope Status frame
-            format!(
-                "{}\n",
-                r#"{"topic":"md.sip.statuses","payload":{"symbol":"AAPL","status_ts_ms":1777896610000,"state":"TRADING"}}"#
-            ),
-        ];
-        for line in lines {
-            socket.write_all(line.as_bytes()).await.unwrap();
-            socket.flush().await.unwrap();
-        }
-        // Keep socket open briefly so client reads all 3 frames, then close to trigger EOF
-        tokio::time::sleep(Duration::from_millis(80)).await;
-    });
+    // First next_frame() establishes the session and records OffsetAt::Latest in `offsets`
+    let initial_poll = source
+        .next_frame()
+        .await
+        .expect("initial next_frame on empty topics should succeed");
+    assert!(initial_poll.is_none());
+
+    // Produce bar record (as a {"topic", "payload"} envelope) while connected
+    let ts = rskafka::chrono::Utc::now();
+    let bar_pc = producer_client
+        .partition_client(bar_topic.clone(), 0, UnknownTopicHandling::Retry)
+        .await
+        .expect("bar partition client");
+    bar_pc
+        .produce(
+            vec![Record {
+                key: Some(b"AAPL".to_vec()),
+                value: Some(
+                    br#"{"topic":"md.sip.bars.1m","payload":{"symbol":"AAPL","timeframe":"1m","bar_ts":1777896600,"open":185.0,"high":186.0,"low":184.5,"close":185.5,"volume":42000.0,"version":1,"is_synthetic":false,"is_suspect_spike":false}}"#
+                        .to_vec(),
+                ),
+                headers: std::collections::BTreeMap::new(),
+                timestamp: ts,
+            }],
+            Compression::NoCompression,
+        )
+        .await
+        .expect("produce bar record");
+
+    let first_frame = source
+        .next_frame()
+        .await
+        .expect("poll bar frame")
+        .expect("bar frame should be present");
+    assert_eq!(first_frame.topic, TOPIC_SIP_BARS_1M);
+
+    // Simulate disconnect via close(), then produce quote & status records (direct JSON without outer envelope)
+    // to verify reconnect resumes from persisted offsets and preserves authoritative `cursor.topic`
+    source.close().await.expect("close before reconnect");
+
+    for (topic, json_payload) in [
+        (
+            &quote_topic,
+            r#"{"symbol":"AAPL","quote_ts_ms":1777896605000,"bid_price":185.45,"bid_size":200.0,"ask_price":185.55,"ask_size":300.0}"#,
+        ),
+        (
+            &status_topic,
+            r#"{"symbol":"AAPL","status_ts_ms":1777896610000,"state":"TRADING"}"#,
+        ),
+    ] {
+        let pc = producer_client
+            .partition_client(topic.clone(), 0, UnknownTopicHandling::Retry)
+            .await
+            .expect("partition client");
+        pc.produce(
+            vec![Record {
+                key: Some(b"AAPL".to_vec()),
+                value: Some(json_payload.as_bytes().to_vec()),
+                headers: std::collections::BTreeMap::new(),
+                timestamp: ts,
+            }],
+            Compression::NoCompression,
+        )
+        .await
+        .expect("produce record");
+    }
 
     let mut received: Vec<KafkaPayloadFrame> = Vec::new();
-    while received.len() < 3 {
+    while received.len() < 2 {
         if let Some(frame) = source
             .next_frame()
             .await
-            .expect("next_frame should succeed while stream is open")
+            .expect("next_frame after reconnect should resume from saved offsets")
         {
             received.push(frame);
         }
     }
 
-    assert_eq!(received[0].topic, TOPIC_SIP_BARS_1M);
-    assert_eq!(received[1].topic, TOPIC_SIP_QUOTES);
-    assert_eq!(received[2].topic, TOPIC_SIP_STATUSES);
+    assert_eq!(received[0].topic, quote_topic);
+    assert_eq!(received[1].topic, status_topic);
 
-    broker_task.await.unwrap();
+    // 4. Malformed non-JSON record on broker partition must fail closed
+    bar_pc
+        .produce(
+            vec![Record {
+                key: Some(b"AAPL".to_vec()),
+                value: Some(b"MALFORMED_NOT_JSON".to_vec()),
+                headers: std::collections::BTreeMap::new(),
+                timestamp: ts,
+            }],
+            Compression::NoCompression,
+        )
+        .await
+        .expect("produce malformed record");
 
-    // Subsequent poll after broker closed TCP socket must report Transport EOF error (fail-closed)
-    let eof_err = source
+    let bad_err = source
         .next_frame()
         .await
-        .expect_err("EOF on established session must fail closed with Transport error");
-    assert!(matches!(eof_err, DataInfraError::Transport(ref msg) if msg.contains("EOF")));
+        .expect_err("malformed non-JSON Kafka record must fail closed");
+    assert!(matches!(bad_err, DataInfraError::Transport(_)));
 
-    // Closing the source resets the established session state
     source.close().await.expect("close TcpKafkaPayloadSource");
 }

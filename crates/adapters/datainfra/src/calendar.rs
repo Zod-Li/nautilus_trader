@@ -36,13 +36,10 @@ use crate::{
 
 /// Canonical market code queried by [`CalendarSessionGate`].
 pub const DEFAULT_CALENDAR_MARKET: &str = "US_EQUITY";
-/// Primary HTTP endpoint path for `calendar-service` session status queries.
-pub const CALENDAR_SESSION_STATUS_PATH: &str = "/api/v1/calendar/session-status";
-/// Alternate HTTP endpoint path when `calendar-service` is mounted directly at `/v1`.
-pub const CALENDAR_SESSION_STATUS_V1_PATH: &str = "/v1/calendar/session-status";
+/// Canonical HTTP endpoint path for `calendar-service` session status queries.
+pub const CALENDAR_SESSION_STATUS_PATH: &str = "/v1/calendar/session-status";
 
-/// Rich domain model representing the response from `calendar-service` (`/api/v1/calendar/session-status`
-/// or `/v1/calendar/session-status`).
+/// Rich domain model representing the response from `calendar-service` (`/v1/calendar/session-status`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CalendarSessionStatus {
     /// Market code (e.g. `"US_EQUITY"`).
@@ -155,7 +152,7 @@ impl CalendarSessionStatus {
 /// Transport port for querying `calendar-service`.
 #[async_trait]
 pub trait CalendarTransport: Send + Sync + std::fmt::Debug {
-    /// Queries `/api/v1/calendar/session-status` (with fallback to `/v1/calendar/session-status`)
+    /// Queries `/v1/calendar/session-status`
     /// for `market` and optional `at_ts` (UTC seconds).
     ///
     /// # Errors
@@ -230,54 +227,34 @@ impl CalendarTransport for HttpCalendarTransport {
         market: &str,
         at_ts_utc: Option<i64>,
     ) -> DataInfraResult<CalendarSessionStatus> {
-        let candidate_paths = [
-            CALENDAR_SESSION_STATUS_PATH,
-            CALENDAR_SESSION_STATUS_V1_PATH,
-        ];
-        let mut last_err: Option<DataInfraError> = None;
-
-        for path in candidate_paths {
-            let url = self.build_endpoint_url(path, market, at_ts_utc)?;
-            match self
-                .http_client
-                .request(Method::GET, url, None, None, None, None, None)
-                .await
-            {
-                Ok(resp) => {
-                    let code = resp.status.as_u16();
-                    if code == 200 {
-                        let status: CalendarSessionStatus = serde_json::from_slice(&resp.body)
-                            .map_err(|e| {
-                                DataInfraError::CalendarGate(format!(
-                                    "failed to decode CalendarSessionStatus JSON: {e}"
-                                ))
-                            })?;
-                        status.validate_sanity()?;
-                        return Ok(status);
-                    }
-                    if code == 404 {
-                        last_err = Some(DataInfraError::CalendarGate(format!(
-                            "calendar-service endpoint {path} returned HTTP 404"
-                        )));
-                        continue;
-                    }
-                    let body_preview = String::from_utf8_lossy(&resp.body);
-                    return Err(DataInfraError::CalendarGate(format!(
-                        "calendar-service returned HTTP {code}: {body_preview}"
-                    )));
+        let url = self.build_endpoint_url(CALENDAR_SESSION_STATUS_PATH, market, at_ts_utc)?;
+        match self
+            .http_client
+            .request(Method::GET, url, None, None, None, None, None)
+            .await
+        {
+            Ok(resp) => {
+                let code = resp.status.as_u16();
+                if code == 200 {
+                    let status: CalendarSessionStatus = serde_json::from_slice(&resp.body)
+                        .map_err(|e| {
+                            DataInfraError::CalendarGate(format!(
+                                "failed to decode CalendarSessionStatus JSON: {e}"
+                            ))
+                        })?;
+                    status.validate_sanity()?;
+                    return Ok(status);
                 }
-                Err(e) => {
-                    return Err(DataInfraError::CalendarGate(format!(
-                        "calendar-service unreachable ({}): {e}",
-                        self.base_url
-                    )));
-                }
+                let body_preview = String::from_utf8_lossy(&resp.body);
+                Err(DataInfraError::CalendarGate(format!(
+                    "calendar-service returned HTTP {code}: {body_preview}"
+                )))
             }
+            Err(e) => Err(DataInfraError::CalendarGate(format!(
+                "calendar-service unreachable ({}): {e}",
+                self.base_url
+            ))),
         }
-
-        Err(last_err.unwrap_or_else(|| {
-            DataInfraError::CalendarGate("calendar-service session-status query failed".to_string())
-        }))
     }
 }
 

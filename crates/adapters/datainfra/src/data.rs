@@ -412,6 +412,13 @@ impl DataInfraDataClient {
         self
     }
 
+    /// Replaces the [`KafkaPayloadSource`] used by the background stream consumer task.
+    #[must_use]
+    pub fn with_payload_source(mut self, kafka_source: Arc<dyn KafkaPayloadSource>) -> Self {
+        self.kafka_source = kafka_source;
+        self
+    }
+
     /// Binds or replaces the `DataEvent` channel sender toward `DataEngine`.
     pub fn set_data_sender(&mut self, sender: EventSender<DataEvent>) {
         *self.shared_sender.write() = Some(sender.clone());
