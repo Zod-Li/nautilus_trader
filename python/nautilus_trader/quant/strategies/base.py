@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN
 import logging
 import threading
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 from nautilus_trader.common import Clock, OrderFactory
 from nautilus_trader.quant.contracts.models import (
@@ -17,6 +17,7 @@ from nautilus_trader.quant.contracts.models import (
     PlanRiskEnvelope,
     PlanSide,
     StrategyArchetypeId,
+    default_limit_collar_for_archetype,
 )
 from nautilus_trader.quant.governance.plan_gate import PLAN_GATE_EXEC_ALGORITHM_ID
 from nautilus_trader.model import (
@@ -300,6 +301,10 @@ class BaseArchetypeStrategy(Strategy):
         )
         self._highs: List[float] = []
         self._lows: List[float] = []
+        self._raw_highs: List[float] = []
+        self._raw_lows: List[float] = []
+        self._cleaned_bar_extremes_by_ts_ns: Dict[int, Tuple[float, float]] = {}
+        self._raw_bar_extremes_by_ts_ns: Dict[int, Tuple[float, float]] = {}
         self._closes: List[float] = []
         self._volumes: List[float] = []
         self._trailing_stop_price: Optional[float] = None
@@ -391,8 +396,7 @@ class BaseArchetypeStrategy(Strategy):
 
     def warmup_historical_bars(self, bars: Sequence[Bar]) -> int:
         """Feeds historical bars chronologically into rolling indicator windows under `_in_warmup=True`
-        without emitting any entry or exit orders. When multiple instruments share identical bar
-        timestamps (e.g. `StatArbPairsStrategy`), secondary-leg bars are ordered before primary-leg bars.
+        without emitting any entry or exit orders.
         """
         if not bars:
             return 0
@@ -431,10 +435,49 @@ class BaseArchetypeStrategy(Strategy):
         """Clears rolling bar and indicator windows when a flat strategy is re-warmed up."""
         self._highs.clear()
         self._lows.clear()
+        self._raw_highs.clear()
+        self._raw_lows.clear()
         self._closes.clear()
         self._volumes.clear()
         self._last_bar_ts_ns = 0
         self._warmup_bar_count = 0
+
+    def bind_dual_track_bar_extremes(
+        self,
+        *,
+        cleaned_by_ts_ns: Optional[Mapping[int, Tuple[float, float]]] = None,
+        raw_by_ts_ns: Optional[Mapping[int, Tuple[float, float]]] = None,
+    ) -> None:
+        """Binds dual-track bar extremes keyed by bar timestamp (`ts_ns`).
+
+        Rolling indicators (`rolling_atr`, `vwap_anchor`) consume cleaned `(high, low)`,
+        while stop-loss triggers inspect un-smoothed `(raw_high, raw_low)` to preserve
+        1:1 backtest-to-live isomorphism with broker `STOP_MARKET` execution.
+        """
+        self._cleaned_bar_extremes_by_ts_ns = (
+            {int(k): (float(v[0]), float(v[1])) for k, v in cleaned_by_ts_ns.items()}
+            if cleaned_by_ts_ns
+            else {}
+        )
+        self._raw_bar_extremes_by_ts_ns = (
+            {int(k): (float(v[0]), float(v[1])) for k, v in raw_by_ts_ns.items()}
+            if raw_by_ts_ns
+            else {}
+        )
+
+    def _current_bar_raw_low(self, fallback: Optional[float] = None) -> float:
+        if self._raw_lows:
+            return float(self._raw_lows[-1])
+        if fallback is not None:
+            return float(fallback)
+        return float(self._lows[-1]) if self._lows else 0.0
+
+    def _current_bar_raw_high(self, fallback: Optional[float] = None) -> float:
+        if self._raw_highs:
+            return float(self._raw_highs[-1])
+        if fallback is not None:
+            return float(fallback)
+        return float(self._highs[-1]) if self._highs else 0.0
 
     def set_tracked_position_signed_qty(
         self,
@@ -772,8 +815,6 @@ class BaseArchetypeStrategy(Strategy):
                 self.warmup_historical_bars(loaded_bars)
         if self._is_owner_thread():
             self.subscribe_bars(self._archetype_config.bar_type)
-            if self._archetype_config.secondary_bar_type is not None:
-                self.subscribe_bars(self._archetype_config.secondary_bar_type)
 
     def _resolve_entry_limit_price(
         self,
@@ -803,10 +844,7 @@ class BaseArchetypeStrategy(Strategy):
         collar = (
             env.collar
             if env is not None and getattr(env, "collar", None) is not None
-            else MarketableLimitCollar(
-                limit_collar_pct=Decimal("0.35"),
-                limit_collar_atr=Decimal("0.25"),
-            )
+            else default_limit_collar_for_archetype(self._archetype_config.ARCHETYPE_ID)
         )
         worst_limit_dec = collar.compute_worst_limit_price(
             plan_side,
@@ -838,11 +876,6 @@ class BaseArchetypeStrategy(Strategy):
                 kwargs = dict(item.get("kwargs", {}))
                 target_inst = kwargs.get("instrument_id") or self._archetype_config.instrument_id
                 cur_px = float(current_bar.close.as_double())
-                sec_inst = getattr(self._archetype_config, "secondary_instrument_id", None)
-                if sec_inst is not None and str(target_inst) == str(sec_inst):
-                    sec_closes = getattr(self, "_secondary_closes", None)
-                    if sec_closes:
-                        cur_px = float(sec_closes[-1])
                 if action == "entry":
                     orig_ref = float(kwargs.get("reference_price") or cur_px)
                     orig_stop = kwargs.get("stop_loss_price")
@@ -886,14 +919,46 @@ class BaseArchetypeStrategy(Strategy):
                     self._standalone_clock.set_time(bar_ts)
                 except Exception:
                     pass
-        self._highs.append(float(bar.high.as_double()))
-        self._lows.append(float(bar.low.as_double()))
+        bar_high = float(bar.high.as_double())
+        bar_low = float(bar.low.as_double())
+        cleaned_pair = self._cleaned_bar_extremes_by_ts_ns.get(bar_ts)
+        if cleaned_pair is not None:
+            cleaned_high, cleaned_low = float(cleaned_pair[0]), float(cleaned_pair[1])
+        else:
+            attr_ch = getattr(bar, "cleaned_high", None)
+            attr_cl = getattr(bar, "cleaned_low", None)
+            cleaned_high = float(attr_ch) if attr_ch is not None else bar_high
+            cleaned_low = float(attr_cl) if attr_cl is not None else bar_low
+
+        raw_pair = self._raw_bar_extremes_by_ts_ns.get(bar_ts)
+        if raw_pair is not None:
+            raw_high, raw_low = float(raw_pair[0]), float(raw_pair[1])
+        else:
+            attr_rh = getattr(bar, "raw_high", None)
+            attr_rl = getattr(bar, "raw_low", None)
+            raw_high = (
+                max(bar_high, float(attr_rh))
+                if attr_rh is not None
+                else max(bar_high, cleaned_high)
+            )
+            raw_low = (
+                min(bar_low, float(attr_rl))
+                if attr_rl is not None
+                else min(bar_low, cleaned_low)
+            )
+
+        self._highs.append(cleaned_high)
+        self._lows.append(cleaned_low)
+        self._raw_highs.append(raw_high)
+        self._raw_lows.append(raw_low)
         self._closes.append(float(bar.close.as_double()))
         self._volumes.append(float(bar.volume.as_double()))
         max_keep = max(self._archetype_config.lookback_window * 3, 120)
         if len(self._closes) > max_keep:
             del self._highs[:-max_keep]
             del self._lows[:-max_keep]
+            del self._raw_highs[:-max_keep]
+            del self._raw_lows[:-max_keep]
             del self._closes[:-max_keep]
             del self._volumes[:-max_keep]
         if not self._in_warmup:

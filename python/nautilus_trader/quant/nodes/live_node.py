@@ -47,7 +47,6 @@ from nautilus_trader.quant.governance.plan_gate import (
     PlanGateExecAlgorithmConfig,
     PostgresPlanGateBackend,
     SnapshotPlanGateBackend,
-    build_stat_arb_secondary_plan_item,
 )
 from nautilus_trader.quant.governance.telemetry_actor import (
     PostgresTelemetryActor,
@@ -1312,13 +1311,6 @@ class DailyPlanReconciler:
                         renewed_item,
                         reserved_qty=carried_reserved,
                     )
-                    sec_item = build_stat_arb_secondary_plan_item(renewed_item)
-                    if sec_item is not None:
-                        persisted_sec = secondary_items_by_symbol.get(sec_item.symbol)
-                        self._backend.upsert_runtime_plan_item(
-                            persisted_sec or sec_item,
-                            reserved_qty=(persisted_sec or sec_item).filled_qty,
-                        )
                 self._plan_items_by_symbol[sym] = renewed_item
 
                 decisions.append(
@@ -1439,13 +1431,6 @@ class DailyPlanReconciler:
                         new_item,
                         reserved_qty=new_item.filled_qty,
                     )
-                    sec_item = build_stat_arb_secondary_plan_item(new_item)
-                    if sec_item is not None:
-                        persisted_sec = secondary_items_by_symbol.get(sec_item.symbol)
-                        self._backend.upsert_runtime_plan_item(
-                            persisted_sec or sec_item,
-                            reserved_qty=(persisted_sec or sec_item).filled_qty,
-                        )
                 self._plan_items_by_symbol[sym] = new_item
 
                 decisions.append(

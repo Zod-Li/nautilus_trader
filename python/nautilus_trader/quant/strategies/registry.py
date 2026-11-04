@@ -23,10 +23,6 @@ from nautilus_trader.quant.strategies.mean_reversion import (
     MeanReversionConfig,
     MeanReversionStrategy,
 )
-from nautilus_trader.quant.strategies.stat_arb_pairs import (
-    StatArbPairsConfig,
-    StatArbPairsStrategy,
-)
 from nautilus_trader.quant.strategies.trend_momentum import (
     TrendMomentumConfig,
     TrendMomentumStrategy,
@@ -167,18 +163,6 @@ STRATEGY_ARCHETYPE_REGISTRY: Dict[StrategyArchetypeId, ArchetypeDescriptor] = {
         strategy_cls=MeanReversionStrategy,
         requires_secondary_instrument=False,
         parameter_bounds=_default_parameter_bounds(requires_secondary=False),
-    ),
-    StrategyArchetypeId.STAT_ARB_PAIRS: ArchetypeDescriptor(
-        archetype_id=StrategyArchetypeId.STAT_ARB_PAIRS,
-        name="Statistical Arbitrage Pairs Strategy",
-        description=(
-            "Dual-leg cointegration spread residual MAD Z-score strategy with dynamic "
-            "Rolling OLS / Kalman-EWMA hedge ratio beta."
-        ),
-        config_cls=StatArbPairsConfig,
-        strategy_cls=StatArbPairsStrategy,
-        requires_secondary_instrument=True,
-        parameter_bounds=_default_parameter_bounds(requires_secondary=True),
     ),
 }
 

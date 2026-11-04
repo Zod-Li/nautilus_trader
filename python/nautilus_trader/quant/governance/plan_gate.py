@@ -160,143 +160,6 @@ class PlanGateDecision:
         )
 
 
-def build_stat_arb_secondary_plan_item(
-    primary_item: PlanItemContract,
-) -> Optional[PlanItemContract]:
-    """Derives the paired secondary hedge `PlanItemContract` envelope for a `STAT_ARB_PAIRS` primary item."""
-    cfg = primary_item.strategy_config
-    if cfg.archetype_id != StrategyArchetypeId.STAT_ARB_PAIRS or not cfg.secondary_instrument_id:
-        return None
-    trace = primary_item.sizing_trace or {}
-    if (
-        str(trace.get("role", "")).strip() == "secondary_leg"
-        or bool(trace.get("is_secondary_leg", False))
-        or bool(trace.get("disable_secondary_hedge_envelope", False))
-        or trace.get("register_secondary_hedge_envelope") is False
-    ):
-        return None
-    sec_inst = str(cfg.secondary_instrument_id).strip()
-    sec_sym = sec_inst.split(".", 1)[0].strip().upper()
-    if not sec_sym or sec_sym == primary_item.symbol:
-        return None
-
-    env = primary_item.risk_envelope
-    sec_side = (
-        PlanSide.SHORT
-        if env.side == PlanSide.LONG
-        else PlanSide.LONG
-    )
-    sec_item_id = uuid5(
-        NAMESPACE_URL,
-        f"nautilus-secondary-leg:{primary_item.plan_id}:{primary_item.item_id}:{sec_sym}",
-    )
-    window_scale = Decimal(cfg.slow_window) / Decimal(max(cfg.fast_window, 1))
-    beta_bound = max(Decimal("1"), cfg.atr_stop_multiplier, window_scale)
-    raw_trace_beta = trace.get("hedge_beta", trace.get("beta"))
-    if raw_trace_beta is not None:
-        beta_bound = max(beta_bound, abs(_to_decimal(raw_trace_beta, "hedge_beta")))
-
-    raw_sec_cap = trace.get("secondary_approved_qty_cap")
-    sec_cap = (
-        _to_decimal(raw_sec_cap, "approved_qty_cap")
-        if raw_sec_cap is not None
-        else (env.approved_qty_cap * beta_bound).to_integral_value()
-    )
-    sec_target_qty = max(env.target_qty, sec_cap)
-
-    prim_ref_px = env.reference_price
-    raw_sec_ref = trace.get("secondary_reference_price", trace.get("secondary_price"))
-    sec_ref_px = (
-        _to_decimal(raw_sec_ref, "secondary_reference_price")
-        if raw_sec_ref is not None
-        else prim_ref_px
-    )
-    prim_stop_dist = abs(prim_ref_px - env.initial_stop_price)
-    prim_stop_ratio = (
-        prim_stop_dist / prim_ref_px
-        if prim_ref_px > Decimal("0")
-        else (Decimal("1") - cfg.entry_quantile_threshold)
-    )
-    sec_stop_ratio = min(
-        cfg.entry_quantile_threshold,
-        max(
-            prim_stop_ratio * cfg.atr_stop_multiplier,
-            Decimal("1") - cfg.exit_quantile_threshold,
-        ),
-    )
-    raw_sec_stop = trace.get("secondary_initial_stop_price")
-    if raw_sec_stop is not None:
-        sec_stop = _to_decimal(raw_sec_stop, "initial_stop_price")
-    elif sec_side == PlanSide.SHORT:
-        sec_stop = Decimal(f"{float(sec_ref_px * (Decimal('1') + sec_stop_ratio)):.2f}")
-    else:
-        sec_stop = Decimal(f"{float(sec_ref_px * (Decimal('1') - sec_stop_ratio)):.2f}")
-
-    sec_stop_offset = abs(sec_ref_px - sec_stop)
-    sec_notional = max(
-        env.target_notional_usd,
-        Decimal(f"{float(sec_target_qty * sec_ref_px):.2f}"),
-    )
-    raw_sec_budget = trace.get("secondary_max_risk_budget_usd")
-    sec_risk_budget = (
-        _to_decimal(raw_sec_budget, "max_risk_budget_usd")
-        if raw_sec_budget is not None
-        else min(
-            env.max_risk_budget_usd,
-            sec_notional,
-        )
-    )
-    sec_status = str(trace.get("secondary_status", primary_item.status))
-    sec_take_profit = (
-        Decimal(f"{float(sec_ref_px * (Decimal('1') - prim_stop_ratio)):.2f}")
-        if sec_side == PlanSide.SHORT
-        else Decimal(f"{float(sec_ref_px * (Decimal('1') + sec_stop_ratio)):.2f}")
-    )
-    sec_envelope = replace(
-        env,
-        side=sec_side,
-        target_qty=sec_target_qty,
-        approved_qty_cap=sec_cap,
-        target_notional_usd=sec_notional,
-        max_risk_budget_usd=sec_risk_budget,
-        initial_stop_price=sec_stop,
-        take_profit_price=(
-            sec_take_profit
-            if env.take_profit_price is not None
-            else None
-        ),
-    )
-    sec_cfg = replace(
-        cfg,
-        instrument_id=sec_inst,
-        secondary_instrument_id=cfg.instrument_id,
-    )
-    sec_trace = {
-        **dict(trace),
-        "role": "secondary_leg",
-        "is_secondary_leg": True,
-        "parent_plan_item_id": str(primary_item.item_id),
-    }
-    sec_ven = (
-        sec_inst.split(".", 1)[1].strip().upper()
-        if "." in sec_inst
-        else primary_item.venue
-    )
-    return replace(
-        primary_item,
-        item_id=sec_item_id,
-        symbol=sec_sym,
-        venue=sec_ven,
-        strategy_id=f"{primary_item.strategy_id}-{sec_sym}",
-        status=sec_status,
-        filled_qty=Decimal("0"),
-        reserved_notional_usd=Decimal("0"),
-        risk_envelope=sec_envelope,
-        strategy_config=sec_cfg,
-        sizing_trace=sec_trace,
-    )
-
-
 def _plan_item_to_rust_envelope(item: PlanItemContract) -> RustPlanItemEnvelope:
     valid_until = (
         item.risk_envelope.valid_until
@@ -405,14 +268,8 @@ class SnapshotPlanGateBackend:
         self._removed_symbols: set[str] = set()
         self._items_by_symbol: Dict[str, PlanItemContract] = {}
         self._alerts: List[Dict[str, Any]] = []
-        explicit_symbols = {item.symbol for item in plan_items}
         for item in plan_items:
-            self.upsert_plan_item(item, _skip_auto_secondary=True)
-        if self._auto_register_stat_arb_secondary:
-            for item in plan_items:
-                sec_item = build_stat_arb_secondary_plan_item(item)
-                if sec_item is not None and sec_item.symbol not in explicit_symbols:
-                    self.upsert_plan_item(sec_item, _skip_auto_secondary=True)
+            self.upsert_plan_item(item)
 
     @property
     def trading_date(self) -> Optional[date]:
@@ -448,31 +305,10 @@ class SnapshotPlanGateBackend:
     def upsert_plan_item(
         self,
         item: PlanItemContract,
-        *,
-        _skip_auto_secondary: bool = False,
     ) -> None:
         self._removed_symbols.discard(item.symbol)
         self._items_by_symbol[item.symbol] = item
         self._rust_engine.upsert_plan_item(_plan_item_to_rust_envelope(item), False)
-        if not _skip_auto_secondary and self._auto_register_stat_arb_secondary:
-            sec_item = build_stat_arb_secondary_plan_item(item)
-            if (
-                sec_item is not None
-                and sec_item.symbol not in self._removed_symbols
-                and (
-                    sec_item.symbol not in self._items_by_symbol
-                    or str(
-                        self._items_by_symbol[sec_item.symbol].sizing_trace.get(
-                            "parent_plan_item_id", ""
-                        )
-                    )
-                    == str(item.item_id)
-                )
-            ):
-                self._items_by_symbol[sec_item.symbol] = sec_item
-                self._rust_engine.upsert_plan_item(
-                    _plan_item_to_rust_envelope(sec_item), False
-                )
 
     def upsert_runtime_plan_item(
         self,
@@ -492,26 +328,6 @@ class SnapshotPlanGateBackend:
             _plan_item_to_rust_envelope(adjusted_item),
             bool(preserve_higher_reservation),
         )
-        if self._auto_register_stat_arb_secondary:
-            sec_item = build_stat_arb_secondary_plan_item(adjusted_item)
-            if (
-                sec_item is not None
-                and sec_item.symbol not in self._removed_symbols
-                and (
-                    sec_item.symbol not in self._items_by_symbol
-                    or str(
-                        self._items_by_symbol[sec_item.symbol].sizing_trace.get(
-                            "parent_plan_item_id", ""
-                        )
-                    )
-                    == str(adjusted_item.item_id)
-                )
-            ):
-                self._items_by_symbol[sec_item.symbol] = sec_item
-                self._rust_engine.upsert_plan_item(
-                    _plan_item_to_rust_envelope(sec_item),
-                    bool(preserve_higher_reservation),
-                )
 
     def remove_runtime_plan_item(self, symbol: str) -> None:
         norm_sym = str(symbol or "").split(".", 1)[0].strip().upper()
@@ -1175,29 +991,6 @@ class PostgresPlanGateBackend:
             self._known_symbols.add(norm_sym)
             self._symbol_by_item_id[str(adjusted_item.item_id)] = norm_sym
             self._items_by_symbol[norm_sym] = adjusted_item
-            sec_item = build_stat_arb_secondary_plan_item(adjusted_item)
-            if (
-                sec_item is not None
-                and sec_item.symbol not in self._removed_runtime_symbols
-                and (
-                    sec_item.symbol not in self._items_by_symbol
-                    or str(
-                        self._items_by_symbol[sec_item.symbol].sizing_trace.get(
-                            "parent_plan_item_id", ""
-                        )
-                    )
-                    == str(adjusted_item.item_id)
-                )
-            ):
-                sec_sym = sec_item.symbol
-                self._runtime_items_by_symbol[sec_sym] = (sec_item, None)
-                self._rust_engine.upsert_plan_item(
-                    _plan_item_to_rust_envelope(sec_item),
-                    bool(preserve_higher_reservation),
-                )
-                self._known_symbols.add(sec_sym)
-                self._symbol_by_item_id[str(sec_item.item_id)] = sec_sym
-                self._items_by_symbol[sec_sym] = sec_item
 
     def remove_runtime_plan_item(self, symbol: str) -> None:
         """Removes a runtime `PlanItemContract` overlay for `symbol` and evicts it from `RustPlanGateEngine`."""
@@ -1673,26 +1466,6 @@ class PostgresPlanGateBackend:
                             logger.warning(
                                 "Skipping invalid PlanItemContract row: %s", item_exc
                             )
-                    for primary_item in list(loaded_by_symbol.values()):
-                        sec_item = build_stat_arb_secondary_plan_item(primary_item)
-                        if (
-                            sec_item is not None
-                            and sec_item.symbol not in loaded_by_symbol
-                            and sec_item.symbol not in self._removed_runtime_symbols
-                        ):
-                            sec_sym = sec_item.symbol
-                            if effective_preserve:
-                                prior_sec_res = prev_reserved.get(sec_sym, Decimal("0"))
-                                if prior_sec_res > sec_item.filled_qty:
-                                    sec_item = replace(sec_item, filled_qty=prior_sec_res)
-                            self._rust_engine.upsert_plan_item(
-                                _plan_item_to_rust_envelope(sec_item),
-                                effective_preserve,
-                            )
-                            self._known_symbols.add(sec_sym)
-                            self._symbol_by_item_id[str(sec_item.item_id)] = sec_sym
-                            self._items_by_symbol[sec_sym] = sec_item
-                            loaded_by_symbol[sec_sym] = sec_item
                     for norm_sym, (runtime_item, runtime_reserved) in list(
                         self._runtime_items_by_symbol.items()
                     ):

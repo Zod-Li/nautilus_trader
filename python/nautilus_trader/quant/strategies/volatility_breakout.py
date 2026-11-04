@@ -90,6 +90,8 @@ class VolatilityBreakoutStrategy(BaseArchetypeStrategy):
         close_px = self._closes[-1]
         high_px = self._highs[-1]
         low_px = self._lows[-1]
+        raw_high_px = self._current_bar_raw_high(high_px)
+        raw_low_px = self._current_bar_raw_low(low_px)
 
         price_quantile = empirical_rank_quantile(close_window, close_px)
         vol_quantile = empirical_rank_quantile(vol_ratio_window, vol_ratio)
@@ -114,7 +116,7 @@ class VolatilityBreakoutStrategy(BaseArchetypeStrategy):
 
             stop_hit = (
                 self._trailing_stop_price is not None
-                and low_px <= self._trailing_stop_price
+                and raw_low_px <= self._trailing_stop_price
             )
             channel_failure = price_quantile <= exit_q
             if stop_hit or channel_failure:
@@ -138,7 +140,7 @@ class VolatilityBreakoutStrategy(BaseArchetypeStrategy):
 
             stop_hit = (
                 self._trailing_stop_price is not None
-                and high_px >= self._trailing_stop_price
+                and raw_high_px >= self._trailing_stop_price
             )
             channel_failure = (1.0 - price_quantile) <= exit_q
             if stop_hit or channel_failure:

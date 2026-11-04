@@ -112,6 +112,8 @@ class TrendMomentumStrategy(BaseArchetypeStrategy):
         close_px = self._closes[-1]
         high_px = self._highs[-1]
         low_px = self._lows[-1]
+        raw_high_px = self._current_bar_raw_high(high_px)
+        raw_low_px = self._current_bar_raw_low(low_px)
 
         signed_pos = self._open_position_signed_qty()
         if signed_pos > Decimal("0"):
@@ -126,7 +128,7 @@ class TrendMomentumStrategy(BaseArchetypeStrategy):
 
             stop_hit = (
                 self._trailing_stop_price is not None
-                and low_px <= self._trailing_stop_price
+                and raw_low_px <= self._trailing_stop_price
             )
             momentum_exhausted = mom_quantile <= exit_q
             if stop_hit or momentum_exhausted:
@@ -152,7 +154,7 @@ class TrendMomentumStrategy(BaseArchetypeStrategy):
 
             stop_hit = (
                 self._trailing_stop_price is not None
-                and high_px >= self._trailing_stop_price
+                and raw_high_px >= self._trailing_stop_price
             )
             momentum_exhausted = (1.0 - mom_quantile) <= exit_q
             if stop_hit or momentum_exhausted:

@@ -118,12 +118,38 @@ class PlanContractValidationError(ValueError):
 
 
 class StrategyArchetypeId(str, Enum):
-    """Pre-audited Nautilus Strategy archetypes eligible for pre-market calibration and live execution."""
+    """Pre-audited pure Long-Only Nautilus Strategy archetypes eligible for offline regime calibration and live execution."""
 
     TREND_MOMENTUM = "TREND_MOMENTUM"
     VOLATILITY_BREAKOUT = "VOLATILITY_BREAKOUT"
     MEAN_REVERSION = "MEAN_REVERSION"
-    STAT_ARB_PAIRS = "STAT_ARB_PAIRS"
+
+
+BREAKOUT_ARCHETYPE_IDS = frozenset(
+    {
+        StrategyArchetypeId.TREND_MOMENTUM,
+        StrategyArchetypeId.VOLATILITY_BREAKOUT,
+    }
+)
+BREAKOUT_LIMIT_COLLAR_ATR = Decimal("0.25")
+MEAN_REVERSION_LIMIT_COLLAR_ATR = Decimal("0.10")
+
+
+def default_limit_collar_atr_for_archetype(
+    archetype_id: StrategyArchetypeId | str,
+) -> Decimal:
+    """Returns the canonical limit collar ATR multiplier for `archetype_id`:
+    - `0.25` for breakout/momentum archetypes (`TREND_MOMENTUM`, `VOLATILITY_BREAKOUT`)
+    - `0.10` for mean reversion (`MEAN_REVERSION`)
+    """
+    resolved = (
+        archetype_id
+        if isinstance(archetype_id, StrategyArchetypeId)
+        else StrategyArchetypeId(str(archetype_id).strip().upper())
+    )
+    if resolved in BREAKOUT_ARCHETYPE_IDS:
+        return BREAKOUT_LIMIT_COLLAR_ATR
+    return MEAN_REVERSION_LIMIT_COLLAR_ATR
 
 
 class PlanSide(str, Enum):
@@ -229,13 +255,10 @@ class ArchetypeStrategyConfig:
             raise PlanContractValidationError(
                 f"atr_stop_multiplier ({self.atr_stop_multiplier}) must be > 0"
             )
-
-        if self.archetype_id == StrategyArchetypeId.STAT_ARB_PAIRS:
-            sec = (self.secondary_instrument_id or "").strip()
-            if "." not in sec or sec == inst:
-                raise PlanContractValidationError(
-                    "STAT_ARB_PAIRS requires a distinct secondary_instrument_id in 'SYMBOL.VENUE' format"
-                )
+        if self.secondary_instrument_id is not None and str(self.secondary_instrument_id).strip():
+            raise PlanContractValidationError(
+                f"{self.archetype_id.value} does not permit secondary_instrument_id"
+            )
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -340,6 +363,17 @@ class MarketableLimitCollar:
             limit_collar_pct=_to_decimal(data["limit_collar_pct"], "limit_collar_pct"),
             limit_collar_atr=_to_decimal(data["limit_collar_atr"], "limit_collar_atr"),
         )
+
+
+def default_limit_collar_for_archetype(
+    archetype_id: StrategyArchetypeId | str,
+    limit_collar_pct: Decimal | float | str = Decimal("0.35"),
+) -> MarketableLimitCollar:
+    """Constructs the canonical `MarketableLimitCollar` for `archetype_id`."""
+    return MarketableLimitCollar(
+        limit_collar_pct=_to_decimal(limit_collar_pct, "limit_collar_pct"),
+        limit_collar_atr=default_limit_collar_atr_for_archetype(archetype_id),
+    )
 
 
 @dataclass(frozen=True)

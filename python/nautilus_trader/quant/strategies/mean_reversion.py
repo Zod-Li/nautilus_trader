@@ -89,6 +89,8 @@ class MeanReversionStrategy(BaseArchetypeStrategy):
         close_px = self._closes[-1]
         high_px = self._highs[-1]
         low_px = self._lows[-1]
+        raw_high_px = self._current_bar_raw_high(high_px)
+        raw_low_px = self._current_bar_raw_low(low_px)
         residual = close_px - vwap_anchor
         self._residuals.append(residual)
 
@@ -119,7 +121,7 @@ class MeanReversionStrategy(BaseArchetypeStrategy):
         if signed_pos > Decimal("0"):
             stop_hit = (
                 self._trailing_stop_price is not None
-                and low_px <= self._trailing_stop_price
+                and raw_low_px <= self._trailing_stop_price
             )
             reverted_to_anchor = (
                 close_px >= vwap_anchor or (1.0 - z_quantile) <= exit_q
@@ -138,7 +140,7 @@ class MeanReversionStrategy(BaseArchetypeStrategy):
         if signed_pos < Decimal("0"):
             stop_hit = (
                 self._trailing_stop_price is not None
-                and high_px >= self._trailing_stop_price
+                and raw_high_px >= self._trailing_stop_price
             )
             reverted_to_anchor = close_px <= vwap_anchor or z_quantile <= exit_q
             if stop_hit or reverted_to_anchor:

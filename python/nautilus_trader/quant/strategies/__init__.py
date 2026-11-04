@@ -36,10 +36,6 @@ from nautilus_trader.quant.strategies.registry import (
     instantiate_strategy_from_contract,
     list_strategy_archetype_schemas,
 )
-from nautilus_trader.quant.strategies.stat_arb_pairs import (
-    StatArbPairsConfig,
-    StatArbPairsStrategy,
-)
 from nautilus_trader.quant.strategies.trend_momentum import (
     TrendMomentumConfig,
     TrendMomentumStrategy,
@@ -56,8 +52,6 @@ __all__ = [
     "MeanReversionConfig",
     "MeanReversionStrategy",
     "STRATEGY_ARCHETYPE_REGISTRY",
-    "StatArbPairsConfig",
-    "StatArbPairsStrategy",
     "TIMEFRAME_TO_BAR_SPEC",
     "TrendMomentumConfig",
     "TrendMomentumStrategy",

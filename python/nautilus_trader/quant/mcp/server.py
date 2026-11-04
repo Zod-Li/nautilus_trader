@@ -48,9 +48,9 @@ from nautilus_trader.quant.contracts.models import (
     PlanSide,
     StrategyArchetypeId,
     compute_intraday_entry_valid_until,
+    default_limit_collar_atr_for_archetype,
 )
 from nautilus_trader.quant.contracts.repository import PlanContractRepository
-from nautilus_trader.quant.governance.plan_gate import build_stat_arb_secondary_plan_item
 from nautilus_trader.quant.mcp.schemas import (
     ALLOWED_MCP_TOOL_NAMES,
     McpPlanLockRejectedError,
@@ -460,6 +460,7 @@ class NautilusMcpServer:
             risk_envelope,
             bars=bars,
             bar_timeframe=strat_cfg.bar_timeframe,
+            archetype_id=strat_cfg.archetype_id,
         )
         plan_item = self._make_plan_item_contract(
             symbol=sym,
@@ -523,6 +524,7 @@ class NautilusMcpServer:
             risk_envelope,
             bars=bars,
             bar_timeframe=strat_cfg.bar_timeframe,
+            archetype_id=strat_cfg.archetype_id,
         )
         plan_item = self._make_plan_item_contract(
             symbol=sym,
@@ -641,6 +643,7 @@ class NautilusMcpServer:
                 raw_env,
                 trading_date=resolved_date,
                 bar_timeframe=strat_cfg.bar_timeframe,
+                archetype_id=strat_cfg.archetype_id,
             )
             fp = compute_strategy_fingerprint(sym, strat_cfg)
 
@@ -761,19 +764,6 @@ class NautilusMcpServer:
                     "committee_attestation": dict(committee_attestation),
                 }
             )
-            if (
-                strat_cfg.archetype_id == StrategyArchetypeId.STAT_ARB_PAIRS
-                and strat_cfg.secondary_instrument_id
-            ):
-                sec_inst = str(strat_cfg.secondary_instrument_id).strip()
-                sec_sym = sec_inst.split(".", 1)[0].strip().upper()
-                sec_side = (
-                    PlanSide.SHORT if sized_envelope.side == PlanSide.LONG else PlanSide.LONG
-                )
-                enriched_trace.setdefault("secondary_instrument_id", sec_inst)
-                enriched_trace.setdefault("secondary_symbol", sec_sym)
-                enriched_trace.setdefault("secondary_side", sec_side.value)
-                enriched_trace.setdefault("register_secondary_hedge_envelope", True)
             item_contract = self._make_plan_item_contract(
                 symbol=sym,
                 strategy_config=strat_cfg,
@@ -807,17 +797,10 @@ class NautilusMcpServer:
         )
 
         if self._dsn is not None:
-            db_items = list(locked_items)
-            existing_db_syms = {it.symbol for it in db_items}
-            for item_contract in locked_items:
-                sec_item = build_stat_arb_secondary_plan_item(item_contract)
-                if sec_item is not None and sec_item.symbol not in existing_db_syms:
-                    db_items.append(sec_item)
-                    existing_db_syms.add(sec_item.symbol)
             repo = PlanContractRepository(dsn=self._dsn)
             resolved_plan_uuid = repo.create_and_lock_trading_plan(
                 trading_date=resolved_date,
-                items=db_items,
+                items=list(locked_items),
                 total_equity_usd=resolved_equity_dec,
                 market=str(market or "US_EQUITY").strip().upper(),
                 summary=str(committee_attestation.get("portfolio_chair_decision", "LOCKED")),
@@ -1078,11 +1061,16 @@ class NautilusMcpServer:
         *,
         trading_date: Optional[date] = None,
         bar_timeframe: str = "15m",
+        archetype_id: Optional[StrategyArchetypeId | str] = None,
     ) -> PlanRiskEnvelope:
         risk_cfg = self._system_config.risk
         exec_cfg = self._system_config.execution
         default_collar_pct = Decimal(str(exec_cfg.limit_collar_pct))
-        default_collar_atr = Decimal(str(exec_cfg.limit_collar_atr))
+        default_collar_atr = (
+            default_limit_collar_atr_for_archetype(archetype_id)
+            if archetype_id is not None
+            else Decimal(str(exec_cfg.limit_collar_atr))
+        )
         risk_per_trade_frac = Decimal(str(risk_cfg.risk_per_trade_pct)) / Decimal("100")
         max_single_name_frac = Decimal(str(risk_cfg.max_single_name_pct)) / Decimal("100")
         ttl_bars = max(1, int(exec_cfg.entry_ttl_bars))
