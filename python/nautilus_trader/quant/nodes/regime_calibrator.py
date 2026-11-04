@@ -332,6 +332,18 @@ class FrozenRegimeParamRecord:
             "limit_collar_pct": str(self.limit_collar_pct),
         }
 
+    @property
+    def strategy_archetype(self) -> str:
+        return (
+            self.archetype_id.value
+            if isinstance(self.archetype_id, StrategyArchetypeId)
+            else str(self.archetype_id)
+        )
+
+    @property
+    def strategy_config_json(self) -> Dict[str, Any]:
+        return self.to_params_dict()
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             "vol_bucket": self.vol_bucket.value,
@@ -636,12 +648,13 @@ class FrozenRegimeParamTable:
         finally:
             conn.close()
 
-    def list_all(self) -> List[FrozenRegimeParamRecord]:
+    def list_all(self, *, active_only: bool = False) -> List[FrozenRegimeParamRecord]:
         conn = self._connect()
         try:
             with conn.cursor() as cur:
+                where_clause = "WHERE is_active = TRUE" if active_only else ""
                 cur.execute(
-                    """
+                    f"""
                     SELECT
                         vol_bucket,
                         liq_bucket,
@@ -666,6 +679,7 @@ class FrozenRegimeParamTable:
                         pooled_expectancy_r,
                         is_active
                     FROM frozen_regime_param_table
+                    {where_clause}
                     ORDER BY vol_bucket, liq_bucket, dominant_style
                     """
                 )

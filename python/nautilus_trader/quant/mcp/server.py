@@ -553,6 +553,7 @@ class NautilusMcpServer:
             "symbol": sym,
             "archetype_id": strat_cfg.archetype_id.value,
             "strategy_fingerprint": fp,
+            "backtest_attestation_id": f"bt-{fp[:16]}",
             "passed": report.passed,
             "falsification_token": token,
             "report": report.to_dict(),
@@ -574,8 +575,25 @@ class NautilusMcpServer:
         if not isinstance(committee_attestation, dict):
             raise McpPlanLockRejectedError("committee_attestation must be a dictionary")
         all_candidates_vetoed = bool(committee_attestation.get("all_candidates_vetoed", False))
-        if not validated_items and not all_candidates_vetoed:
+        att_k_max = committee_attestation.get("k_max")
+        att_m_regime = committee_attestation.get("m_regime")
+        att_macro_regime = str(committee_attestation.get("macro_regime") or "").strip().upper()
+        if att_k_max is not None and (int(att_k_max) < 0 or int(att_k_max) > 2):
+            raise McpPlanLockRejectedError(f"k_max must be in [0, 2], got {att_k_max}")
+        if att_m_regime is not None and (float(att_m_regime) < 0.0 or float(att_m_regime) > 1.0):
+            raise McpPlanLockRejectedError(f"m_regime must be in [0.0, 1.0], got {att_m_regime}")
+        l0_zero_quota = (
+            (att_k_max is not None and int(att_k_max) == 0)
+            or (att_m_regime is not None and float(att_m_regime) == 0.0)
+            or att_macro_regime == "RISK_OFF_DEFENSIVE"
+        )
+        if not validated_items and not (all_candidates_vetoed or l0_zero_quota):
             raise McpPlanLockRejectedError("validated_items cannot be empty")
+        if l0_zero_quota:
+            validated_items = []
+            all_candidates_vetoed = True
+        elif att_k_max is not None and int(att_k_max) > 0:
+            validated_items = list(validated_items)[: int(att_k_max)]
 
         for req_key in REQUIRED_ATTESTATION_KEYS:
             val = str(committee_attestation.get(req_key, "") or "").strip()
@@ -709,19 +727,60 @@ class NautilusMcpServer:
                     f"{decision.reject_reason or 'ZERO_QTY'}"
                 )
 
+            raw_m_regime = (
+                raw_item.get("m_regime")
+                if raw_item.get("m_regime") is not None
+                else committee_attestation.get("m_regime", 1.0)
+            )
+            eff_m_regime = float(raw_m_regime if raw_m_regime is not None else 1.0)
+            if eff_m_regime < 0.0 or eff_m_regime > 1.0:
+                raise McpPlanLockRejectedError(f"m_regime must be in [0.0, 1.0], got {raw_m_regime}")
+            if eff_m_regime == 0.0:
+                continue
+            scaled_decision_qty = max(
+                1,
+                int(math.floor(float(decision.qty) * eff_m_regime + 1e-9)),
+            )
+            should_scale_env = eff_m_regime < 1.0 and not bool(
+                raw_item.get("_env_already_scaled_by_m_regime", False)
+            )
+            scaled_env_target_qty = (
+                Decimal(
+                    str(
+                        max(
+                            1,
+                            int(math.floor(float(req_env.target_qty) * eff_m_regime + 1e-9)),
+                        )
+                    )
+                )
+                if should_scale_env
+                else req_env.target_qty
+            )
+            scaled_env_cap_qty = (
+                Decimal(
+                    str(
+                        max(
+                            1,
+                            int(math.floor(float(req_env.approved_qty_cap) * eff_m_regime + 1e-9)),
+                        )
+                    )
+                )
+                if should_scale_env
+                else req_env.approved_qty_cap
+            )
             approved_qty_cap = min(
-                req_env.approved_qty_cap,
-                req_env.target_qty,
-                Decimal(str(int(decision.qty))),
+                scaled_env_cap_qty,
+                scaled_env_target_qty,
+                Decimal(str(scaled_decision_qty)),
             )
             if approved_qty_cap <= Decimal("0"):
                 raise McpPlanLockRejectedError(
                     f"Approved quantity cap for {sym} is non-positive: {approved_qty_cap}"
                 )
-            target_qty = min(req_env.target_qty, approved_qty_cap)
+            target_qty = min(scaled_env_target_qty, approved_qty_cap)
             raw_sized_notional = min(
                 float(req_env.target_notional_usd),
-                float(decision.notional_usd),
+                float(decision.notional_usd) * eff_m_regime,
                 float(target_qty) * entry_ref,
             )
             approved_notional = max(
@@ -731,7 +790,9 @@ class NautilusMcpServer:
             approved_risk_budget = min(
                 req_env.max_risk_budget_usd,
                 approved_notional,
-                Decimal(f"{max(decision.risk_budget_usd, decision.risk_usd, 1.0):.2f}"),
+                Decimal(
+                    f"{max(decision.risk_budget_usd * eff_m_regime, decision.risk_usd * eff_m_regime, 1.0):.2f}"
+                ),
             )
 
             sized_envelope = PlanRiskEnvelope(
@@ -750,6 +811,12 @@ class NautilusMcpServer:
                 {
                     "sector": sector,
                     "conviction": round(conviction, 4),
+                    "m_regime": round(eff_m_regime, 4),
+                    "macro_regime": str(
+                        raw_item.get("macro_regime")
+                        or committee_attestation.get("macro_regime")
+                        or "RISK_ON_EXPANSION"
+                    ),
                     "entry_reference_price": round(entry_ref, 4),
                     "falsification_token": expected_token,
                     "falsification_report": falsification_report.to_dict(),
