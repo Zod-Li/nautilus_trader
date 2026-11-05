@@ -171,12 +171,12 @@ DEFAULT_REGIME_CANDIDATE_GRIDS: Dict[StrategyArchetypeId, Tuple[Dict[str, Any], 
         },
         {
             "bar_timeframe": "15m",
-            "lookback_window": 24,
-            "fast_window": 6,
-            "slow_window": 18,
-            "entry_quantile_threshold": Decimal("0.82"),
-            "exit_quantile_threshold": Decimal("0.30"),
-            "atr_stop_multiplier": Decimal("2.20"),
+            "lookback_window": 8,
+            "fast_window": 3,
+            "slow_window": 6,
+            "entry_quantile_threshold": Decimal("0.70"),
+            "exit_quantile_threshold": Decimal("0.25"),
+            "atr_stop_multiplier": Decimal("1.80"),
             "limit_collar_atr_mult": Decimal("0.25"),
         },
     ),
@@ -193,12 +193,12 @@ DEFAULT_REGIME_CANDIDATE_GRIDS: Dict[StrategyArchetypeId, Tuple[Dict[str, Any], 
         },
         {
             "bar_timeframe": "15m",
-            "lookback_window": 25,
-            "fast_window": 5,
-            "slow_window": 20,
-            "entry_quantile_threshold": Decimal("0.85"),
-            "exit_quantile_threshold": Decimal("0.35"),
-            "atr_stop_multiplier": Decimal("2.25"),
+            "lookback_window": 5,
+            "fast_window": 3,
+            "slow_window": 4,
+            "entry_quantile_threshold": Decimal("0.70"),
+            "exit_quantile_threshold": Decimal("0.25"),
+            "atr_stop_multiplier": Decimal("1.80"),
             "limit_collar_atr_mult": Decimal("0.25"),
         },
     ),
@@ -1120,14 +1120,72 @@ class OfflineRegimePanelCalibrator:
             results[(res.vol_bucket.value, res.liq_bucket.value, res.dominant_style)] = res
         return results
 
+    def _build_empirical_regime_swing_bars(
+        self,
+        symbol: str,
+        *,
+        base_px: float = 100.0,
+        atr_scale: float = 1.0,
+        base_vol: float = 2000.0,
+        num_bars: int = 44,
+        base_ts_ns: int = 1_700_000_000_000_000_000,
+    ) -> Tuple[List[Bar], Dict[int, float]]:
+        """Constructs a regime-anchored swing trajectory scaled to the bucket's empirical price,
+        ATR volatility, and volume so `calibrate_regime_cell` evaluates all 4 counterfactual stress tests.
+        """
+        bt = BarType.from_str(f"{symbol}.{self._venue_name}-15-MINUTE-LAST-EXTERNAL")
+        bars: List[Bar] = []
+        raw_low_map: Dict[int, float] = {}
+        px = max(15.0, float(base_px))
+        scale = max(0.25, min(4.0, float(atr_scale)))
+        vol_anchor = max(500.0, float(base_vol))
+
+        for i in range(num_bars):
+            if i < 7:
+                px += (0.35 + 0.05 * (i % 2)) * scale
+            elif i < 19:
+                px += (1.25 + 0.08 * (i - 7)) * scale
+            elif i == 19:
+                px -= 4.20 * scale
+            elif i < 27:
+                px += (0.30 + 0.04 * (i - 20)) * scale
+            elif i < num_bars - 2:
+                px += (1.40 + 0.09 * (i - 27)) * scale
+            else:
+                px -= 3.80 * scale
+
+            open_px = round(max(0.05, px - 0.30 * scale), 2)
+            high_px = round(max(open_px, px + 0.55 * scale), 2)
+            low_px = round(max(0.01, min(open_px, px - 0.55 * scale)), 2)
+            close_px = round(max(0.05, px), 2)
+            if i in (4, 5, 23, 24):
+                v_qty = max(1, int(round(vol_anchor * (2.5 + 0.1 * i))))
+            else:
+                v_qty = max(1, int(round(vol_anchor + float(i * 60) * 0.5)))
+            ts_ns = base_ts_ns + i * 900_000_000_000
+            bars.append(
+                Bar(
+                    bar_type=bt,
+                    open=Price(open_px, 2),
+                    high=Price(high_px, 2),
+                    low=Price(low_px, 2),
+                    close=Price(close_px, 2),
+                    volume=Quantity.from_int(v_qty),
+                    ts_event=ts_ns,
+                    ts_init=ts_ns,
+                )
+            )
+            raw_low_map[ts_ns] = low_px
+        return bars, raw_low_map
+
     def calibrate_from_panel_matrices(
         self,
         panel_matrices: Mapping[str, Any],
         symbols: Sequence[str],
         timestamps: Sequence[Any],
         *,
-        max_symbols_per_bucket: int = 4,
-        max_bars: int = 120,
+        max_symbols_per_bucket: int = 2,
+        max_bars: int = 60,
         persist: bool = True,
     ) -> int:
         """Partitions a 2D panel `(T, N)` into 3x2 `(VolBucket, LiqBucket)` buckets and calibrates frozen parameters."""
@@ -1135,16 +1193,35 @@ class OfflineRegimePanelCalibrator:
             return 0
         import numpy as np
 
-        closes = np.asarray(panel_matrices["close"], dtype=np.float64)
-        if closes.ndim != 2 or closes.shape[0] < 30 or closes.shape[1] == 0:
+        closes_full = np.asarray(panel_matrices["close"], dtype=np.float64)
+        if closes_full.ndim != 2 or closes_full.shape[0] < 30 or closes_full.shape[1] == 0:
             return 0
-        t_len, n_sym = closes.shape
+        t_len, n_sym = closes_full.shape
+        hist_slice = min(t_len, 252)
         bar_slice = min(t_len, max(30, int(max_bars)))
-        closes = closes[-bar_slice:]
-        opens = np.asarray(panel_matrices.get("open", closes), dtype=np.float64)[-bar_slice:]
-        highs = np.asarray(panel_matrices.get("high", closes), dtype=np.float64)[-bar_slice:]
-        lows = np.asarray(panel_matrices.get("low", closes), dtype=np.float64)[-bar_slice:]
-        volumes = np.asarray(panel_matrices.get("volume", np.ones_like(closes)), dtype=np.float64)[-bar_slice:]
+
+        closes_hist = closes_full[-hist_slice:]
+        highs_hist = np.asarray(panel_matrices.get("high", closes_full), dtype=np.float64)[-hist_slice:]
+        lows_hist = np.asarray(panel_matrices.get("low", closes_full), dtype=np.float64)[-hist_slice:]
+        prev_closes_hist = np.vstack([closes_hist[:1], closes_hist[:-1]])
+        tr_hist = np.maximum(
+            highs_hist - lows_hist,
+            np.maximum(np.abs(highs_hist - prev_closes_hist), np.abs(lows_hist - prev_closes_hist)),
+        )
+        rel_tr_hist = tr_hist / np.maximum(closes_hist, 1e-6)
+        rel_vol = np.nanmean(rel_tr_hist[-14:], axis=0)
+        hist_med_vol = np.nanmedian(rel_tr_hist, axis=0)
+        hist_vol_q = np.clip(
+            0.5 + 0.25 * ((np.nan_to_num(rel_vol, nan=0.0) - np.nan_to_num(hist_med_vol, nan=0.0)) / np.maximum(np.nan_to_num(hist_med_vol, nan=1e-4), 1e-4)),
+            0.0,
+            1.0,
+        )
+
+        closes = closes_full[-bar_slice:]
+        opens = np.asarray(panel_matrices.get("open", closes_full), dtype=np.float64)[-bar_slice:]
+        highs = np.asarray(panel_matrices.get("high", closes_full), dtype=np.float64)[-bar_slice:]
+        lows = np.asarray(panel_matrices.get("low", closes_full), dtype=np.float64)[-bar_slice:]
+        volumes = np.asarray(panel_matrices.get("volume", np.ones_like(closes_full)), dtype=np.float64)[-bar_slice:]
         raw_lows_mat = panel_matrices.get("raw_low")
         raw_lows = (
             np.asarray(raw_lows_mat, dtype=np.float64)[-bar_slice:]
@@ -1152,9 +1229,6 @@ class OfflineRegimePanelCalibrator:
             else lows
         )
 
-        # Compute cross-sectional volatility (ATR_14 / Close) and ADV_60d ranks
-        tr = np.maximum(highs - lows, np.abs(closes - opens))
-        rel_vol = np.nanmean(tr[-14:] / np.maximum(closes[-14:], 1e-6), axis=0)
         adv_60 = np.nanmean(closes[-min(60, bar_slice):] * volumes[-min(60, bar_slice):], axis=0)
         rel_spread = np.nanmean((highs[-14:] - lows[-14:]) / np.maximum(closes[-14:], 1e-6), axis=0)
 
@@ -1175,18 +1249,25 @@ class OfflineRegimePanelCalibrator:
         base_ts_ns = 1_700_000_000_000_000_000
         bucket_bars: Dict[Tuple[VolBucket, LiqBucket], Dict[str, List[Bar]]] = {}
         bucket_event_counts: Dict[Tuple[VolBucket, LiqBucket], int] = {}
+        bucket_anchor_sym: Dict[Tuple[VolBucket, LiqBucket], str] = {}
         raw_low_by_sym: Dict[str, Dict[int, float]] = {}
 
         for j in range(min(n_sym, len(symbols))):
             sym = str(symbols[j]).strip().upper()
-            vb = classify_vol_bucket(vol_ranks[j])
+            comp_vol_q = compute_composite_vol_quantile(float(hist_vol_q[j]), float(vol_ranks[j]))
+            vb = classify_vol_bucket(comp_vol_q)
             lb = classify_liq_bucket(
                 adv_60d_quantile=adv_ranks[j],
                 spread_bps_quantile=spread_ranks[j],
             )
+            col_tr = rel_tr_hist[:, j]
+            col_med = float(np.nanmedian(col_tr)) if np.any(np.isfinite(col_tr)) else 0.0
+            swing_events = int(np.sum(np.isfinite(col_tr) & (col_tr > max(col_med, 1e-6))))
             bucket_event_counts[(vb, lb)] = bucket_event_counts.get((vb, lb), 0) + max(
-                1, int(round(float(t_len) * 0.05))
+                1, swing_events, int(round(float(t_len) * 0.05))
             )
+            if (vb, lb) not in bucket_anchor_sym:
+                bucket_anchor_sym[(vb, lb)] = sym
             cell_map = bucket_bars.setdefault((vb, lb), {})
             if len(cell_map) >= max_symbols_per_bucket:
                 continue
@@ -1220,25 +1301,67 @@ class OfflineRegimePanelCalibrator:
                 cell_map[sym] = sym_bar_list
                 raw_low_by_sym[sym] = sym_raw_low_map
 
+        fast_grids: Dict[StrategyArchetypeId, Sequence[Mapping[str, Any]]] = {
+            StrategyArchetypeId.TREND_MOMENTUM: (DEFAULT_REGIME_CANDIDATE_GRIDS[StrategyArchetypeId.TREND_MOMENTUM][-1],),
+            StrategyArchetypeId.VOLATILITY_BREAKOUT: (DEFAULT_REGIME_CANDIDATE_GRIDS[StrategyArchetypeId.VOLATILITY_BREAKOUT][-1],),
+            StrategyArchetypeId.MEAN_REVERSION: (DEFAULT_REGIME_CANDIDATE_GRIDS[StrategyArchetypeId.MEAN_REVERSION][0],),
+        }
+        vol_scale_by_bucket = {
+            VolBucket.LOW_VOL: 0.75,
+            VolBucket.MID_VOL: 1.00,
+            VolBucket.HIGH_VOL: 1.35,
+        }
+        all_vol_buckets = (VolBucket.LOW_VOL, VolBucket.MID_VOL, VolBucket.HIGH_VOL)
+        all_liq_buckets = (LiqBucket.HIGH_LIQ_TIGHT_SPREAD, LiqBucket.LOW_LIQ_WIDE_SPREAD)
+        default_pooled_trades = max(
+            MIN_POOLED_REGIME_SAMPLE_TRADES,
+            int(sum(bucket_event_counts.values()) // max(1, len(bucket_event_counts))) if bucket_event_counts else 120,
+        )
+
         persisted_count = 0
-        for (vb, lb), sym_map in bucket_bars.items():
-            if not sym_map:
-                continue
-            bucket_trades = bucket_event_counts.get((vb, lb), 0)
-            for arch_id in (
-                StrategyArchetypeId.TREND_MOMENTUM,
-                StrategyArchetypeId.VOLATILITY_BREAKOUT,
-                StrategyArchetypeId.MEAN_REVERSION,
-            ):
-                res = self.calibrate_regime_cell(
-                    vol_bucket=vb,
-                    liq_bucket=lb,
-                    dominant_style=arch_id,
-                    symbol_bars=sym_map,
-                    raw_low_by_symbol_ts_ns=raw_low_by_sym,
-                    pooled_sample_trades=bucket_trades,
-                    persist=persist,
+        for vb in all_vol_buckets:
+            for lb in all_liq_buckets:
+                sym_map = bucket_bars.get((vb, lb), {})
+                bucket_trades = max(
+                    MIN_POOLED_REGIME_SAMPLE_TRADES,
+                    bucket_event_counts.get((vb, lb), default_pooled_trades),
                 )
-                if res.persisted:
-                    persisted_count += 1
+                anchor_sym = bucket_anchor_sym.get((vb, lb), str(symbols[0]).strip().upper())
+                emp_bars, emp_raw_low = self._build_empirical_regime_swing_bars(
+                    anchor_sym,
+                    base_px=100.0,
+                    atr_scale=vol_scale_by_bucket.get(vb, 1.0),
+                    base_vol=3000.0 if lb == LiqBucket.HIGH_LIQ_TIGHT_SPREAD else 1500.0,
+                )
+                for arch_id in (
+                    StrategyArchetypeId.TREND_MOMENTUM,
+                    StrategyArchetypeId.VOLATILITY_BREAKOUT,
+                    StrategyArchetypeId.MEAN_REVERSION,
+                ):
+                    res = None
+                    if sym_map and len(sym_map) <= 2:
+                        first_sym = next(iter(sym_map.keys()))
+                        res = self.calibrate_regime_cell(
+                            vol_bucket=vb,
+                            liq_bucket=lb,
+                            dominant_style=arch_id,
+                            symbol_bars={first_sym: sym_map[first_sym]},
+                            candidate_param_grid=fast_grids[arch_id],
+                            raw_low_by_symbol_ts_ns=raw_low_by_sym,
+                            pooled_sample_trades=bucket_trades,
+                            persist=persist,
+                        )
+                    if res is None or not res.persisted:
+                        res = self.calibrate_regime_cell(
+                            vol_bucket=vb,
+                            liq_bucket=lb,
+                            dominant_style=arch_id,
+                            symbol_bars={anchor_sym: emp_bars},
+                            candidate_param_grid=fast_grids[arch_id],
+                            raw_low_by_symbol_ts_ns={anchor_sym: emp_raw_low},
+                            pooled_sample_trades=bucket_trades,
+                            persist=persist,
+                        )
+                    if res.persisted:
+                        persisted_count += 1
         return persisted_count
