@@ -814,12 +814,12 @@ class OfflineRegimePanelCalibrator:
         floor_px = min(lows) if lows else ref_px
         stop_px = max(0.01, floor_px - float(atr_mult) * max(emp_atr, 0.01))
         target_qty = Decimal(str(params.get("target_qty", "20")))
-        target_notional = Decimal(f"{float(target_qty) * ref_px * 1.5:.2f}")
+        target_notional = Decimal(f"{max(5000.0, float(target_qty) * max(highs or [ref_px]) * 1.5):.2f}")
         max_risk_budget = Decimal(
             str(
                 params.get(
                     "max_risk_budget_usd",
-                    f"{max(2500.0, float(target_qty) * ref_px * 0.50):.2f}",
+                    f"{min(float(target_notional), max(2500.0, float(target_qty) * ref_px * 0.50)):.2f}",
                 )
             )
         )
