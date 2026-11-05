@@ -1307,7 +1307,7 @@ class OfflineRegimePanelCalibrator:
             StrategyArchetypeId.MEAN_REVERSION: (DEFAULT_REGIME_CANDIDATE_GRIDS[StrategyArchetypeId.MEAN_REVERSION][0],),
         }
         vol_scale_by_bucket = {
-            VolBucket.LOW_VOL: 0.75,
+            VolBucket.LOW_VOL: 0.90,
             VolBucket.MID_VOL: 1.00,
             VolBucket.HIGH_VOL: 1.35,
         }
@@ -1331,13 +1331,18 @@ class OfflineRegimePanelCalibrator:
                     anchor_sym,
                     base_px=100.0,
                     atr_scale=vol_scale_by_bucket.get(vb, 1.0),
-                    base_vol=3000.0 if lb == LiqBucket.HIGH_LIQ_TIGHT_SPREAD else 1500.0,
+                    base_vol=3000.0 if lb == LiqBucket.HIGH_LIQ_TIGHT_SPREAD else 2000.0,
                 )
                 for arch_id in (
                     StrategyArchetypeId.TREND_MOMENTUM,
                     StrategyArchetypeId.VOLATILITY_BREAKOUT,
                     StrategyArchetypeId.MEAN_REVERSION,
                 ):
+                    if persist and self._param_table is not None:
+                        existing_rec = self._param_table.get_frozen_params(vb, lb, arch_id)
+                        if existing_rec is not None and existing_rec.stress_passed:
+                            persisted_count += 1
+                            continue
                     res = None
                     if sym_map and len(sym_map) <= 2:
                         first_sym = next(iter(sym_map.keys()))
