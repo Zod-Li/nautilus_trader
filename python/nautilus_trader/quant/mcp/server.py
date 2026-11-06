@@ -79,15 +79,50 @@ REQUIRED_ATTESTATION_KEYS: Tuple[str, ...] = (
 )
 
 
+def _canonicalize_risk_envelope(
+    risk_envelope: PlanRiskEnvelope | Mapping[str, Any],
+) -> Dict[str, Any]:
+    if isinstance(risk_envelope, PlanRiskEnvelope):
+        raw = risk_envelope.to_dict()
+    else:
+        raw = dict(risk_envelope)
+    collar = raw.get("collar")
+    collar_dict = (
+        {
+            "max_slippage_bps": str(Decimal(str(collar.get("max_slippage_bps", "0")))),
+            "max_atr_fraction": str(Decimal(str(collar.get("max_atr_fraction", "0")))),
+        }
+        if isinstance(collar, Mapping)
+        else None
+    )
+    return {
+        "side": str(raw.get("side", "LONG")).strip().upper(),
+        "target_qty": str(Decimal(str(raw.get("target_qty", "0")))),
+        "approved_qty_cap": str(Decimal(str(raw.get("approved_qty_cap", "0")))),
+        "target_notional_usd": str(Decimal(str(raw.get("target_notional_usd", "0")))),
+        "max_risk_budget_usd": str(Decimal(str(raw.get("max_risk_budget_usd", "0")))),
+        "initial_stop_price": str(Decimal(str(raw.get("initial_stop_price", "0")))),
+        "take_profit_price": (
+            str(Decimal(str(raw["take_profit_price"])))
+            if raw.get("take_profit_price") is not None
+            else None
+        ),
+        "collar": collar_dict,
+    }
+
+
 def compute_strategy_fingerprint(
     symbol: str,
     strategy_config: ArchetypeStrategyConfig,
+    risk_envelope: Optional[PlanRiskEnvelope | Mapping[str, Any]] = None,
 ) -> str:
-    """Computes a canonical SHA-256 fingerprint for `(symbol, strategy_config)`."""
-    canonical = {
+    """Computes a canonical SHA-256 fingerprint for `(symbol, strategy_config[, risk_envelope])`."""
+    canonical: Dict[str, Any] = {
         "symbol": symbol.strip().upper(),
         "strategy_config": strategy_config.to_dict(),
     }
+    if risk_envelope is not None:
+        canonical["risk_envelope"] = _canonicalize_risk_envelope(risk_envelope)
     raw = json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(raw).hexdigest()
 
@@ -146,6 +181,7 @@ class NautilusMcpServer:
         self._cumulative_trials: int = 0
         self._verified_backtests: Dict[str, IsomorphicBacktestMetrics] = {}
         self._verified_falsifications: Dict[str, Tuple[str, StressFalsificationReport]] = {}
+        self._verified_falsification_envelopes: Dict[str, PlanRiskEnvelope] = {}
 
     @property
     def allowed_tools(self) -> List[str]:
@@ -542,7 +578,8 @@ class NautilusMcpServer:
             equities=equities,
             effective_trials=eff_trials,
         )
-        fp = compute_strategy_fingerprint(sym, strat_cfg)
+        fp = compute_strategy_fingerprint(sym, strat_cfg, risk_envelope=env)
+        base_fp = compute_strategy_fingerprint(sym, strat_cfg)
         with self._lock:
             prev_entry = self._verified_falsifications.get(fp)
             if report.passed:
@@ -552,19 +589,14 @@ class NautilusMcpServer:
                     else ""
                 )
                 token = prev_tok or f"falsified-{fp[:16]}-{uuid.uuid4().hex[:8]}"
-                self._verified_backtests[fp] = report.baseline_metrics
-                self._verified_falsifications[fp] = (token, report)
-            elif (
-                prev_entry is not None
-                and prev_entry[1].passed
-                and effective_trials is None
-                and int(lookback_days) == 60
-            ):
-                token, report = prev_entry
             else:
                 token = ""
-                self._verified_backtests[fp] = report.baseline_metrics
-                self._verified_falsifications[fp] = (token, report)
+            self._verified_backtests[fp] = report.baseline_metrics
+            self._verified_backtests[base_fp] = report.baseline_metrics
+            self._verified_falsifications[fp] = (token, report)
+            self._verified_falsifications[base_fp] = (token, report)
+            self._verified_falsification_envelopes[fp] = env
+            self._verified_falsification_envelopes[base_fp] = env
 
         return {
             "symbol": sym,
@@ -680,10 +712,18 @@ class NautilusMcpServer:
                 bar_timeframe=strat_cfg.bar_timeframe,
                 archetype_id=strat_cfg.archetype_id,
             )
-            fp = compute_strategy_fingerprint(sym, strat_cfg)
+            fp = compute_strategy_fingerprint(sym, strat_cfg, risk_envelope=req_env)
+            base_fp = compute_strategy_fingerprint(sym, strat_cfg)
 
             with self._lock:
-                falsification_entry = self._verified_falsifications.get(fp)
+                falsification_entry = (
+                    self._verified_falsifications.get(fp)
+                    or self._verified_falsifications.get(base_fp)
+                )
+                falsified_env = (
+                    self._verified_falsification_envelopes.get(fp)
+                    or self._verified_falsification_envelopes.get(base_fp)
+                )
 
             if falsification_entry is None:
                 raise McpPlanLockRejectedError(
@@ -696,6 +736,28 @@ class NautilusMcpServer:
                     f"Candidate {sym} ({arch_id}) FAILED run_stress_falsification: "
                     f"{list(falsification_report.failure_reasons)}"
                 )
+            if falsified_env is not None:
+                falsified_env_fp = compute_strategy_fingerprint(
+                    sym, strat_cfg, risk_envelope=falsified_env
+                )
+                if fp != falsified_env_fp:
+                    is_valid_regime_downscale = (
+                        bool(raw_item.get("_env_already_scaled_by_m_regime", False))
+                        and 0.0 < eff_m_regime < 1.0
+                        and req_env.side == falsified_env.side
+                        and req_env.initial_stop_price == falsified_env.initial_stop_price
+                        and req_env.take_profit_price == falsified_env.take_profit_price
+                        and req_env.collar == falsified_env.collar
+                        and req_env.target_qty <= falsified_env.target_qty
+                        and req_env.approved_qty_cap <= falsified_env.approved_qty_cap
+                        and req_env.target_notional_usd <= falsified_env.target_notional_usd
+                        and req_env.max_risk_budget_usd <= falsified_env.max_risk_budget_usd
+                    )
+                    if not is_valid_regime_downscale:
+                        raise McpPlanLockRejectedError(
+                            f"Candidate {sym} ({arch_id}) risk_envelope does not match "
+                            f"falsified risk_envelope (fingerprint={fp[:12]} vs {falsified_env_fp[:12]})"
+                        )
             provided_token = str(raw_item.get("falsification_token", "") or "").strip()
             if provided_token and provided_token != expected_token:
                 raise McpPlanLockRejectedError(

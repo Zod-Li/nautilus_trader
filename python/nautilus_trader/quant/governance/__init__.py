@@ -9,7 +9,6 @@ from nautilus_trader.quant.governance.plan_gate import (
     PlanGateExecAlgorithmConfig,
     PlanGateOrderRequest,
     PostgresPlanGateBackend,
-    SnapshotPlanGateBackend,
     evaluate_entry_against_envelope,
 )
 from nautilus_trader.quant.governance.telemetry_actor import (
@@ -40,6 +39,5 @@ __all__ = [
     "PostgresTelemetryActorConfig",
     "ProtectiveOcoMonitor",
     "ProtectiveOrderCoverage",
-    "SnapshotPlanGateBackend",
     "evaluate_entry_against_envelope",
 ]

@@ -198,7 +198,7 @@ class _TrackedEntryReservation:
 
 
 class PlanGateBackend(Protocol):
-    """Protocol implemented by `PostgresPlanGateBackend` and `SnapshotPlanGateBackend`."""
+    """Protocol implemented by `PostgresPlanGateBackend`."""
 
     def evaluate_and_reserve(self, request: PlanGateOrderRequest) -> PlanGateDecision:
         """Evaluate pre-trade admission and atomically reserve capacity on approval."""
@@ -245,217 +245,6 @@ def evaluate_entry_against_envelope(
         engine.upsert_plan_item(_plan_item_to_rust_envelope(adjusted_item), False)
     rust_decision = engine.evaluate_and_reserve(request.to_rust_request())
     return PlanGateDecision.from_rust_decision(rust_decision)
-
-
-class SnapshotPlanGateBackend:
-    """High-speed deterministic backend backed by `RustPlanGateEngine` for `BacktestEngine`."""
-
-    def __init__(
-        self,
-        plan_items: Sequence[PlanItemContract] = (),
-        entry_freeze: bool = False,
-        entry_freeze_reason: str = "",
-        trading_date: Optional[date] = None,
-        allow_multi_cycle_reentry: bool = True,
-        auto_register_stat_arb_secondary: bool = True,
-    ) -> None:
-        self._rust_engine = RustPlanGateEngine(bool(entry_freeze), str(entry_freeze_reason))
-        self._trading_date: Optional[date] = trading_date
-        self._allow_multi_cycle_reentry: bool = bool(allow_multi_cycle_reentry)
-        self._auto_register_stat_arb_secondary: bool = bool(
-            auto_register_stat_arb_secondary
-        )
-        self._removed_symbols: set[str] = set()
-        self._items_by_symbol: Dict[str, PlanItemContract] = {}
-        self._alerts: List[Dict[str, Any]] = []
-        for item in plan_items:
-            self.upsert_plan_item(item)
-
-    @property
-    def trading_date(self) -> Optional[date]:
-        return self._trading_date
-
-    def set_trading_date(
-        self,
-        trading_date: date,
-        *,
-        clear_runtime_items: bool = True,
-        sync: bool = True,
-    ) -> None:
-        _ = (clear_runtime_items, sync)
-        self._trading_date = trading_date
-
-    @property
-    def rust_engine(self) -> RustPlanGateEngine:
-        return self._rust_engine
-
-    @property
-    def entry_freeze(self) -> bool:
-        return self._rust_engine.entry_freeze
-
-    def set_entry_freeze(
-        self,
-        active: bool,
-        reason: str = "",
-        updated_by: str = "nautilus:plan_gate",
-    ) -> None:
-        _ = updated_by
-        self._rust_engine.set_entry_freeze(bool(active), str(reason))
-
-    def upsert_plan_item(
-        self,
-        item: PlanItemContract,
-    ) -> None:
-        self._removed_symbols.discard(item.symbol)
-        self._items_by_symbol[item.symbol] = item
-        self._rust_engine.upsert_plan_item(_plan_item_to_rust_envelope(item), False)
-
-    def upsert_runtime_plan_item(
-        self,
-        item: PlanItemContract,
-        *,
-        reserved_qty: Optional[Decimal] = None,
-        preserve_higher_reservation: bool = False,
-    ) -> None:
-        adjusted_item = (
-            replace(item, filled_qty=reserved_qty)
-            if reserved_qty is not None
-            else item
-        )
-        self._removed_symbols.discard(adjusted_item.symbol)
-        self._items_by_symbol[adjusted_item.symbol] = adjusted_item
-        self._rust_engine.upsert_plan_item(
-            _plan_item_to_rust_envelope(adjusted_item),
-            bool(preserve_higher_reservation),
-        )
-
-    def remove_runtime_plan_item(self, symbol: str) -> None:
-        norm_sym = str(symbol or "").split(".", 1)[0].strip().upper()
-        if not norm_sym:
-            return
-        self._removed_symbols.add(norm_sym)
-        self._items_by_symbol.pop(norm_sym, None)
-        prev_res = {
-            s: Decimal(self._rust_engine.reserved_qty(s))
-            for s in self._items_by_symbol
-        }
-        self._rust_engine.clear_plan_items()
-        for s, item in list(self._items_by_symbol.items()):
-            preserved = max(item.filled_qty, prev_res.get(s, Decimal("0")))
-            adjusted = replace(item, filled_qty=preserved)
-            self._items_by_symbol[s] = adjusted
-            self._rust_engine.upsert_plan_item(
-                _plan_item_to_rust_envelope(adjusted),
-                False,
-            )
-
-    def get_plan_item(self, symbol: str) -> Optional[PlanItemContract]:
-        norm_sym = str(symbol or "").split(".", 1)[0].strip().upper()
-        return self._items_by_symbol.get(norm_sym)
-
-    get_plan_item_for_instrument = get_plan_item
-
-    def reserved_qty(self, symbol: str) -> Decimal:
-        norm_sym = str(symbol or "").split(".", 1)[0].strip().upper()
-        return Decimal(self._rust_engine.reserved_qty(norm_sym))
-
-    @property
-    def alerts(self) -> List[Dict[str, Any]]:
-        return list(self._alerts)
-
-    def evaluate_and_reserve(self, request: PlanGateOrderRequest) -> PlanGateDecision:
-        rust_decision = self._rust_engine.evaluate_and_reserve(request.to_rust_request())
-        decision = PlanGateDecision.from_rust_decision(rust_decision)
-        if decision.allowed and not decision.is_exit_bypass:
-            item = self._items_by_symbol.get(request.symbol)
-            if item is not None and item.status == "ARMED":
-                self._items_by_symbol[request.symbol] = replace(item, status="TRIGGERED")
-        elif not decision.allowed:
-            self._alerts.append(
-                {
-                    "event_type": "PLAN_GATE_ORDER_DENIED",
-                    "severity": "CRITICAL" if self.entry_freeze else "WARN",
-                    "source": "nautilus:plan_gate",
-                    "title": f"PlanGate denied {request.order_side} {request.symbol}",
-                    "body": decision.reason or "PLAN_GATE_DENIED",
-                    "payload": {
-                        "client_order_id": request.client_order_id,
-                        "strategy_id": request.strategy_id,
-                        "instrument_id": request.instrument_id,
-                        "symbol": request.symbol,
-                        "quantity": str(request.quantity),
-                        "reason": decision.reason,
-                    },
-                }
-            )
-        self._rust_engine.drain_pending_mutations(64)
-        return decision
-
-    def release_reservation(
-        self,
-        symbol: str = "",
-        quantity: Optional[Decimal | int | float | str] = None,
-        *,
-        release_qty: Optional[Decimal | int | float | str] = None,
-        plan_id: Optional[UUID | str] = None,
-        item_id: Optional[UUID | str] = None,
-        reason: str = "",
-    ) -> None:
-        _ = (plan_id, reason)
-        raw_qty = release_qty if release_qty is not None else quantity
-        if raw_qty is None:
-            return
-        qty_dec = _to_decimal(raw_qty, "quantity")
-        if qty_dec <= Decimal("0"):
-            return
-        resolved_symbol = str(symbol or "").strip().upper()
-        if not resolved_symbol and item_id is not None:
-            target_id = str(item_id)
-            for item in self._items_by_symbol.values():
-                if str(item.item_id) == target_id:
-                    resolved_symbol = item.symbol
-                    break
-        if not resolved_symbol:
-            return
-        self._rust_engine.release_reservation(resolved_symbol, str(qty_dec))
-        self._rust_engine.drain_pending_mutations(64)
-
-    def release_closed_position_capacity(
-        self,
-        symbol: UUID | str = "",
-        *,
-        item_id: Optional[UUID | str] = None,
-    ) -> None:
-        """Releases consumed entry capacity in the backtest snapshot sandbox when a position closes flat."""
-        if not self._allow_multi_cycle_reentry:
-            return
-        raw_arg = str(symbol or "").strip()
-        resolved_symbol = raw_arg.upper()
-        if resolved_symbol and resolved_symbol not in self._items_by_symbol:
-            for item in self._items_by_symbol.values():
-                if str(item.item_id) == raw_arg:
-                    resolved_symbol = item.symbol
-                    break
-        if (not resolved_symbol or resolved_symbol not in self._items_by_symbol) and item_id is not None:
-            target_id = str(item_id).strip()
-            for item in self._items_by_symbol.values():
-                if str(item.item_id) == target_id:
-                    resolved_symbol = item.symbol
-                    break
-        if not resolved_symbol or resolved_symbol not in self._items_by_symbol:
-            return
-        cur_reserved = self.reserved_qty(resolved_symbol)
-        if cur_reserved > Decimal("0"):
-            self._rust_engine.release_reservation(resolved_symbol, str(cur_reserved))
-            self._rust_engine.drain_pending_mutations(64)
-        item = self._items_by_symbol.get(resolved_symbol)
-        if item is not None:
-            reset_item = replace(item, filled_qty=Decimal("0"), status="ARMED")
-            self._items_by_symbol[resolved_symbol] = reset_item
-            self._rust_engine.upsert_plan_item(
-                _plan_item_to_rust_envelope(reset_item),
-                False,
-            )
 
 
 class _AsyncPlanGateDbWorker:
@@ -901,34 +690,55 @@ class PostgresPlanGateBackend:
         market: str = "US_EQUITY",
         connect_timeout_secs: int = 3,
         eager_flush: bool = False,
+        *,
+        plan_items: Sequence[PlanItemContract] = (),
+        entry_freeze: bool = False,
+        entry_freeze_reason: str = "",
+        persist_to_db: bool = True,
+        allow_multi_cycle_reentry: bool = False,
     ) -> None:
-        self._dsn = resolve_database_dsn(dsn)
+        self._persist_to_db = bool(persist_to_db)
+        self._allow_multi_cycle_reentry = bool(allow_multi_cycle_reentry)
+        self._dsn = (
+            resolve_database_dsn(dsn)
+            if (self._persist_to_db or dsn is not None)
+            else ""
+        )
         self._trading_date = trading_date
         self._market = market
         self._connect_timeout_secs = max(1, int(connect_timeout_secs))
         self._eager_flush = bool(eager_flush)
-        self._rust_engine = RustPlanGateEngine(False, "")
+        init_freeze = bool(entry_freeze)
+        init_reason = str(entry_freeze_reason or ("ENTRY_FREEZE" if init_freeze else ""))
+        self._rust_engine = RustPlanGateEngine(init_freeze, init_reason)
         self._listen_conn: Optional[Any] = None
         self._sync_lock = threading.Lock()
-        self._monotonic_freeze_latched: bool = False
-        self._monotonic_freeze_reason: str = ""
+        self._monotonic_freeze_latched: bool = init_freeze
+        self._monotonic_freeze_reason: str = init_reason
         self._db_freeze_persisted: bool = False
         self._known_symbols: set[str] = set()
         self._symbol_by_item_id: Dict[str, str] = {}
         self._items_by_symbol: Dict[str, PlanItemContract] = {}
         self._runtime_items_by_symbol: Dict[str, Tuple[PlanItemContract, Optional[Decimal]]] = {}
         self._removed_runtime_symbols: set[str] = set()
-        self._async_writer = _AsyncPlanGateDbWorker(
-            dsn=self._dsn,
-            market=self._market,
-            trading_date=self._trading_date,
-            connect_timeout_secs=self._connect_timeout_secs,
-            rust_engine=self._rust_engine,
-            on_write_failure=self._on_async_write_failure,
-            on_freeze_persisted=self._on_async_freeze_persisted,
-        )
-        self._db_worker = self._async_writer
-        self._initialize_sync_and_triggers()
+        self._alerts: List[Dict[str, Any]] = []
+        for item in plan_items:
+            self.upsert_runtime_plan_item(item, reserved_qty=item.filled_qty)
+        if self._persist_to_db:
+            self._async_writer: Optional[_AsyncPlanGateDbWorker] = _AsyncPlanGateDbWorker(
+                dsn=self._dsn,
+                market=self._market,
+                trading_date=self._trading_date,
+                connect_timeout_secs=self._connect_timeout_secs,
+                rust_engine=self._rust_engine,
+                on_write_failure=self._on_async_write_failure,
+                on_freeze_persisted=self._on_async_freeze_persisted,
+            )
+            self._db_worker = self._async_writer
+            self._initialize_sync_and_triggers()
+        else:
+            self._async_writer = None
+            self._db_worker = None
 
     def _on_async_write_failure(self, reason: str) -> None:
         self._monotonic_freeze_latched = True
@@ -948,6 +758,13 @@ class PostgresPlanGateBackend:
     def trading_date(self) -> Optional[date]:
         return self._trading_date
 
+    @property
+    def alerts(self) -> List[Dict[str, Any]]:
+        return list(self._alerts)
+
+    def upsert_plan_item(self, item: PlanItemContract) -> None:
+        self.upsert_runtime_plan_item(item, reserved_qty=item.filled_qty)
+
     def set_trading_date(
         self,
         trading_date: date,
@@ -957,11 +774,12 @@ class PostgresPlanGateBackend:
     ) -> None:
         """Hot-reloads `trading_date` on `PostgresPlanGateBackend` during daily rollover."""
         self._trading_date = trading_date
-        self._async_writer.set_trading_date(trading_date)
+        if self._async_writer is not None:
+            self._async_writer.set_trading_date(trading_date)
         if clear_runtime_items:
             self._runtime_items_by_symbol.clear()
             self._removed_runtime_symbols.clear()
-        if sync:
+        if sync and self._persist_to_db:
             self.sync_from_db(preserve_higher_reservation=False)
 
     def upsert_runtime_plan_item(
@@ -1064,19 +882,18 @@ class PostgresPlanGateBackend:
         self._monotonic_freeze_reason = reason_str
         self._db_freeze_persisted = False
         self._rust_engine.set_entry_freeze(True, reason_str)
-        self._async_writer.enqueue_mutations(
-            [
-                {
-                    "kind": "SET_ENTRY_FREEZE",
-                    "active": True,
-                    "reason": reason_str,
-                    "updated_by": str(updated_by or "nautilus:plan_gate"),
-                    "alert_event_type": str(alert_event_type or "PLAN_GATE_ENTRY_FREEZE"),
-                }
-            ]
-        )
-        if self._eager_flush:
-            self._async_writer.flush(timeout_secs=2.0)
+        mutation = {
+            "kind": "SET_ENTRY_FREEZE",
+            "active": True,
+            "reason": reason_str,
+            "updated_by": str(updated_by or "nautilus:plan_gate"),
+            "alert_event_type": str(alert_event_type or "PLAN_GATE_ENTRY_FREEZE"),
+        }
+        self._alerts.append(mutation)
+        if self._async_writer is not None:
+            self._async_writer.enqueue_mutations([mutation])
+            if self._eager_flush:
+                self._async_writer.flush(timeout_secs=2.0)
 
     def trigger_protective_oco_freeze(self, symbol: str, reason: str) -> None:
         """Triggered by `ProtectiveOcoMonitor` when an open position loses protective stop coverage."""
@@ -1108,6 +925,14 @@ class PostgresPlanGateBackend:
         """Atomically updates `ENTRY_FREEZE` in $O(1)$ Rust memory and persists to `system_flags`."""
         if bool(active):
             self.latch_entry_freeze(reason=reason, updated_by=updated_by)
+            return
+
+        if self._async_writer is None:
+            self._monotonic_freeze_latched = False
+            self._monotonic_freeze_reason = ""
+            self._db_freeze_persisted = False
+            self._rust_engine.set_entry_freeze(False, str(reason))
+            self._rust_engine.set_backend_unavailable(False, "")
             return
 
         if self._async_writer.has_failed_writes or self._async_writer.pending_count > 0:
@@ -1144,17 +969,21 @@ class PostgresPlanGateBackend:
 
     def flush(self, timeout_secs: float = 5.0) -> None:
         """Waits for all queued asynchronous DB writes to complete."""
-        pending = self._rust_engine.drain_pending_mutations(1024)
-        if pending:
-            self._async_writer.enqueue_mutations(pending)
-        self._async_writer.flush(timeout_secs=timeout_secs)
+        pending = list(self._rust_engine.drain_pending_mutations(1024) or [])
+        if self._async_writer is not None:
+            if pending:
+                self._async_writer.enqueue_mutations(pending)
+            self._async_writer.flush(timeout_secs=timeout_secs)
+        elif pending:
+            self._alerts.extend(pending)
 
     def close(self) -> None:
         """Flushes pending writes and closes background DB and LISTEN connections."""
-        try:
-            self._async_writer.close()
-        except Exception:
-            pass
+        if self._async_writer is not None:
+            try:
+                self._async_writer.close()
+            except Exception:
+                pass
         conn = self._listen_conn
         self._listen_conn = None
         if conn is not None:
@@ -1232,6 +1061,8 @@ class PostgresPlanGateBackend:
             )
 
     def _poll_notifications_nonblocking(self) -> None:
+        if not self._persist_to_db:
+            return
         conn = self._listen_conn
         if conn is None or getattr(conn, "closed", 1) != 0:
             return
@@ -1253,6 +1084,8 @@ class PostgresPlanGateBackend:
 
     def sync_from_db(self, preserve_higher_reservation: bool = True) -> None:
         """Synchronizes `system_flags.ENTRY_FREEZE` and locked `trading_plan_items` into `RustPlanGateEngine`."""
+        if not self._persist_to_db or self._async_writer is None:
+            return
         with self._sync_lock:
             if (
                 self._async_writer.has_failed_writes
@@ -1580,9 +1413,11 @@ class PostgresPlanGateBackend:
                 }
             )
         if pending:
-            self._async_writer.enqueue_mutations(pending)
-            if self._eager_flush:
-                self._async_writer.flush(timeout_secs=2.0)
+            self._alerts.extend(pending)
+            if self._async_writer is not None:
+                self._async_writer.enqueue_mutations(pending)
+                if self._eager_flush:
+                    self._async_writer.flush(timeout_secs=2.0)
 
         return decision
 
@@ -1610,11 +1445,13 @@ class PostgresPlanGateBackend:
         if not resolved_symbol:
             return
         self._rust_engine.release_reservation(resolved_symbol, str(qty_dec))
-        pending = self._rust_engine.drain_pending_mutations(64)
+        pending = list(self._rust_engine.drain_pending_mutations(64) or [])
         if pending:
-            self._async_writer.enqueue_mutations(pending)
-            if self._eager_flush:
-                self._async_writer.flush(timeout_secs=2.0)
+            self._alerts.extend(pending)
+            if self._async_writer is not None:
+                self._async_writer.enqueue_mutations(pending)
+                if self._eager_flush:
+                    self._async_writer.flush(timeout_secs=2.0)
 
     def release_closed_position_capacity(
         self,
@@ -1622,8 +1459,25 @@ class PostgresPlanGateBackend:
         *,
         item_id: Optional[UUID | str] = None,
     ) -> None:
-        """No-op in live `PostgresPlanGateBackend` (single-plan cumulative cap is authoritative)."""
-        return
+        """Releases closed-cycle entry reservation in multi-cycle backtest mode; no-op in live single-plan mode."""
+        if not self._allow_multi_cycle_reentry:
+            return
+        raw_sym = str(symbol or "").strip()
+        norm_sym = raw_sym.upper()
+        if norm_sym not in self._items_by_symbol and item_id is not None:
+            norm_sym = self._symbol_by_item_id.get(str(item_id), norm_sym)
+        if norm_sym not in self._items_by_symbol:
+            norm_sym = self._symbol_by_item_id.get(raw_sym, norm_sym)
+        item = self._items_by_symbol.get(norm_sym)
+        if item is None:
+            return
+        reset_item = replace(item, filled_qty=Decimal("0"))
+        self.upsert_runtime_plan_item(
+            reset_item,
+            reserved_qty=Decimal("0"),
+            preserve_higher_reservation=False,
+        )
+        self._rust_engine.drain_pending_mutations(64)
 
 
 class PlanGateExecAlgorithmConfig(ExecutionAlgorithmConfig):
@@ -1709,12 +1563,14 @@ class PlanGateExecAlgorithm(ExecutionAlgorithm):
         *,
         telemetry_actor: Optional[Any] = None,
         oco_monitor: Optional[Any] = None,
+        forward_gate: Optional[PlanGateExecAlgorithm] = None,
     ) -> None:
         resolved_cfg = config or PlanGateExecAlgorithmConfig(
             exec_algorithm_id=PLAN_GATE_EXEC_ALGORITHM_ID,
         )
         super().__init__(resolved_cfg)
         self._backend = backend
+        self._forward_gate: Optional[PlanGateExecAlgorithm] = forward_gate
         self._collar_market_orders = bool(
             getattr(resolved_cfg, "collar_market_orders", True)
         )
@@ -1753,8 +1609,9 @@ class PlanGateExecAlgorithm(ExecutionAlgorithm):
         *,
         telemetry_actor: Optional[Any] = None,
         oco_monitor: Optional[Any] = None,
+        forward_gate: Optional[PlanGateExecAlgorithm] = None,
     ) -> PlanGateExecAlgorithm:
-        _ = (backend, telemetry_actor, oco_monitor)
+        _ = (backend, telemetry_actor, oco_monitor, forward_gate)
         resolved_cfg = config or PlanGateExecAlgorithmConfig(
             exec_algorithm_id=PLAN_GATE_EXEC_ALGORITHM_ID,
         )
@@ -2148,7 +2005,14 @@ class PlanGateExecAlgorithm(ExecutionAlgorithm):
             request = self._build_order_request(entry_order)
             if request.stop_loss_price is None and inferred_list_stop_px is not None:
                 request = replace(request, stop_loss_price=inferred_list_stop_px)
-            decision = self._backend.evaluate_and_reserve(request)
+            if self._forward_gate is not None:
+                self._sync_forward_gate_runtime()
+                decision = self._forward_gate.evaluate_order(
+                    entry_order,
+                    inferred_stop_loss_price=inferred_list_stop_px,
+                )
+            else:
+                decision = self._backend.evaluate_and_reserve(request)
             entry_cid = str(entry_order.client_order_id)
             self._record_decision_audit(
                 entry_cid,
@@ -2161,6 +2025,8 @@ class PlanGateExecAlgorithm(ExecutionAlgorithm):
                 for prev_order, prev_req, prev_dec in admitted_entries:
                     prev_cid = str(prev_order.client_order_id)
                     self._reservations.pop(prev_cid, None)
+                    if self._forward_gate is not None:
+                        self._forward_gate._reservations.pop(prev_cid, None)
                     self._backend.release_reservation(
                         prev_req.symbol,
                         prev_req.quantity,
@@ -2185,6 +2051,15 @@ class PlanGateExecAlgorithm(ExecutionAlgorithm):
                             deny_decision,
                             order=child_order,
                         )
+                    if self._forward_gate is not None and (
+                        cid not in self._forward_gate._decisions
+                        or self._forward_gate._decisions[cid].allowed
+                    ):
+                        self._forward_gate._record_decision_audit(
+                            cid,
+                            deny_decision,
+                            order=child_order,
+                        )
                     self._safe_deny_order(child_order, reason)
                 return
 
@@ -2195,17 +2070,25 @@ class PlanGateExecAlgorithm(ExecutionAlgorithm):
         protective_cids = {str(o.client_order_id) for o in protective_orders}
         for prot_order in protective_orders:
             prot_cid = str(prot_order.client_order_id)
+            prot_dec = PlanGateDecision(
+                allowed=True,
+                reason=None,
+                is_exit_bypass=True,
+                item_id=primary_decision.item_id,
+                plan_id=primary_decision.plan_id,
+            )
             self._record_decision_audit(
                 prot_cid,
-                PlanGateDecision(
-                    allowed=True,
-                    reason=None,
-                    is_exit_bypass=True,
-                    item_id=primary_decision.item_id,
-                    plan_id=primary_decision.plan_id,
-                ),
+                prot_dec,
                 order=prot_order,
             )
+            if self._forward_gate is not None:
+                self._forward_gate._record_decision_audit(
+                    prot_cid,
+                    prot_dec,
+                    order=prot_order,
+                )
+                self._forward_gate._cache_telemetry_order(prot_order)
 
         has_contingency_children = any(
             str(getattr(o, "parent_order_id", "") or "") in list_cids
@@ -2233,11 +2116,52 @@ class PlanGateExecAlgorithm(ExecutionAlgorithm):
                 spawn_cid = str(spawned.client_order_id)
                 self._spawn_to_primary_cid[spawn_cid] = cid
                 self._decisions[spawn_cid] = child_decision
+                if self._forward_gate is not None:
+                    self._forward_gate._spawn_to_primary_cid[spawn_cid] = cid
+                    self._forward_gate._decisions[spawn_cid] = child_decision
+                    self._forward_gate._cache_telemetry_order(spawned)
                 self._cache_telemetry_order(spawned)
                 self._safe_submit_order(spawned)
             else:
+                if self._forward_gate is not None:
+                    self._forward_gate._cache_telemetry_order(child_order)
                 self._cache_telemetry_order(child_order)
                 self._safe_submit_order(child_order)
+
+    def _sync_forward_gate_runtime(self) -> None:
+        if self._forward_gate is None:
+            return
+        c = self._safe_cache()
+        clk = self._safe_clock()
+        if c is not None:
+            self._forward_gate._cached_cache = c
+        if clk is not None:
+            self._forward_gate._cached_clock = clk
+
+    def evaluate_order(
+        self,
+        order: Any,
+        *,
+        inferred_stop_loss_price: Optional[Decimal] = None,
+    ) -> PlanGateDecision:
+        """Evaluates `order` against the underlying `PlanGateBackend` and records audit/reservation state."""
+        self._refresh_runtime_handles()
+        self._resolve_telemetry_actor()
+        self._cache_telemetry_order(order)
+        request = self._build_order_request(order)
+        if request.stop_loss_price is None and inferred_stop_loss_price is not None:
+            request = replace(request, stop_loss_price=inferred_stop_loss_price)
+        decision = self._backend.evaluate_and_reserve(request)
+        cid = str(order.client_order_id)
+        self._record_decision_audit(
+            cid,
+            decision,
+            order=order,
+            request=request,
+        )
+        if decision.allowed:
+            self._record_entry_reservation(order, request, decision)
+        return decision
 
     def _resolve_order_list_orders(
         self,
@@ -2379,7 +2303,11 @@ class PlanGateExecAlgorithm(ExecutionAlgorithm):
         self._resolve_telemetry_actor()
         self._cache_telemetry_order(order)
         request = self._build_order_request(order)
-        decision = self._backend.evaluate_and_reserve(request)
+        if self._forward_gate is not None:
+            self._sync_forward_gate_runtime()
+            decision = self._forward_gate.evaluate_order(order)
+        else:
+            decision = self._backend.evaluate_and_reserve(request)
         cid = str(order.client_order_id)
         self._record_decision_audit(
             cid,
@@ -2410,9 +2338,15 @@ class PlanGateExecAlgorithm(ExecutionAlgorithm):
             spawn_cid = str(spawned.client_order_id)
             self._spawn_to_primary_cid[spawn_cid] = cid
             self._decisions[spawn_cid] = decision
+            if self._forward_gate is not None:
+                self._forward_gate._spawn_to_primary_cid[spawn_cid] = cid
+                self._forward_gate._decisions[spawn_cid] = decision
+                self._forward_gate._cache_telemetry_order(spawned)
             self._cache_telemetry_order(spawned)
             self._safe_submit_order(spawned)
         else:
+            if self._forward_gate is not None:
+                self._forward_gate._cache_telemetry_order(order)
             self._cache_telemetry_order(order)
             self._safe_submit_order(order)
         return decision
@@ -2423,6 +2357,10 @@ class PlanGateExecAlgorithm(ExecutionAlgorithm):
 
     def _on_order_event(self, event: Any) -> None:
         if event is None:
+            return
+        if self._forward_gate is not None:
+            self._sync_forward_gate_runtime()
+            self._forward_gate.on_order_event(event)
             return
         cls_name = type(event).__name__
         if cls_name == "OrderFilled":
@@ -2444,6 +2382,10 @@ class PlanGateExecAlgorithm(ExecutionAlgorithm):
 
     def _on_position_event(self, event: Any) -> None:
         if event is None:
+            return
+        if self._forward_gate is not None:
+            self._sync_forward_gate_runtime()
+            self._forward_gate.on_position_event(event)
             return
         telemetry = self._resolve_telemetry_actor()
         if telemetry is not None:

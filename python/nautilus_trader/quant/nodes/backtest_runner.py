@@ -31,7 +31,7 @@ from nautilus_trader.quant.governance.plan_gate import (
     PLAN_GATE_EXEC_ALGORITHM_ID,
     PlanGateExecAlgorithm,
     PlanGateExecAlgorithmConfig,
-    SnapshotPlanGateBackend,
+    PostgresPlanGateBackend,
 )
 from nautilus_trader.quant.governance.telemetry_actor import (
     PostgresTelemetryActor,
@@ -572,7 +572,7 @@ class IsomorphicBacktestRunner:
         walk_forward: Optional[WalkForwardSummary] = None,
         effective_trials: Optional[int] = None,
     ) -> IsomorphicBacktestMetrics:
-        """Executes a 5-axis isomorphic backtest in `BacktestEngine` with `PlanGateExecAlgorithm(SnapshotPlanGateBackend)` and `ProtectiveOcoMonitor`."""
+        """Executes a 5-axis isomorphic backtest in `BacktestEngine` with `PlanGateExecAlgorithm(PostgresPlanGateBackend)` and `ProtectiveOcoMonitor`."""
         venue_str = (
             plan_item.strategy_config.instrument_id.split(".", 1)[1].strip().upper()
             if "." in plan_item.strategy_config.instrument_id
@@ -676,10 +676,12 @@ class IsomorphicBacktestRunner:
             for eq in equity_list:
                 engine.add_instrument(eq)
 
-            snapshot_backend = SnapshotPlanGateBackend(
+            snapshot_backend = PostgresPlanGateBackend(
                 plan_items=items_to_lock,
                 entry_freeze=False,
                 trading_date=effective_date,
+                persist_to_db=False,
+                allow_multi_cycle_reentry=True,
             )
             oco_monitor = ProtectiveOcoMonitor(
                 dsn=None,
