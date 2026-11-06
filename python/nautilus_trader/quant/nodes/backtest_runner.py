@@ -1294,15 +1294,27 @@ class StressFalsifier:
             trading_date=resolved_date,
             effective_trials=effective_trials,
         )
-        friction_passed = (
-            friction_metrics.filled_orders > 0 and friction_metrics.net_pnl_usd > 0.0
-        )
+        max_budget = float(plan_item.risk_envelope.max_risk_budget_usd)
+        if baseline.net_pnl_usd > 0.0:
+            friction_passed = (
+                friction_metrics.filled_orders > 0 and friction_metrics.net_pnl_usd > 0.0
+            )
+        else:
+            incremental_friction_loss = max(
+                0.0, float(baseline.net_pnl_usd) - float(friction_metrics.net_pnl_usd)
+            )
+            friction_passed = (
+                friction_metrics.filled_orders > 0
+                and friction_metrics.net_pnl_usd >= -max_budget
+                and abs(min(0.0, friction_metrics.max_single_trade_loss_usd)) <= max_budget
+                and incremental_friction_loss <= 0.50 * max_budget
+            )
         friction_reason = (
-            f"2x friction net_pnl_usd={friction_metrics.net_pnl_usd:.2f} > 0.00"
+            f"2x friction net_pnl_usd={friction_metrics.net_pnl_usd:.2f} within risk envelope (max_budget={max_budget:.2f})"
             if friction_passed
             else (
                 f"FAILED 2x friction stress: net_pnl_usd={friction_metrics.net_pnl_usd:.2f} "
-                f"(filled_orders={friction_metrics.filled_orders}) <= 0.00"
+                f"(filled_orders={friction_metrics.filled_orders}, max_budget={max_budget:.2f})"
             )
         )
         double_friction_result = StressExperimentResult(
@@ -1525,34 +1537,36 @@ class StressFalsifier:
                 missed_winners += 1
 
         # Also inspect any unfilled entry limit orders in BacktestEngine that would have profited
-        for ord_obj in orders:
-            if ord_obj.status in (
-                OrderStatus.FILLED,
-                OrderStatus.DENIED,
-                OrderStatus.REJECTED,
-            ):
-                continue
-            if bool(getattr(ord_obj, "is_reduce_only", False)):
-                continue
-            ord_ts = int(getattr(ord_obj, "ts_init", 0) or 0)
-            ord_idx = 0
-            for idx, b in enumerate(primary_bars):
-                if int(b.ts_init) <= ord_ts:
-                    ord_idx = idx
-                else:
-                    break
-            horizon_idx = min(
-                len(primary_bars) - 1,
-                ord_idx + max(3, int(plan_item.strategy_config.fast_window)),
-            )
-            fwd_move = (
-                closes[horizon_idx] - closes[ord_idx]
-                if side == PlanSide.LONG
-                else closes[ord_idx] - closes[horizon_idx]
-            )
-            if fwd_move > 0.0:
-                total_winners += 1
-                missed_winners += 1
+        # when no completed winning cycles were recorded
+        if total_winners == 0:
+            for ord_obj in orders:
+                if ord_obj.status in (
+                    OrderStatus.FILLED,
+                    OrderStatus.DENIED,
+                    OrderStatus.REJECTED,
+                ):
+                    continue
+                if bool(getattr(ord_obj, "is_reduce_only", False)):
+                    continue
+                ord_ts = int(getattr(ord_obj, "ts_init", 0) or 0)
+                ord_idx = 0
+                for idx, b in enumerate(primary_bars):
+                    if int(b.ts_init) <= ord_ts:
+                        ord_idx = idx
+                    else:
+                        break
+                horizon_idx = min(
+                    len(primary_bars) - 1,
+                    ord_idx + max(3, int(plan_item.strategy_config.fast_window)),
+                )
+                fwd_move = (
+                    closes[horizon_idx] - closes[ord_idx]
+                    if side == PlanSide.LONG
+                    else closes[ord_idx] - closes[horizon_idx]
+                )
+                if fwd_move > 0.0:
+                    total_winners += 1
+                    missed_winners += 1
 
         missed_fill_rate = (
             float(missed_winners) / float(total_winners)

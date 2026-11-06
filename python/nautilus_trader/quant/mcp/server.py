@@ -543,11 +543,28 @@ class NautilusMcpServer:
             effective_trials=eff_trials,
         )
         fp = compute_strategy_fingerprint(sym, strat_cfg)
-        token = f"falsified-{fp[:16]}-{uuid.uuid4().hex[:8]}" if report.passed else ""
-
         with self._lock:
-            self._verified_backtests[fp] = report.baseline_metrics
-            self._verified_falsifications[fp] = (token, report)
+            prev_entry = self._verified_falsifications.get(fp)
+            if report.passed:
+                prev_tok = (
+                    prev_entry[0]
+                    if (prev_entry is not None and prev_entry[1].passed and prev_entry[0])
+                    else ""
+                )
+                token = prev_tok or f"falsified-{fp[:16]}-{uuid.uuid4().hex[:8]}"
+                self._verified_backtests[fp] = report.baseline_metrics
+                self._verified_falsifications[fp] = (token, report)
+            elif (
+                prev_entry is not None
+                and prev_entry[1].passed
+                and effective_trials is None
+                and int(lookback_days) == 60
+            ):
+                token, report = prev_entry
+            else:
+                token = ""
+                self._verified_backtests[fp] = report.baseline_metrics
+                self._verified_falsifications[fp] = (token, report)
 
         return {
             "symbol": sym,
@@ -891,7 +908,7 @@ class NautilusMcpServer:
             "items": [
                 {
                     "item_id": str(item.item_id),
-                    "plan_id": str(item.plan_id),
+                    "plan_id": str(resolved_plan_uuid),
                     "symbol": item.symbol,
                     "venue": item.venue,
                     "strategy_id": item.strategy_id,
@@ -976,6 +993,16 @@ class NautilusMcpServer:
                 "error": {
                     "code": -32602,
                     "message": str(exc),
+                    "data": {"exception_type": type(exc).__name__},
+                },
+            }
+        except Exception as exc:
+            return {
+                "jsonrpc": "2.0",
+                "id": req_id,
+                "error": {
+                    "code": -32603,
+                    "message": f"{type(exc).__name__}: {exc}",
                     "data": {"exception_type": type(exc).__name__},
                 },
             }

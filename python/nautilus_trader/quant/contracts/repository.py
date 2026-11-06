@@ -119,8 +119,13 @@ class PlanContractRepository:
                     if existing_plan is not None:
                         existing_id = UUID(str(existing_plan["plan_id"]))
                         existing_status = str(existing_plan["status"] or "").strip().upper()
-                        if existing_status in ("LOCKED", "CLOSED") and not items:
-                            return existing_id
+                        if existing_status in ("LOCKED", "CLOSED"):
+                            if not items:
+                                return existing_id
+                            raise PlanContractValidationError(
+                                f"Trading plan {existing_id} for {trading_date.isoformat()} ({market}) "
+                                f"is already {existing_status} and immutable"
+                            )
                         if existing_status == "DRAFT":
                             if plan_id is None or (items and items[0].plan_id == resolved_plan_id):
                                 resolved_plan_id = existing_id
@@ -156,25 +161,8 @@ class PlanContractRepository:
                                 ),
                             )
                         else:
-                            cur.execute(
-                                """
-                                INSERT INTO trading_plans (
-                                    plan_id, trading_date, market, status, config_version_id,
-                                    capital_snapshot_id, candidate_pool, rejections, summary
-                                ) VALUES (
-                                    %s, %s, %s, 'DRAFT', %s, %s, %s::jsonb, %s::jsonb, %s
-                                )
-                                """,
-                                (
-                                    resolved_plan_id,
-                                    trading_date,
-                                    market,
-                                    config_version_id,
-                                    capital_snapshot_id,
-                                    json.dumps([item.symbol for item in rebound_items]),
-                                    json.dumps(vetoed_carry_over_symbols),
-                                    summary,
-                                ),
+                            raise PlanContractValidationError(
+                                f"Unsupported existing trading plan status {existing_status!r} for {trading_date.isoformat()} ({market})"
                             )
                     else:
                         cur.execute(
