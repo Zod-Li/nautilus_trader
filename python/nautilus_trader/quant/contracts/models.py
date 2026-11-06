@@ -348,9 +348,11 @@ class MarketableLimitCollar:
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> MarketableLimitCollar:
+        pct_raw = data.get("limit_collar_pct", data.get("max_slippage_bps", "0"))
+        atr_raw = data.get("limit_collar_atr", data.get("max_atr_fraction", "0"))
         return cls(
-            limit_collar_pct=_to_decimal(data["limit_collar_pct"], "limit_collar_pct"),
-            limit_collar_atr=_to_decimal(data["limit_collar_atr"], "limit_collar_atr"),
+            limit_collar_pct=_to_decimal(pct_raw, "limit_collar_pct"),
+            limit_collar_atr=_to_decimal(atr_raw, "limit_collar_atr"),
         )
 
 
@@ -417,6 +419,18 @@ class PlanRiskEnvelope:
         if self.target_qty > Decimal("0"):
             return self.target_notional_usd / self.target_qty
         return Decimal("0")
+
+    @property
+    def limit_collar_pct(self) -> Decimal:
+        if "limit_collar_pct" in self.__dict__:
+            return _to_decimal(self.__dict__["limit_collar_pct"], "limit_collar_pct")
+        return self.collar.limit_collar_pct if self.collar is not None else Decimal("0")
+
+    @property
+    def limit_collar_atr(self) -> Decimal:
+        if "limit_collar_atr" in self.__dict__:
+            return _to_decimal(self.__dict__["limit_collar_atr"], "limit_collar_atr")
+        return self.collar.limit_collar_atr if self.collar is not None else Decimal("0")
 
     def validate_intrinsic(self) -> None:
         if self.target_qty <= Decimal("0"):
@@ -519,6 +533,16 @@ class PlanRiskEnvelope:
         return replace(self, approved_qty_cap=cap_dec)
 
     def to_dict(self) -> Dict[str, Any]:
+        collar_dict = (
+            {
+                "limit_collar_pct": str(self.limit_collar_pct),
+                "limit_collar_atr": str(self.limit_collar_atr),
+            }
+            if self.collar is not None
+            or "limit_collar_pct" in self.__dict__
+            or "limit_collar_atr" in self.__dict__
+            else None
+        )
         return {
             "side": self.side.value if isinstance(self.side, PlanSide) else str(self.side),
             "target_qty": str(self.target_qty),
@@ -529,7 +553,9 @@ class PlanRiskEnvelope:
             "take_profit_price": (
                 str(self.take_profit_price) if self.take_profit_price is not None else None
             ),
-            "collar": self.collar.to_dict() if self.collar is not None else None,
+            "limit_collar_pct": str(self.limit_collar_pct),
+            "limit_collar_atr": str(self.limit_collar_atr),
+            "collar": collar_dict,
             "valid_until": self.valid_until.isoformat(),
         }
 

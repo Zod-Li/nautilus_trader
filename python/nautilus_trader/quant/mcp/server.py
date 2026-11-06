@@ -85,18 +85,45 @@ def _canonicalize_risk_envelope(
 ) -> Dict[str, Any]:
     if isinstance(risk_envelope, PlanRiskEnvelope):
         raw = risk_envelope.to_dict()
+        env_pct = getattr(risk_envelope, "limit_collar_pct", None)
+        env_atr = getattr(risk_envelope, "limit_collar_atr", None)
+        if env_pct is not None:
+            raw["limit_collar_pct"] = env_pct
+        if env_atr is not None:
+            raw["limit_collar_atr"] = env_atr
+    elif isinstance(risk_envelope, Mapping):
+        raw = dict(risk_envelope)
+    elif hasattr(risk_envelope, "to_dict") and callable(risk_envelope.to_dict):
+        raw = dict(risk_envelope.to_dict())
     else:
         raw = dict(risk_envelope)
     collar = raw.get("collar")
-    if isinstance(collar, MarketableLimitCollar):
-        collar_dict: Optional[Dict[str, str]] = collar.to_dict()
-    elif isinstance(collar, Mapping):
-        collar_dict = {
+    collar_map: Mapping[str, Any] = (
+        collar.to_dict()
+        if isinstance(collar, MarketableLimitCollar)
+        else (collar if isinstance(collar, Mapping) else {})
+    )
+    pct_val = raw.get(
+        "limit_collar_pct",
+        collar_map.get(
+            "limit_collar_pct",
+            raw.get("max_slippage_bps", collar_map.get("max_slippage_bps")),
+        ),
+    )
+    atr_val = raw.get(
+        "limit_collar_atr",
+        collar_map.get(
+            "limit_collar_atr",
+            raw.get("max_atr_fraction", collar_map.get("max_atr_fraction")),
+        ),
+    )
+    if pct_val is not None or atr_val is not None or collar is not None:
+        collar_dict: Optional[Dict[str, str]] = {
             "limit_collar_pct": str(
-                Decimal(str(collar.get("limit_collar_pct", collar.get("max_slippage_bps", "0"))))
+                Decimal(str(pct_val if pct_val is not None else "0"))
             ),
             "limit_collar_atr": str(
-                Decimal(str(collar.get("limit_collar_atr", collar.get("max_atr_fraction", "0"))))
+                Decimal(str(atr_val if atr_val is not None else "0"))
             ),
         }
     else:
@@ -554,20 +581,28 @@ class NautilusMcpServer:
                     )
         else:
             request_runner = self._create_isolated_runner()
-            if walk_forward:
-                metrics = request_runner.run_walk_forward(
-                    plan_item,
-                    bars=bars,
-                    equities=equities,
-                    effective_trials=eff_trials,
-                )
-            else:
-                metrics = request_runner.run_backtest(
-                    plan_item,
-                    bars=bars,
-                    equities=equities,
-                    effective_trials=eff_trials,
-                )
+            try:
+                if walk_forward:
+                    metrics = request_runner.run_walk_forward(
+                        plan_item,
+                        bars=bars,
+                        equities=equities,
+                        effective_trials=eff_trials,
+                    )
+                else:
+                    metrics = request_runner.run_backtest(
+                        plan_item,
+                        bars=bars,
+                        equities=equities,
+                        effective_trials=eff_trials,
+                    )
+            finally:
+                request_runner._last_plan_gate = None
+                request_runner._last_strategy = None
+                request_runner._last_telemetry_actor = None
+                request_runner._last_oco_monitor = None
+                del request_runner
+                gc.collect()
 
         fp = compute_strategy_fingerprint(sym, strat_cfg)
         backtest_id = f"bt-{fp[:16]}"
@@ -630,12 +665,20 @@ class NautilusMcpServer:
         else:
             request_runner = self._create_isolated_runner()
             request_falsifier = StressFalsifier(runner=request_runner)
-            report = request_falsifier.run_falsification(
-                plan_item,
-                bars=bars,
-                equities=equities,
-                effective_trials=eff_trials,
-            )
+            try:
+                report = request_falsifier.run_falsification(
+                    plan_item,
+                    bars=bars,
+                    equities=equities,
+                    effective_trials=eff_trials,
+                )
+            finally:
+                request_runner._last_plan_gate = None
+                request_runner._last_strategy = None
+                request_runner._last_telemetry_actor = None
+                request_runner._last_oco_monitor = None
+                del request_falsifier, request_runner
+                gc.collect()
         fp = compute_strategy_fingerprint(sym, strat_cfg, risk_envelope=env)
         base_fp = compute_strategy_fingerprint(sym, strat_cfg)
         with self._lock:
@@ -1394,9 +1437,17 @@ class NautilusMcpServer:
             take_profit = Decimal(str(tp_raw)) if tp_raw is not None else None
             collar_raw = raw_envelope.get("collar")
             if collar_raw is None:
+                raw_collar_pct = raw_envelope.get(
+                    "limit_collar_pct",
+                    raw_envelope.get("max_slippage_bps", default_collar_pct),
+                )
+                raw_collar_atr = raw_envelope.get(
+                    "limit_collar_atr",
+                    raw_envelope.get("max_atr_fraction", default_collar_atr),
+                )
                 collar = MarketableLimitCollar(
-                    limit_collar_pct=default_collar_pct,
-                    limit_collar_atr=default_collar_atr,
+                    limit_collar_pct=Decimal(str(raw_collar_pct)),
+                    limit_collar_atr=Decimal(str(raw_collar_atr)),
                 )
             elif isinstance(collar_raw, MarketableLimitCollar):
                 collar = collar_raw

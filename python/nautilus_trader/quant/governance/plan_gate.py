@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass, replace
 from datetime import date, datetime, timezone
 from decimal import Decimal
@@ -62,6 +63,83 @@ EXIT_INTENT_TAGS = frozenset(
     }
 )
 NOTIFY_CHANNEL = "nautilus_plan_gate_sync"
+MAX_TRACKED_ORDER_HISTORY: int = 4096
+
+
+class _BoundedFifoList(list):
+    """FIFO-bounded list that evicts oldest entries when capacity exceeds `max_size`."""
+
+    def __init__(self, max_size: int = MAX_TRACKED_ORDER_HISTORY) -> None:
+        super().__init__()
+        self._max_size = max(1, int(max_size))
+
+    def append(self, item: Any) -> None:
+        super().append(item)
+        overflow = len(self) - self._max_size
+        if overflow > 0:
+            del self[:overflow]
+
+    def extend(self, items: Any) -> None:
+        super().extend(items)
+        overflow = len(self) - self._max_size
+        if overflow > 0:
+            del self[:overflow]
+
+
+class _BoundedFifoSet(set):
+    """FIFO-bounded set that evicts oldest entries when capacity exceeds `max_size`."""
+
+    def __init__(self, max_size: int = MAX_TRACKED_ORDER_HISTORY) -> None:
+        super().__init__()
+        self._max_size = max(1, int(max_size))
+        self._order: OrderedDict[Any, None] = OrderedDict()
+
+    def add(self, item: Any) -> None:
+        if item in self._order:
+            self._order.move_to_end(item)
+            super().add(item)
+            return
+        while len(self._order) >= self._max_size:
+            oldest, _ = self._order.popitem(last=False)
+            super().discard(oldest)
+        self._order[item] = None
+        super().add(item)
+
+    def discard(self, item: Any) -> None:
+        self._order.pop(item, None)
+        super().discard(item)
+
+    def remove(self, item: Any) -> None:
+        self._order.pop(item, None)
+        super().remove(item)
+
+    def clear(self) -> None:
+        self._order.clear()
+        super().clear()
+
+
+class _BoundedFifoDict(OrderedDict):
+    """FIFO-bounded dictionary that evicts oldest entries when capacity exceeds `max_size`."""
+
+    def __init__(self, max_size: int = MAX_TRACKED_ORDER_HISTORY) -> None:
+        super().__init__()
+        self._max_size = max(1, int(max_size))
+
+    def __setitem__(self, key: Any, value: Any) -> None:
+        if key in self:
+            super().__setitem__(key, value)
+            self.move_to_end(key)
+            return
+        while len(self) >= self._max_size:
+            self.popitem(last=False)
+        super().__setitem__(key, value)
+
+    def setdefault(self, key: Any, default: Any = None) -> Any:
+        if key in self:
+            self.move_to_end(key)
+            return self[key]
+        self[key] = default
+        return default
 
 
 @dataclass(frozen=True)
@@ -1098,7 +1176,13 @@ class PostgresPlanGateBackend:
                     )
                     conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
                     with conn.cursor() as cur:
-                        cur.execute(f"LISTEN {NOTIFY_CHANNEL};")
+                        cur.execute(
+                            f"""
+                            LISTEN {NOTIFY_CHANNEL};
+                            LISTEN nautilus_plan_locked;
+                            LISTEN system_flags_changed;
+                            """
+                        )
                     self._listen_conn = conn
                 except Exception as exc:
                     self._rust_engine.set_backend_unavailable(
@@ -1659,13 +1743,17 @@ class PlanGateExecAlgorithm(ExecutionAlgorithm):
         self._disallow_uncollared_market_orders = bool(
             getattr(resolved_cfg, "disallow_uncollared_market_orders", False)
         )
-        self._decisions: Dict[str, PlanGateDecision] = {}
-        self._audit_trail: List[_AuditTrailRecord] = []
+        self._decisions: Dict[str, PlanGateDecision] = _BoundedFifoDict(MAX_TRACKED_ORDER_HISTORY)
+        self._audit_trail: List[_AuditTrailRecord] = _BoundedFifoList(MAX_TRACKED_ORDER_HISTORY)
+        self._submitted_orders: List[Any] = _BoundedFifoList(MAX_TRACKED_ORDER_HISTORY)
+        self._rejected_orders: List[Any] = _BoundedFifoList(MAX_TRACKED_ORDER_HISTORY)
+        self._modified_orders: List[Any] = _BoundedFifoList(MAX_TRACKED_ORDER_HISTORY)
+        self._canceled_orders: List[Any] = _BoundedFifoList(MAX_TRACKED_ORDER_HISTORY)
         self._reservations: Dict[str, _TrackedEntryReservation] = {}
-        self._spawn_to_primary_cid: Dict[str, str] = {}
-        self._processed_fill_keys: set[str] = set()
-        self._released_order_ids: set[str] = set()
-        self._closed_cycle_entry_order_ids: set[str] = set()
+        self._spawn_to_primary_cid: Dict[str, str] = _BoundedFifoDict(MAX_TRACKED_ORDER_HISTORY)
+        self._processed_fill_keys: set[str] = _BoundedFifoSet(MAX_TRACKED_ORDER_HISTORY)
+        self._released_order_ids: set[str] = _BoundedFifoSet(MAX_TRACKED_ORDER_HISTORY)
+        self._closed_cycle_entry_order_ids: set[str] = _BoundedFifoSet(MAX_TRACKED_ORDER_HISTORY)
         self._registered_strategies: List[Any] = []
         self._telemetry_actor: Optional[Any] = None
         self._is_started: bool = False
@@ -2369,6 +2457,7 @@ class PlanGateExecAlgorithm(ExecutionAlgorithm):
             self._registered_strategies.append(strategy)
 
     def _safe_deny_order(self, order: Any, reason: str) -> None:
+        self._rejected_orders.append(order)
         try:
             self.deny_order(order, reason)
         except RuntimeError as exc:
@@ -2397,6 +2486,7 @@ class PlanGateExecAlgorithm(ExecutionAlgorithm):
                 pass
 
     def _safe_submit_order(self, order: Any) -> None:
+        self._submitted_orders.append(order)
         try:
             self.submit_order(order)
         except RuntimeError as exc:
@@ -2621,6 +2711,7 @@ class PlanGateExecAlgorithm(ExecutionAlgorithm):
 
     def on_order_canceled(self, event: Any) -> None:
         """Release unfilled reserved entry capacity when an admitted order is canceled."""
+        self._canceled_orders.append(event)
         telemetry = self._resolve_telemetry_actor()
         if telemetry is not None:
             telemetry.on_order_canceled(event)
@@ -2628,6 +2719,7 @@ class PlanGateExecAlgorithm(ExecutionAlgorithm):
 
     def on_order_rejected(self, event: Any) -> None:
         """Release unfilled reserved entry capacity when an admitted order is rejected."""
+        self._rejected_orders.append(event)
         telemetry = self._resolve_telemetry_actor()
         if telemetry is not None:
             telemetry.on_order_rejected(event)

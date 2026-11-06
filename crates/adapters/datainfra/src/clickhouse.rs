@@ -548,7 +548,9 @@ pub fn build_v_quant_bars_query(
             {high_col}, \
             {low_col}, \
             {close_col}, \
-            {vol_col} \
+            {vol_col}, \
+            is_synthetic, \
+            is_suspect_spike \
         FROM {database}.v_quant_bars \
         WHERE {where_sql} \
         ORDER BY bar_start_time ASC, symbol ASC{limit_clause}",

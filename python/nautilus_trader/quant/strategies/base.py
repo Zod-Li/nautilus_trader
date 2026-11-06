@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import replace
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN
@@ -36,6 +37,84 @@ from nautilus_trader.model import (
 from nautilus_trader.trading import Strategy, StrategyConfig
 
 logger = logging.getLogger(__name__)
+
+MAX_TRACKED_ORDER_HISTORY: int = 4096
+
+
+class _BoundedFifoList(list):
+    """FIFO-bounded list that evicts oldest entries when capacity exceeds `max_size`."""
+
+    def __init__(self, max_size: int = MAX_TRACKED_ORDER_HISTORY) -> None:
+        super().__init__()
+        self._max_size = max(1, int(max_size))
+
+    def append(self, item: Any) -> None:
+        super().append(item)
+        overflow = len(self) - self._max_size
+        if overflow > 0:
+            del self[:overflow]
+
+    def extend(self, items: Any) -> None:
+        super().extend(items)
+        overflow = len(self) - self._max_size
+        if overflow > 0:
+            del self[:overflow]
+
+
+class _BoundedFifoSet(set):
+    """FIFO-bounded set that evicts oldest entries when capacity exceeds `max_size`."""
+
+    def __init__(self, max_size: int = MAX_TRACKED_ORDER_HISTORY) -> None:
+        super().__init__()
+        self._max_size = max(1, int(max_size))
+        self._order: OrderedDict[Any, None] = OrderedDict()
+
+    def add(self, item: Any) -> None:
+        if item in self._order:
+            self._order.move_to_end(item)
+            super().add(item)
+            return
+        while len(self._order) >= self._max_size:
+            oldest, _ = self._order.popitem(last=False)
+            super().discard(oldest)
+        self._order[item] = None
+        super().add(item)
+
+    def discard(self, item: Any) -> None:
+        self._order.pop(item, None)
+        super().discard(item)
+
+    def remove(self, item: Any) -> None:
+        self._order.pop(item, None)
+        super().remove(item)
+
+    def clear(self) -> None:
+        self._order.clear()
+        super().clear()
+
+
+class _BoundedFifoDict(OrderedDict):
+    """FIFO-bounded dictionary that evicts oldest entries when capacity exceeds `max_size`."""
+
+    def __init__(self, max_size: int = MAX_TRACKED_ORDER_HISTORY) -> None:
+        super().__init__()
+        self._max_size = max(1, int(max_size))
+
+    def __setitem__(self, key: Any, value: Any) -> None:
+        if key in self:
+            super().__setitem__(key, value)
+            self.move_to_end(key)
+            return
+        while len(self) >= self._max_size:
+            self.popitem(last=False)
+        super().__setitem__(key, value)
+
+    def setdefault(self, key: Any, default: Any = None) -> Any:
+        if key in self:
+            self.move_to_end(key)
+            return self[key]
+        self[key] = default
+        return default
 
 TIMEFRAME_TO_BAR_SPEC: Dict[str, str] = {
     "1m": "1-MINUTE-LAST-EXTERNAL",
@@ -258,13 +337,13 @@ class BaseArchetypeStrategy(Strategy):
         self._lows: List[float] = []
         self._raw_highs: List[float] = []
         self._raw_lows: List[float] = []
-        self._cleaned_bar_extremes_by_ts_ns: Dict[int, Tuple[float, float]] = {}
-        self._raw_bar_extremes_by_ts_ns: Dict[int, Tuple[float, float]] = {}
+        self._cleaned_bar_extremes_by_ts_ns: Dict[int, Tuple[float, float]] = _BoundedFifoDict(MAX_TRACKED_ORDER_HISTORY)
+        self._raw_bar_extremes_by_ts_ns: Dict[int, Tuple[float, float]] = _BoundedFifoDict(MAX_TRACKED_ORDER_HISTORY)
         self._closes: List[float] = []
         self._volumes: List[float] = []
         self._trailing_stop_price: Optional[float] = None
-        self._submitted_order_ids: List[str] = []
-        self._protective_stop_order_ids: List[str] = []
+        self._submitted_order_ids: List[str] = _BoundedFifoList(MAX_TRACKED_ORDER_HISTORY)
+        self._protective_stop_order_ids: List[str] = _BoundedFifoList(MAX_TRACKED_ORDER_HISTORY)
         self._pending_protective_stops: Dict[str, Dict[str, Any]] = {}
         self._active_protective_stops_by_inst: Dict[str, List[str]] = {}
         self._stop_orders_by_cid: Dict[str, Any] = {}
@@ -283,10 +362,15 @@ class BaseArchetypeStrategy(Strategy):
         self._pending_thesis_exit: bool = False
         self._pending_thesis_exit_reason: str = "THESIS_INVALIDATED_EXIT"
         self._tracked_signed_qty_by_inst: Dict[str, Decimal] = {}
-        self._order_side_by_cid: Dict[str, Tuple[str, OrderSide]] = {}
-        self._submitted_orders_by_cid: Dict[str, Any] = {}
-        self._submitted_orders_audit: List[Any] = []
-        self._canceled_order_ids_audit: List[str] = []
+        self._order_side_by_cid: Dict[str, Tuple[str, OrderSide]] = _BoundedFifoDict(MAX_TRACKED_ORDER_HISTORY)
+        self._submitted_orders_by_cid: Dict[str, Any] = _BoundedFifoDict(MAX_TRACKED_ORDER_HISTORY)
+        self._submitted_orders_audit: List[Any] = _BoundedFifoList(MAX_TRACKED_ORDER_HISTORY)
+        self._canceled_order_ids_audit: List[str] = _BoundedFifoList(MAX_TRACKED_ORDER_HISTORY)
+        self._audit_trail: List[Any] = _BoundedFifoList(MAX_TRACKED_ORDER_HISTORY)
+        self._decision_traces: List[Any] = _BoundedFifoList(MAX_TRACKED_ORDER_HISTORY)
+        self._managed_client_order_ids: set[str] = _BoundedFifoSet(MAX_TRACKED_ORDER_HISTORY)
+        self._filled_order_ids: set[str] = _BoundedFifoSet(MAX_TRACKED_ORDER_HISTORY)
+        self._processed_fill_keys: set[str] = _BoundedFifoSet(MAX_TRACKED_ORDER_HISTORY)
         self._pending_cross_thread_submits: List[Any] = []
         self._pending_cross_thread_cancels: List[Any] = []
         self._in_cancel_order_call: bool = False
@@ -302,9 +386,17 @@ class BaseArchetypeStrategy(Strategy):
         self._cached_clock: Optional[Any] = None
         self._cached_trader_registered: bool = False
         self._standalone_order_seq: int = 0
-        self._denied_order_ids: set[str] = set()
-        self._rejected_order_ids: set[str] = set()
-        self._processed_terminal_events: set[Tuple[str, str]] = set()
+        self._denied_order_ids: set[str] = _BoundedFifoSet(MAX_TRACKED_ORDER_HISTORY)
+        self._rejected_order_ids: set[str] = _BoundedFifoSet(MAX_TRACKED_ORDER_HISTORY)
+        self._processed_terminal_events: set[Tuple[str, str]] = _BoundedFifoSet(MAX_TRACKED_ORDER_HISTORY)
+
+    @property
+    def _submitted_orders(self) -> List[Any]:
+        return self._submitted_orders_audit
+
+    @property
+    def _canceled_orders(self) -> List[str]:
+        return self._canceled_order_ids_audit
 
     @property
     def _canceled_order_ids(self) -> List[str]:
@@ -409,16 +501,16 @@ class BaseArchetypeStrategy(Strategy):
         while stop-loss triggers inspect un-smoothed `(raw_high, raw_low)` to preserve
         1:1 backtest-to-live isomorphism with broker `STOP_MARKET` execution.
         """
-        self._cleaned_bar_extremes_by_ts_ns = (
-            {int(k): (float(v[0]), float(v[1])) for k, v in cleaned_by_ts_ns.items()}
-            if cleaned_by_ts_ns
-            else {}
-        )
-        self._raw_bar_extremes_by_ts_ns = (
-            {int(k): (float(v[0]), float(v[1])) for k, v in raw_by_ts_ns.items()}
-            if raw_by_ts_ns
-            else {}
-        )
+        cleaned_dict: Dict[int, Tuple[float, float]] = _BoundedFifoDict(MAX_TRACKED_ORDER_HISTORY)
+        if cleaned_by_ts_ns:
+            for k, v in cleaned_by_ts_ns.items():
+                cleaned_dict[int(k)] = (float(v[0]), float(v[1]))
+        raw_dict: Dict[int, Tuple[float, float]] = _BoundedFifoDict(MAX_TRACKED_ORDER_HISTORY)
+        if raw_by_ts_ns:
+            for k, v in raw_by_ts_ns.items():
+                raw_dict[int(k)] = (float(v[0]), float(v[1]))
+        self._cleaned_bar_extremes_by_ts_ns = cleaned_dict
+        self._raw_bar_extremes_by_ts_ns = raw_dict
 
     def _current_bar_raw_low(self, fallback: Optional[float] = None) -> float:
         if self._raw_lows:
@@ -521,6 +613,7 @@ class BaseArchetypeStrategy(Strategy):
 
     def _submit_order_safely(self, order: Any) -> None:
         cid = str(order.client_order_id)
+        self._managed_client_order_ids.add(cid)
         self._submitted_orders_by_cid[cid] = order
         if order not in self._submitted_orders_audit:
             self._submitted_orders_audit.append(order)
@@ -1659,6 +1752,12 @@ class BaseArchetypeStrategy(Strategy):
         cid = str(self._event_get(event, "client_order_id", "") or "")
         if not cid:
             return
+        self._filled_order_ids.add(cid)
+        event_id = self._event_get(event, "event_id", None) or self._event_get(event, "id", None)
+        trade_id = self._event_get(event, "trade_id", None)
+        ts_event = self._event_get(event, "ts_event", None)
+        fill_key = f"id:{event_id}" if event_id is not None else f"fill:{cid}:{trade_id}:{ts_event}"
+        self._processed_fill_keys.add(fill_key)
 
         last_qty = self._event_get(event, "last_qty", None)
         if last_qty is None:
@@ -1979,6 +2078,8 @@ class BaseArchetypeStrategy(Strategy):
     ) -> Optional[str]:
         target_inst = instrument_id or self._archetype_config.instrument_id
         inst_key = str(target_inst)
+        if inst_key in self._pending_safe_exits or self._active_exit_orders_by_inst.get(inst_key):
+            return None
         sym = self._symbol_from_instrument_id(target_inst)
         open_stops = self._get_open_protective_stop_orders(target_inst)
         signed_pos = self._open_position_signed_qty(target_inst)
@@ -2477,6 +2578,18 @@ class BaseArchetypeStrategy(Strategy):
             if str(pending_spec.get("instrument_id")) == inst_key:
                 self._pending_protective_stops.pop(pending_cid, None)
 
+        if inst_key in self._pending_safe_exits or self._active_exit_orders_by_inst.get(inst_key):
+            existing_safe_exit = self._pending_safe_exits.get(inst_key)
+            if existing_safe_exit is not None:
+                existing_safe_exit["exit_side"] = resolved_exit_side
+                existing_safe_exit["quantity"] = resolved_qty_dec
+                if reference_price > 0.0:
+                    existing_safe_exit["reference_price"] = float(reference_price)
+                existing_safe_exit["reason_tag"] = resolved_reason
+                if signal_tags is not None:
+                    existing_safe_exit["signal_tags"] = list(signal_tags)
+            return ""
+
         open_stops = self._get_open_protective_stop_orders(target_inst)
         if not open_stops:
             return self._execute_exit_order_submission(
@@ -2487,15 +2600,6 @@ class BaseArchetypeStrategy(Strategy):
                 reason_tag=resolved_reason,
                 signal_tags=signal_tags,
             )
-
-        existing_safe_exit = self._pending_safe_exits.get(inst_key)
-        if existing_safe_exit is not None and existing_safe_exit.get("pending_stop_cids"):
-            existing_safe_exit["exit_side"] = resolved_exit_side
-            existing_safe_exit["quantity"] = resolved_qty_dec
-            existing_safe_exit["reference_price"] = float(reference_price)
-            existing_safe_exit["reason_tag"] = resolved_reason
-            existing_safe_exit["signal_tags"] = list(signal_tags or [])
-            return str(next(iter(existing_safe_exit["pending_stop_cids"])))
 
         pending_cids = {str(o.client_order_id) for o in open_stops}
         self._notify_safe_exit_begin(sym)
