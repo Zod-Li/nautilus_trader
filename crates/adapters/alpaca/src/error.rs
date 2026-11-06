@@ -64,6 +64,9 @@ pub enum AlpacaError {
     /// Payload deserialization or domain conversion error (non-retryable).
     #[error("Alpaca payload parse error: {0}")]
     Parse(String),
+    /// Unsupported order type or trailing offset type (non-retryable).
+    #[error("Alpaca unsupported order type: {0}")]
+    UnsupportedOrderType(String),
 }
 
 impl AlpacaError {

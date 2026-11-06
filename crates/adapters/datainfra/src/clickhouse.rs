@@ -452,12 +452,6 @@ impl ClickHouseArrowTransport for HttpClickHouseArrowTransport {
 
                 let status_code = response.status.as_u16();
                 if status_code == 200 {
-                    if response.body.is_empty() {
-                        return Err(DataInfraError::Transport(
-                            "ClickHouse HTTP 200 response returned empty ArrowStream body (fail-closed)"
-                                .to_string(),
-                        ));
-                    }
                     return Ok(response.body);
                 }
 
@@ -581,14 +575,12 @@ pub fn build_sip_quotes_query(
     let mut where_clauses = vec!["symbol IN {symbols:Array(String)}".to_string()];
 
     if let Some(start_ns) = req.start_ts_ns {
-        let start_sec = start_ns.as_u64() / 1_000_000_000;
-        params.push(("start_ts".to_string(), start_sec.to_string()));
-        where_clauses.push("toUnixTimestamp(event_time) >= {start_ts:UInt64}".to_string());
+        params.push(("start_ts_ns".to_string(), start_ns.as_u64().to_string()));
+        where_clauses.push("toUnixTimestamp64Nano(event_time) >= {start_ts_ns:UInt64}".to_string());
     }
     if let Some(end_ns) = req.end_ts_ns {
-        let end_sec = end_ns.as_u64() / 1_000_000_000;
-        params.push(("end_ts".to_string(), end_sec.to_string()));
-        where_clauses.push("toUnixTimestamp(event_time) <= {end_ts:UInt64}".to_string());
+        params.push(("end_ts_ns".to_string(), end_ns.as_u64().to_string()));
+        where_clauses.push("toUnixTimestamp64Nano(event_time) <= {end_ts_ns:UInt64}".to_string());
     }
 
     let limit_clause = if let Some(limit) = req.limit {
@@ -632,14 +624,12 @@ pub fn build_sip_statuses_query(
     let mut where_clauses = vec!["symbol IN {symbols:Array(String)}".to_string()];
 
     if let Some(start_ns) = req.start_ts_ns {
-        let start_sec = start_ns.as_u64() / 1_000_000_000;
-        params.push(("start_ts".to_string(), start_sec.to_string()));
-        where_clauses.push("toUnixTimestamp(event_time) >= {start_ts:UInt64}".to_string());
+        params.push(("start_ts_ns".to_string(), start_ns.as_u64().to_string()));
+        where_clauses.push("toUnixTimestamp64Nano(event_time) >= {start_ts_ns:UInt64}".to_string());
     }
     if let Some(end_ns) = req.end_ts_ns {
-        let end_sec = end_ns.as_u64() / 1_000_000_000;
-        params.push(("end_ts".to_string(), end_sec.to_string()));
-        where_clauses.push("toUnixTimestamp(event_time) <= {end_ts:UInt64}".to_string());
+        params.push(("end_ts_ns".to_string(), end_ns.as_u64().to_string()));
+        where_clauses.push("toUnixTimestamp64Nano(event_time) <= {end_ts_ns:UInt64}".to_string());
     }
 
     let limit_clause = if let Some(limit) = req.limit {

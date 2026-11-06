@@ -642,11 +642,11 @@ impl RustPlanGateEngine {
         if let Some(stop_px) = effective_stop_px
             && plan_item.max_risk_budget_usd > Decimal::ZERO
         {
-            let trade_risk_usd = (budget_ref_price - stop_px).abs() * request.quantity;
+            let trade_risk_usd = (budget_ref_price - stop_px).abs() * projected_total_qty;
             if trade_risk_usd > plan_item.max_risk_budget_usd {
                 let reason = format!(
                     "RISK_BUDGET_EXCEEDED: single-trade risk (|{budget_ref_price} - {stop_px}| * {} = {trade_risk_usd}) exceeds max_risk_budget_usd ({})",
-                    request.quantity, plan_item.max_risk_budget_usd
+                    projected_total_qty, plan_item.max_risk_budget_usd
                 );
                 Self::enqueue_denied_mutation(
                     &mut guard,
@@ -720,11 +720,21 @@ impl RustPlanGateEngine {
             .copied()
             .unwrap_or(Decimal::ZERO);
         let updated = (current - quantity).max(Decimal::ZERO);
+        let actual_released_qty = (current - updated).max(Decimal::ZERO);
         guard
             .reserved_qty_by_symbol
             .insert(symbol.to_string(), updated);
+        let mut released_notional = Decimal::ZERO;
         if let Some(item) = guard.items_by_symbol.get_mut(symbol) {
             item.filled_qty = updated;
+            if updated == Decimal::ZERO && item.status == "TRIGGERED" {
+                item.status = "ARMED".to_string();
+            }
+            if item.target_qty > Decimal::ZERO && item.target_notional_usd > Decimal::ZERO {
+                let implied_ref_price = item.target_notional_usd / item.target_qty;
+                released_notional = (actual_released_qty * implied_ref_price)
+                    .round_dp_with_strategy(2, RoundingStrategy::MidpointNearestEven);
+            }
         }
         let item_id = guard
             .items_by_symbol
@@ -736,6 +746,7 @@ impl RustPlanGateEngine {
             "item_id": item_id,
             "quantity": quantity.to_string(),
             "new_reserved_qty": updated.to_string(),
+            "released_notional_usd": released_notional.to_string(),
         });
         guard.pending_mutations.push_back(mutation.to_string());
         updated

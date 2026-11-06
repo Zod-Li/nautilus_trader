@@ -10,6 +10,7 @@ coverage via `ProtectiveOcoMonitor`.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
@@ -45,6 +46,49 @@ from nautilus_trader.model import (
 from evolution_engine.db.dsn import resolve_database_dsn
 
 logger = logging.getLogger(__name__)
+
+
+class _BoundedFifoSet(OrderedDict):
+    """FIFO-bounded set backed by `collections.OrderedDict`."""
+
+    def __init__(self, max_size: int = 4096) -> None:
+        super().__init__()
+        self._max_size = max(1, int(max_size))
+
+    def add(self, key: str) -> None:
+        if key in self:
+            self.move_to_end(key)
+            return
+        while len(self) >= self._max_size:
+            self.popitem(last=False)
+        self[key] = None
+
+    def discard(self, key: str) -> None:
+        self.pop(key, None)
+
+
+class _BoundedFifoDict(OrderedDict):
+    """FIFO-bounded dictionary backed by `collections.OrderedDict`."""
+
+    def __init__(self, max_size: int = 8192) -> None:
+        super().__init__()
+        self._max_size = max(1, int(max_size))
+
+    def __setitem__(self, key: Any, value: Any) -> None:
+        if key in self:
+            super().__setitem__(key, value)
+            self.move_to_end(key)
+            return
+        while len(self) >= self._max_size:
+            self.popitem(last=False)
+        super().__setitem__(key, value)
+
+    def setdefault(self, key: Any, default: Any = None) -> Any:
+        if key in self:
+            self.move_to_end(key)
+            return self[key]
+        self[key] = default
+        return default
 
 
 class _AsyncTelemetryDbWorker:
@@ -974,13 +1018,13 @@ class PostgresTelemetryActor(DataActor):
             connect_timeout_secs=self._connect_timeout_secs,
             persist_to_db=self._persist_to_db,
         )
-        self._processed_event_ids: Set[str] = set()
-        self._order_meta: Dict[str, Dict[str, Any]] = {}
-        self._fills_by_cid: Dict[str, Dict[str, Tuple[Decimal, Decimal]]] = {}
+        self._processed_event_ids: _BoundedFifoSet = _BoundedFifoSet(16384)
+        self._order_meta: _BoundedFifoDict = _BoundedFifoDict(8192)
+        self._fills_by_cid: _BoundedFifoDict = _BoundedFifoDict(8192)
         self._active_stop_legs_by_symbol: Dict[str, Dict[str, Decimal]] = {}
         self._active_stop_price_by_leg: Dict[str, Decimal] = {}
-        self._terminated_stop_cids: Set[str] = set()
-        self._replaced_stop_cids: Set[str] = set()
+        self._terminated_stop_cids: _BoundedFifoSet = _BoundedFifoSet(4096)
+        self._replaced_stop_cids: _BoundedFifoSet = _BoundedFifoSet(4096)
         self._safe_exit_symbols: Set[str] = set()
         self._msgbus_subscriptions: List[Tuple[str, Any]] = []
         self._subscribed_msgbuses: Set[int] = set()
@@ -1090,9 +1134,9 @@ class PostgresTelemetryActor(DataActor):
 
         if old_cid:
             if len(self._replaced_stop_cids) >= 4096:
-                self._replaced_stop_cids.pop()
+                self._replaced_stop_cids.popitem(last=False)
             if len(self._terminated_stop_cids) >= 4096:
-                self._terminated_stop_cids.pop()
+                self._terminated_stop_cids.popitem(last=False)
             self._replaced_stop_cids.add(str(old_cid))
             self._terminated_stop_cids.add(str(old_cid))
             if norm_sym and norm_sym in self._active_stop_legs_by_symbol:
@@ -2097,7 +2141,7 @@ class PostgresTelemetryActor(DataActor):
                 or meta.get("stop_loss_price")
                 or Decimal("0")
             )
-            if total_remaining_cov == Decimal("0") or new_pos_qty == Decimal("0"):
+            if new_pos_qty == Decimal("0"):
                 legs.clear()
                 closed_cov = ProtectiveOrderCoverage(
                     symbol=sym,

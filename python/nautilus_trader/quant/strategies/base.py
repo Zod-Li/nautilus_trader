@@ -99,6 +99,7 @@ class BaseArchetypeStrategyConfig(StrategyConfig):
         use_limit_orders: bool = True,
         submit_protective_stop: bool = False,
         execution_delay_bars: int = 0,
+        entry_ttl_bars: Optional[int] = None,
         exec_algorithm_id: str | ExecAlgorithmId = PLAN_GATE_EXEC_ALGORITHM_ID,
         strategy_id: Optional[str | StrategyId] = None,
         order_id_tag: Optional[str] = None,
@@ -106,7 +107,7 @@ class BaseArchetypeStrategyConfig(StrategyConfig):
         log_events: bool = True,
         log_commands: bool = True,
     ):
-        _ = execution_delay_bars
+        _ = (execution_delay_bars, entry_ttl_bars)
         inst_str = str(instrument_id).strip()
         sym_clean = inst_str.split(".", 1)[0].replace("/", "")
         default_tag = str(order_id_tag or sym_clean[:8] or "001")
@@ -141,6 +142,7 @@ class BaseArchetypeStrategyConfig(StrategyConfig):
         use_limit_orders: bool = True,
         submit_protective_stop: bool = False,
         execution_delay_bars: int = 0,
+        entry_ttl_bars: Optional[int] = None,
         exec_algorithm_id: str | ExecAlgorithmId = PLAN_GATE_EXEC_ALGORITHM_ID,
         strategy_id: Optional[str | StrategyId] = None,
         order_id_tag: Optional[str] = None,
@@ -182,6 +184,9 @@ class BaseArchetypeStrategyConfig(StrategyConfig):
         self.use_limit_orders = bool(use_limit_orders)
         self.submit_protective_stop = bool(submit_protective_stop)
         self.execution_delay_bars = max(0, int(execution_delay_bars))
+        self.entry_ttl_bars: Optional[int] = (
+            max(1, int(entry_ttl_bars)) if entry_ttl_bars is not None else None
+        )
         self.exec_algorithm_id = (
             exec_algorithm_id
             if isinstance(exec_algorithm_id, ExecAlgorithmId)
@@ -920,15 +925,26 @@ class BaseArchetypeStrategy(Strategy):
     def _expire_stale_unfilled_entry_orders(self) -> None:
         if not self._active_entry_orders_by_inst:
             return
+        valid_until_ns: Optional[int] = None
+        if (
+            self._risk_envelope is not None
+            and getattr(self._risk_envelope, "valid_until", None) is not None
+        ):
+            vu = self._risk_envelope.valid_until
+            if isinstance(vu, datetime):
+                vu_utc = vu if vu.tzinfo is not None else vu.replace(tzinfo=timezone.utc)
+                valid_until_ns = int(vu_utc.timestamp() * 1_000_000_000)
+            elif isinstance(vu, (int, float)):
+                valid_until_ns = int(vu)
+        cfg_ttl = getattr(self._archetype_config, "entry_ttl_bars", None)
+        if cfg_ttl is None:
+            cfg_ttl = getattr(self, "_entry_ttl_bars", None)
+
         for inst_key, entry_spec in list(self._active_entry_orders_by_inst.items()):
             if entry_spec.get("canceling"):
                 continue
             submitted_seq = int(entry_spec.get("submitted_bar_seq", 0))
             if submitted_seq >= self._post_warmup_bar_seq:
-                continue
-            target_inst = entry_spec.get("instrument_id") or InstrumentId.from_str(inst_key)
-            if self._open_position_signed_qty(target_inst) != Decimal("0"):
-                self._active_entry_orders_by_inst.pop(inst_key, None)
                 continue
             order_obj = entry_spec.get("order")
             cid = str(entry_spec.get("cid", "") or "")
@@ -948,10 +964,44 @@ class BaseArchetypeStrategy(Strategy):
             if status_str in ("DENIED", "REJECTED", "CANCELED", "EXPIRED", "FILLED"):
                 self._active_entry_orders_by_inst.pop(inst_key, None)
                 continue
+
+            raw_leaves = getattr(order_obj, "leaves_qty", None)
+            total_qty_dec = _to_decimal(getattr(order_obj, "quantity", 0), "0")
             filled_qty_dec = _to_decimal(getattr(order_obj, "filled_qty", 0), "0")
-            if filled_qty_dec > Decimal("0"):
+            if raw_leaves is not None:
+                leaves_qty_dec = _to_decimal(
+                    raw_leaves.as_decimal()
+                    if hasattr(raw_leaves, "as_decimal")
+                    else raw_leaves,
+                    "0",
+                )
+            elif total_qty_dec > Decimal("0"):
+                leaves_qty_dec = max(Decimal("0"), total_qty_dec - filled_qty_dec)
+            else:
+                leaves_qty_dec = Decimal("0")
+
+            if leaves_qty_dec <= Decimal("0") and (
+                raw_leaves is not None
+                or total_qty_dec > Decimal("0")
+                or filled_qty_dec > Decimal("0")
+            ):
                 self._active_entry_orders_by_inst.pop(inst_key, None)
                 continue
+
+            spec_ttl = entry_spec.get("entry_ttl_bars", cfg_ttl)
+            expired_by_ttl = (
+                spec_ttl is not None
+                and int(spec_ttl) > 0
+                and self._post_warmup_bar_seq >= (submitted_seq + int(spec_ttl))
+            )
+            expired_by_valid_until = (
+                valid_until_ns is not None
+                and valid_until_ns > 0
+                and self._last_bar_ts_ns > valid_until_ns
+            )
+            if not (expired_by_ttl or expired_by_valid_until):
+                continue
+
             self._active_entry_orders_by_inst.pop(inst_key, None)
             self._cancel_single_order_safely(order_obj)
 

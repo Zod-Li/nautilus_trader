@@ -120,9 +120,24 @@ pub fn parse_trade_update_payload(
         _ => order_report.order_status,
     };
 
-    let client_order_id = order_report.client_order_id.ok_or_else(|| {
-        AlpacaError::Parse("trade_update order is missing client_order_id".to_string())
-    })?;
+    let client_order_id = match order_report.client_order_id {
+        Some(cid) => cid,
+        None => {
+            let fallback_id = payload.order.id.trim();
+            if fallback_id.is_empty() {
+                return Err(AlpacaError::Parse(
+                    "trade_update order is missing client_order_id and id".to_string(),
+                ));
+            }
+            let cid = ClientOrderId::new_checked(fallback_id).map_err(|e| {
+                AlpacaError::Parse(format!(
+                    "invalid fallback client_order_id '{fallback_id}': {e}"
+                ))
+            })?;
+            order_report.client_order_id = Some(cid);
+            cid
+        }
+    };
     let venue_order_id = order_report.venue_order_id;
     let instrument_id = order_report.instrument_id;
     let order_side = OrderSide::from(payload.order.side);

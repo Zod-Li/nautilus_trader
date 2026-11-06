@@ -548,6 +548,7 @@ class IsomorphicBacktestRunner:
         plan_item: PlanItemContract,
         *,
         bars: Optional[Sequence[Bar]] = None,
+        warmup_bars: Optional[Sequence[Bar]] = None,
         raw_bars: Optional[Sequence[Bar]] = None,
         raw_low_by_ts_ns: Optional[Mapping[int, float]] = None,
         raw_high_by_ts_ns: Optional[Mapping[int, float]] = None,
@@ -641,6 +642,11 @@ class IsomorphicBacktestRunner:
                 prob_fill_on_limit=1.0,
                 prob_slippage=0.0,
             )
+            engine_slippage_active = isinstance(
+                effective_fill_model, OneTickSlippageFillModel
+            ) or (
+                float(getattr(effective_fill_model, "prob_slippage", 0.0) or 0.0) > 0.0
+            )
             engine.add_venue(
                 venue=Venue(venue_str),
                 oms_type=OmsType.NETTING,
@@ -712,6 +718,9 @@ class IsomorphicBacktestRunner:
                     cleaned_by_ts_ns=cleaned_by_ts_ns,
                     raw_by_ts_ns=raw_by_ts_ns,
                 )
+            if warmup_bars:
+                normalized_warmup = _normalize_bars_for_parity(list(warmup_bars))
+                strategy.warmup_historical_bars(normalized_warmup)
             engine.add_strategy(strategy)
 
             if status_list:
@@ -734,6 +743,7 @@ class IsomorphicBacktestRunner:
                 slippage_multiplier=slippage_multiplier,
                 walk_forward=walk_forward,
                 effective_trials=effective_trials,
+                engine_slippage_active=engine_slippage_active,
             )
         finally:
             if strategy is not None:
@@ -791,13 +801,16 @@ class IsomorphicBacktestRunner:
         )
         split_ts = primary_bars[split_idx].ts_init
         is_bars = [b for b in bar_list if b.ts_init < split_ts]
-        warmup_bars = (
+        warmup_count = (
             int(plan_item.strategy_config.lookback_window)
             + int(plan_item.strategy_config.slow_window)
         )
-        warmup_start_idx = max(0, split_idx - warmup_bars)
-        oos_start_ts = primary_bars[warmup_start_idx].ts_init
-        oos_bars = [b for b in bar_list if b.ts_init >= oos_start_ts]
+        warmup_start_idx = max(0, split_idx - warmup_count)
+        warmup_start_ts = primary_bars[warmup_start_idx].ts_init
+        oos_warmup_bars = [
+            b for b in bar_list if warmup_start_ts <= b.ts_init < split_ts
+        ]
+        oos_bars = [b for b in bar_list if b.ts_init >= split_ts]
 
         is_metrics = self.run_backtest(
             plan_item,
@@ -811,6 +824,7 @@ class IsomorphicBacktestRunner:
         oos_metrics = self.run_backtest(
             plan_item,
             bars=oos_bars,
+            warmup_bars=oos_warmup_bars,
             equities=equity_list,
             use_limit_orders=use_limit_orders,
             submit_protective_stop=submit_protective_stop,
@@ -854,6 +868,7 @@ class IsomorphicBacktestRunner:
         slippage_multiplier: float,
         walk_forward: Optional[WalkForwardSummary],
         effective_trials: Optional[int] = None,
+        engine_slippage_active: bool = False,
     ) -> IsomorphicBacktestMetrics:
         start_cap = float(self._starting_capital_usd)
         orders = list(engine.cache.orders() or [])
@@ -960,10 +975,13 @@ class IsomorphicBacktestRunner:
             0.0, float(slippage_multiplier)
         )
         est_slippage_cost = traded_notional * slippage_rate
-        if est_slippage_cost > 0.0:
-            net_pnl -= est_slippage_cost
+        deducted_slippage_cost = (
+            0.0 if engine_slippage_active else est_slippage_cost
+        )
+        if deducted_slippage_cost > 0.0:
+            net_pnl -= deducted_slippage_cost
 
-        gross_pnl = net_pnl + total_commissions + est_slippage_cost
+        gross_pnl = net_pnl + total_commissions + deducted_slippage_cost
         end_cap = start_cap + net_pnl
         total_return_pct = (net_pnl / start_cap) if start_cap > 0.0 else 0.0
 
@@ -974,7 +992,7 @@ class IsomorphicBacktestRunner:
             net_pnl_final=net_pnl,
             all_bars=bars,
             total_commissions=total_commissions,
-            est_slippage_cost=est_slippage_cost,
+            est_slippage_cost=deducted_slippage_cost,
         )
         self._last_orders = list(orders)
         self._last_period_returns = list(period_returns)

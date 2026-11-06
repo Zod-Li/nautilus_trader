@@ -108,11 +108,14 @@ class VolatilityBreakoutStrategy(BaseArchetypeStrategy):
         signed_pos = self._open_position_signed_qty()
         if signed_pos > Decimal("0"):
             candidate_stop = high_px - (atr_mult * atr)
+            prev_stop = self._trailing_stop_price
+            ratcheted = False
             if (
-                self._trailing_stop_price is None
-                or candidate_stop > self._trailing_stop_price
+                prev_stop is None
+                or candidate_stop > prev_stop
             ):
                 self._trailing_stop_price = candidate_stop
+                ratcheted = prev_stop is not None and candidate_stop > prev_stop
 
             stop_hit = (
                 self._trailing_stop_price is not None
@@ -128,15 +131,23 @@ class VolatilityBreakoutStrategy(BaseArchetypeStrategy):
                     reason_tag=reason,
                 )
                 self._entry_reference_price = None
+            elif ratcheted:
+                self._replace_protective_stop_price(
+                    self._trailing_stop_price,
+                    self.config.instrument_id,
+                )
             return
 
         if signed_pos < Decimal("0"):
             candidate_stop = low_px + (atr_mult * atr)
+            prev_stop = self._trailing_stop_price
+            ratcheted = False
             if (
-                self._trailing_stop_price is None
-                or candidate_stop < self._trailing_stop_price
+                prev_stop is None
+                or candidate_stop < prev_stop
             ):
                 self._trailing_stop_price = candidate_stop
+                ratcheted = prev_stop is not None and candidate_stop < prev_stop
 
             stop_hit = (
                 self._trailing_stop_price is not None
@@ -152,6 +163,11 @@ class VolatilityBreakoutStrategy(BaseArchetypeStrategy):
                     reason_tag=reason,
                 )
                 self._entry_reference_price = None
+            elif ratcheted:
+                self._replace_protective_stop_price(
+                    self._trailing_stop_price,
+                    self.config.instrument_id,
+                )
             return
 
         if (

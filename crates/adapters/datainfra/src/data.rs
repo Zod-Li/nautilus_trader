@@ -523,6 +523,13 @@ impl DataInfraDataClient {
                     .as_u64()
                     .saturating_sub(timeframe_step_ns(&bar.bar_type)),
             );
+            if self.calendar_gate.should_refresh_for_bar_open(bar_open_ns) {
+                let gate = self.calendar_gate.clone();
+                let at_ts = Some((bar_open_ns.as_u64() / 1_000_000_000) as i64);
+                block_on_catalog_future(async move {
+                    gate.refresh_session_status(at_ts).await
+                })?;
+            }
             if !self.calendar_gate.is_within_cached_rth(bar_open_ns)? {
                 return Err(DataInfraError::CalendarGate(format!(
                     "live bar {} at bar_open_ns={bar_open_ns} (ts_event={}) is outside cached RTH session window",
@@ -580,6 +587,16 @@ impl DataInfraDataClient {
                                                     .as_u64()
                                                     .saturating_sub(timeframe_step_ns(&bar.bar_type)),
                                             );
+                                            if calendar_gate.should_refresh_for_bar_open(bar_open_ns) {
+                                                let at_ts = Some((bar_open_ns.as_u64() / 1_000_000_000) as i64);
+                                                if let Err(e) = calendar_gate.refresh_session_status(at_ts).await {
+                                                    log::warn!(
+                                                        "DataInfra background consumer calendar refresh failed for bar {}: {e}",
+                                                        bar.bar_type
+                                                    );
+                                                    continue;
+                                                }
+                                            }
                                             match calendar_gate.is_within_cached_rth(bar_open_ns) {
                                                 Ok(true) => {}
                                                 Ok(false) => {

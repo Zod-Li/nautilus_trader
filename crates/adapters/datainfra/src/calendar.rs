@@ -147,6 +147,43 @@ impl CalendarSessionStatus {
         };
         ts_close_ns > open_ns && ts_close_ns <= close_ns
     }
+
+    /// Returns `true` when `bar_open_ns` has reached or passed `rth_close_ns()`
+    /// (or precedes `rth_open_ns()` on a different UTC day) and the cached session
+    /// status must be refreshed for `bar_open_ns`.
+    #[must_use]
+    pub fn should_refresh_for_bar_open(&self, bar_open_ns: UnixNanos) -> bool {
+        let bar_open_sec = (bar_open_ns.as_u64() / 1_000_000_000) as i64;
+        if let Some(close_ns) = self.rth_close_ns()
+            && bar_open_ns >= close_ns
+        {
+            if self.queried_at_utc >= self.rth_close_utc
+                && bar_open_sec.div_euclid(86_400) == self.queried_at_utc.div_euclid(86_400)
+            {
+                return false;
+            }
+            return true;
+        }
+        if let Some(open_ns) = self.rth_open_ns()
+            && bar_open_ns < open_ns
+        {
+            let ref_sec = if self.rth_open_utc > 0 {
+                self.rth_open_utc
+            } else {
+                self.queried_at_utc
+            };
+            if bar_open_sec.div_euclid(86_400) != ref_sec.div_euclid(86_400) {
+                return true;
+            }
+        }
+        if !self.is_trading_day
+            && self.queried_at_utc > 0
+            && bar_open_sec.div_euclid(86_400) != self.queried_at_utc.div_euclid(86_400)
+        {
+            return true;
+        }
+        false
+    }
 }
 
 /// Transport port for querying `calendar-service`.
@@ -311,6 +348,14 @@ impl CalendarSessionGate {
     #[must_use]
     pub fn cached_status(&self) -> Option<CalendarSessionStatus> {
         self.cached_status.read().clone()
+    }
+
+    /// Returns `true` if the cached session status is stale relative to `bar_open_ns`
+    /// and should be refreshed before evaluating [`Self::is_within_cached_rth`].
+    #[must_use]
+    pub fn should_refresh_for_bar_open(&self, bar_open_ns: UnixNanos) -> bool {
+        self.cached_status()
+            .is_some_and(|status| status.should_refresh_for_bar_open(bar_open_ns))
     }
 
     /// Verifies whether `ts_ns` falls within the currently cached RTH session window

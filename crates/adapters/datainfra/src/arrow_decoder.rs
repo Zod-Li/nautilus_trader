@@ -133,12 +133,10 @@ impl ArrowDecodeOptions {
 ///
 /// # Errors
 ///
-/// Returns [`DataInfraError::Transport`] if the byte buffer is empty or is not a valid Arrow IPC stream.
+/// Returns [`DataInfraError::Transport`] if the byte buffer is not a valid Arrow IPC stream.
 pub fn decode_arrow_ipc_stream(raw_bytes: &[u8]) -> DataInfraResult<Vec<RecordBatch>> {
     if raw_bytes.is_empty() {
-        return Err(DataInfraError::Transport(
-            "ClickHouse ArrowStream response body is empty (fail-closed)".to_string(),
-        ));
+        return Ok(Vec::new());
     }
     let cursor = Cursor::new(raw_bytes);
     let reader = StreamReader::try_new(cursor, None).map_err(|e| {

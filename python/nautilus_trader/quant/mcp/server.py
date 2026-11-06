@@ -164,13 +164,9 @@ class NautilusMcpServer:
         self._venue_name = str(venue_name or "ALPACA").strip().upper()
         self._capital_basis_usd = Decimal(str(capital_basis_usd))
         self._system_config = system_config or SystemConfig()
-        self._runner = backtest_runner or IsomorphicBacktestRunner(
-            dsn=None,
-            datainfra_config=self._datainfra_config,
-            starting_capital_usd=self._capital_basis_usd,
-            effective_trials=2,
-            venue_name=self._venue_name,
-        )
+        self._custom_runner_injected = backtest_runner is not None
+        self._custom_falsifier_injected = stress_falsifier is not None
+        self._runner = backtest_runner or self._create_isolated_runner()
         self._falsifier = stress_falsifier or StressFalsifier(runner=self._runner)
         self._bar_provider = bar_provider
         self._equity_provider = equity_provider
@@ -178,10 +174,34 @@ class NautilusMcpServer:
         self._portfolio_state_provider = portfolio_state_provider
 
         self._lock = threading.Lock()
+        self._runner_lock = threading.RLock()
+        self._max_verified_cache_entries: int = 1024
         self._cumulative_trials: int = 0
         self._verified_backtests: Dict[str, IsomorphicBacktestMetrics] = {}
         self._verified_falsifications: Dict[str, Tuple[str, StressFalsificationReport]] = {}
         self._verified_falsification_envelopes: Dict[str, PlanRiskEnvelope] = {}
+
+    def _create_isolated_runner(self) -> IsomorphicBacktestRunner:
+        return IsomorphicBacktestRunner(
+            dsn=None,
+            datainfra_config=self._datainfra_config,
+            starting_capital_usd=self._capital_basis_usd,
+            effective_trials=2,
+            venue_name=self._venue_name,
+        )
+
+    def _prune_verified_caches_locked(self) -> None:
+        max_entries = max(1, int(self._max_verified_cache_entries))
+        while len(self._verified_backtests) > max_entries:
+            oldest_key = next(iter(self._verified_backtests))
+            self._verified_backtests.pop(oldest_key, None)
+        while len(self._verified_falsifications) > max_entries:
+            oldest_key = next(iter(self._verified_falsifications))
+            self._verified_falsifications.pop(oldest_key, None)
+            self._verified_falsification_envelopes.pop(oldest_key, None)
+        while len(self._verified_falsification_envelopes) > max_entries:
+            oldest_key = next(iter(self._verified_falsification_envelopes))
+            self._verified_falsification_envelopes.pop(oldest_key, None)
 
     @property
     def allowed_tools(self) -> List[str]:
@@ -508,25 +528,44 @@ class NautilusMcpServer:
             explicit_trials=effective_trials,
         )
 
-        if walk_forward:
-            metrics = self._runner.run_walk_forward(
-                plan_item,
-                bars=bars,
-                equities=equities,
-                effective_trials=eff_trials,
-            )
+        if self._custom_runner_injected:
+            with self._runner_lock:
+                if walk_forward:
+                    metrics = self._runner.run_walk_forward(
+                        plan_item,
+                        bars=bars,
+                        equities=equities,
+                        effective_trials=eff_trials,
+                    )
+                else:
+                    metrics = self._runner.run_backtest(
+                        plan_item,
+                        bars=bars,
+                        equities=equities,
+                        effective_trials=eff_trials,
+                    )
         else:
-            metrics = self._runner.run_backtest(
-                plan_item,
-                bars=bars,
-                equities=equities,
-                effective_trials=eff_trials,
-            )
+            request_runner = self._create_isolated_runner()
+            if walk_forward:
+                metrics = request_runner.run_walk_forward(
+                    plan_item,
+                    bars=bars,
+                    equities=equities,
+                    effective_trials=eff_trials,
+                )
+            else:
+                metrics = request_runner.run_backtest(
+                    plan_item,
+                    bars=bars,
+                    equities=equities,
+                    effective_trials=eff_trials,
+                )
 
         fp = compute_strategy_fingerprint(sym, strat_cfg)
         backtest_id = f"bt-{fp[:16]}"
         with self._lock:
             self._verified_backtests[fp] = metrics
+            self._prune_verified_caches_locked()
 
         return {
             "backtest_attestation_id": backtest_id,
@@ -572,12 +611,23 @@ class NautilusMcpServer:
             explicit_trials=effective_trials,
         )
 
-        report = self._falsifier.run_falsification(
-            plan_item,
-            bars=bars,
-            equities=equities,
-            effective_trials=eff_trials,
-        )
+        if self._custom_falsifier_injected or self._custom_runner_injected:
+            with self._runner_lock:
+                report = self._falsifier.run_falsification(
+                    plan_item,
+                    bars=bars,
+                    equities=equities,
+                    effective_trials=eff_trials,
+                )
+        else:
+            request_runner = self._create_isolated_runner()
+            request_falsifier = StressFalsifier(runner=request_runner)
+            report = request_falsifier.run_falsification(
+                plan_item,
+                bars=bars,
+                equities=equities,
+                effective_trials=eff_trials,
+            )
         fp = compute_strategy_fingerprint(sym, strat_cfg, risk_envelope=env)
         base_fp = compute_strategy_fingerprint(sym, strat_cfg)
         with self._lock:
@@ -597,6 +647,7 @@ class NautilusMcpServer:
             self._verified_falsifications[base_fp] = (token, report)
             self._verified_falsification_envelopes[fp] = env
             self._verified_falsification_envelopes[base_fp] = env
+            self._prune_verified_caches_locked()
 
         return {
             "symbol": sym,

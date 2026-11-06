@@ -596,21 +596,43 @@ class _AsyncPlanGateDbWorker:
         elif kind == "RELEASE_RESERVATION":
             item_id = mutation.get("item_id")
             new_reserved = Decimal(str(mutation["new_reserved_qty"]))
+            qty_dec = Decimal(str(mutation.get("quantity", "0")))
+            released_notional = Decimal(str(mutation.get("released_notional_usd", "0")))
             if item_id:
                 cur.execute(
                     """
                     UPDATE trading_plan_items
                     SET filled_qty = %s,
+                        reserved_notional_usd = CASE
+                            WHEN %s = 0 THEN 0
+                            ELSE GREATEST(0, COALESCE(reserved_notional_usd, 0) - %s)
+                        END,
+                        status = CASE
+                            WHEN (GREATEST(0, COALESCE(filled_qty, 0) - %s) = 0 OR %s = 0) AND status = 'TRIGGERED' THEN 'ARMED'
+                            ELSE status
+                        END,
                         updated_at = NOW()
                     WHERE item_id = %s
                     """,
-                    (new_reserved, item_id),
+                    (
+                        new_reserved,
+                        new_reserved,
+                        released_notional,
+                        qty_dec,
+                        new_reserved,
+                        item_id,
+                    ),
                 )
             elif self._trading_date is not None:
                 cur.execute(
                     """
                     UPDATE trading_plan_items i
-                    SET filled_qty = GREATEST(0, i.filled_qty - %s),
+                    SET filled_qty = GREATEST(0, COALESCE(i.filled_qty, 0) - %s),
+                        reserved_notional_usd = GREATEST(0, COALESCE(i.reserved_notional_usd, 0) - %s),
+                        status = CASE
+                            WHEN GREATEST(0, COALESCE(i.filled_qty, 0) - %s) = 0 AND i.status = 'TRIGGERED' THEN 'ARMED'
+                            ELSE i.status
+                        END,
                         updated_at = NOW()
                     FROM trading_plans p
                     WHERE p.plan_id = i.plan_id
@@ -619,7 +641,14 @@ class _AsyncPlanGateDbWorker:
                       AND p.status = 'LOCKED'
                       AND i.symbol = %s
                     """,
-                    (Decimal(str(mutation["quantity"])), self._trading_date, self._market, mutation["symbol"]),
+                    (
+                        qty_dec,
+                        released_notional,
+                        qty_dec,
+                        self._trading_date,
+                        self._market,
+                        mutation["symbol"],
+                    ),
                 )
         elif kind == "SET_ENTRY_FREEZE":
             active_val = bool(mutation.get("active", True))
@@ -721,6 +750,7 @@ class PostgresPlanGateBackend:
         self._items_by_symbol: Dict[str, PlanItemContract] = {}
         self._runtime_items_by_symbol: Dict[str, Tuple[PlanItemContract, Optional[Decimal]]] = {}
         self._removed_runtime_symbols: set[str] = set()
+        self._released_cap_by_symbol: Dict[str, Decimal] = {}
         self._alerts: List[Dict[str, Any]] = []
         for item in plan_items:
             self.upsert_runtime_plan_item(item, reserved_qty=item.filled_qty)
@@ -779,6 +809,7 @@ class PostgresPlanGateBackend:
         if clear_runtime_items:
             self._runtime_items_by_symbol.clear()
             self._removed_runtime_symbols.clear()
+            self._released_cap_by_symbol.clear()
         if sync and self._persist_to_db:
             self.sync_from_db(preserve_higher_reservation=False)
 
@@ -801,6 +832,7 @@ class PostgresPlanGateBackend:
         norm_sym = adjusted_item.symbol
         with self._sync_lock:
             self._removed_runtime_symbols.discard(norm_sym)
+            self._released_cap_by_symbol.pop(norm_sym, None)
             self._runtime_items_by_symbol[norm_sym] = (adjusted_item, reserved_qty)
             self._rust_engine.upsert_plan_item(
                 _plan_item_to_rust_envelope(adjusted_item),
@@ -1239,7 +1271,22 @@ class PostgresPlanGateBackend:
                         try:
                             plan_item = PlanItemContract.from_db_row(row)
                             norm_sym = plan_item.symbol
-                            if effective_preserve:
+                            released_cap = self._released_cap_by_symbol.get(norm_sym)
+                            if released_cap is not None:
+                                capped_qty = min(plan_item.filled_qty, released_cap)
+                                capped_status = (
+                                    "ARMED"
+                                    if capped_qty == Decimal("0")
+                                    and str(plan_item.status) == "TRIGGERED"
+                                    else plan_item.status
+                                )
+                                plan_item = replace(
+                                    plan_item,
+                                    filled_qty=capped_qty,
+                                    status=capped_status,
+                                )
+                                item_preserve = False
+                            elif effective_preserve:
                                 prior_reserved = prev_reserved.get(
                                     norm_sym, Decimal("0")
                                 )
@@ -1248,9 +1295,12 @@ class PostgresPlanGateBackend:
                                         plan_item,
                                         filled_qty=prior_reserved,
                                     )
+                                item_preserve = True
+                            else:
+                                item_preserve = False
                             self._rust_engine.upsert_plan_item(
                                 _plan_item_to_rust_envelope(plan_item),
-                                effective_preserve,
+                                item_preserve,
                             )
                             self._known_symbols.add(norm_sym)
                             self._symbol_by_item_id[str(plan_item.item_id)] = norm_sym
@@ -1264,6 +1314,7 @@ class PostgresPlanGateBackend:
                         self._runtime_items_by_symbol.items()
                     ):
                         prior_res = prev_reserved.get(norm_sym, Decimal("0"))
+                        released_cap = self._released_cap_by_symbol.get(norm_sym)
                         if norm_sym in loaded_by_symbol:
                             db_item = loaded_by_symbol[norm_sym]
                             db_stop = db_item.risk_envelope.initial_stop_price
@@ -1293,10 +1344,19 @@ class PostgresPlanGateBackend:
                                 if effective_preserve
                                 else max(db_item.filled_qty, rt_res)
                             )
+                            if released_cap is not None:
+                                effective_res = min(effective_res, released_cap)
+                            merged_status = (
+                                "ARMED"
+                                if effective_res == Decimal("0")
+                                and str(db_item.status) == "TRIGGERED"
+                                else db_item.status
+                            )
                             overlaid_item = replace(
                                 db_item,
                                 risk_envelope=merged_env,
                                 filled_qty=effective_res,
+                                status=merged_status,
                             )
                             self._runtime_items_by_symbol[norm_sym] = (
                                 overlaid_item,
@@ -1312,8 +1372,18 @@ class PostgresPlanGateBackend:
                                     else max(prior_res, runtime_item.filled_qty)
                                 )
                             )
+                            if released_cap is not None:
+                                effective_res = min(effective_res, released_cap)
+                            merged_status = (
+                                "ARMED"
+                                if effective_res == Decimal("0")
+                                and str(runtime_item.status) == "TRIGGERED"
+                                else runtime_item.status
+                            )
                             overlaid_item = replace(
-                                runtime_item, filled_qty=effective_res
+                                runtime_item,
+                                filled_qty=effective_res,
+                                status=merged_status,
                             )
                         self._rust_engine.upsert_plan_item(
                             _plan_item_to_rust_envelope(overlaid_item),
@@ -1340,6 +1410,33 @@ class PostgresPlanGateBackend:
             request.to_rust_request()
         )
         decision = PlanGateDecision.from_rust_decision(rust_decision)
+        if decision.allowed and not decision.is_exit_bypass:
+            norm_sym = str(request.symbol or "").strip().upper()
+            self._released_cap_by_symbol.pop(norm_sym, None)
+            new_res_raw = getattr(rust_decision, "new_reserved_qty", None)
+            if new_res_raw is not None:
+                new_res_dec = Decimal(str(new_res_raw))
+                if norm_sym in self._items_by_symbol:
+                    cur_item = self._items_by_symbol[norm_sym]
+                    new_status = (
+                        "TRIGGERED"
+                        if str(cur_item.status) == "ARMED"
+                        else cur_item.status
+                    )
+                    self._items_by_symbol[norm_sym] = replace(
+                        cur_item, filled_qty=new_res_dec, status=new_status
+                    )
+                if norm_sym in self._runtime_items_by_symbol:
+                    rt_item, _ = self._runtime_items_by_symbol[norm_sym]
+                    new_status = (
+                        "TRIGGERED"
+                        if str(rt_item.status) == "ARMED"
+                        else rt_item.status
+                    )
+                    self._runtime_items_by_symbol[norm_sym] = (
+                        replace(rt_item, filled_qty=new_res_dec, status=new_status),
+                        new_res_dec,
+                    )
         pending = list(self._rust_engine.drain_pending_mutations(64) or [])
 
         if not decision.allowed and not pending:
@@ -1405,7 +1502,31 @@ class PostgresPlanGateBackend:
             resolved_symbol = self._symbol_by_item_id.get(str(item_id), "")
         if not resolved_symbol:
             return
-        self._rust_engine.release_reservation(resolved_symbol, str(qty_dec))
+        new_res = Decimal(
+            str(self._rust_engine.release_reservation(resolved_symbol, str(qty_dec)))
+        )
+        self._released_cap_by_symbol[resolved_symbol] = new_res
+        if resolved_symbol in self._items_by_symbol:
+            cur_item = self._items_by_symbol[resolved_symbol]
+            reverted_status = (
+                "ARMED"
+                if new_res == Decimal("0") and str(cur_item.status) == "TRIGGERED"
+                else cur_item.status
+            )
+            self._items_by_symbol[resolved_symbol] = replace(
+                cur_item, filled_qty=new_res, status=reverted_status
+            )
+        if resolved_symbol in self._runtime_items_by_symbol:
+            rt_item, _ = self._runtime_items_by_symbol[resolved_symbol]
+            reverted_status = (
+                "ARMED"
+                if new_res == Decimal("0") and str(rt_item.status) == "TRIGGERED"
+                else rt_item.status
+            )
+            self._runtime_items_by_symbol[resolved_symbol] = (
+                replace(rt_item, filled_qty=new_res, status=reverted_status),
+                new_res,
+            )
         pending = list(self._rust_engine.drain_pending_mutations(64) or [])
         if pending:
             self._alerts.extend(pending)
@@ -1961,16 +2082,37 @@ class PlanGateExecAlgorithm(ExecutionAlgorithm):
                 except Exception:
                     pass
 
+        has_contingency_children = (
+            bool(protective_orders)
+            or any(
+                str(getattr(o, "parent_order_id", "") or "") in list_cids
+                or bool(getattr(o, "linked_order_ids", None))
+                for o in resolved_orders
+            )
+        )
+        effective_collar_market = (
+            self._collar_market_orders and not has_contingency_children
+        )
+
         admitted_entries: List[tuple[Any, PlanGateOrderRequest, PlanGateDecision]] = []
         for entry_order in entry_orders:
             request = self._build_order_request(entry_order)
             if request.stop_loss_price is None and inferred_list_stop_px is not None:
                 request = replace(request, stop_loss_price=inferred_list_stop_px)
+            if has_contingency_children:
+                request = replace(
+                    request,
+                    collar_market_order=effective_collar_market,
+                    allow_uncollared_market_order=False,
+                )
             if self._forward_gate is not None:
                 self._sync_forward_gate_runtime()
                 decision = self._forward_gate.evaluate_order(
                     entry_order,
                     inferred_stop_loss_price=inferred_list_stop_px,
+                    collar_market_order=(
+                        effective_collar_market if has_contingency_children else None
+                    ),
                 )
             else:
                 decision = self._backend.evaluate_and_reserve(request)
@@ -2051,11 +2193,6 @@ class PlanGateExecAlgorithm(ExecutionAlgorithm):
                 )
                 self._forward_gate._cache_telemetry_order(prot_order)
 
-        has_contingency_children = any(
-            str(getattr(o, "parent_order_id", "") or "") in list_cids
-            or bool(getattr(o, "linked_order_ids", None))
-            for o in resolved_orders
-        )
         for child_order in resolved_orders:
             cid = str(child_order.client_order_id)
             child_decision = self._decisions[cid]
@@ -2104,6 +2241,7 @@ class PlanGateExecAlgorithm(ExecutionAlgorithm):
         order: Any,
         *,
         inferred_stop_loss_price: Optional[Decimal] = None,
+        collar_market_order: Optional[bool] = None,
     ) -> PlanGateDecision:
         """Evaluates `order` against the underlying `PlanGateBackend` and records audit/reservation state."""
         self._refresh_runtime_handles()
@@ -2112,6 +2250,14 @@ class PlanGateExecAlgorithm(ExecutionAlgorithm):
         request = self._build_order_request(order)
         if request.stop_loss_price is None and inferred_stop_loss_price is not None:
             request = replace(request, stop_loss_price=inferred_stop_loss_price)
+        if collar_market_order is not None:
+            request = replace(
+                request,
+                collar_market_order=bool(collar_market_order),
+                allow_uncollared_market_order=(
+                    request.allow_uncollared_market_order and bool(collar_market_order)
+                ),
+            )
         decision = self._backend.evaluate_and_reserve(request)
         cid = str(order.client_order_id)
         self._record_decision_audit(
@@ -2331,6 +2477,8 @@ class PlanGateExecAlgorithm(ExecutionAlgorithm):
             self.on_order_rejected(event)
         elif cls_name == "OrderExpired":
             self.on_order_expired(event)
+        elif cls_name == "OrderDenied":
+            self.on_order_denied(event)
         else:
             telemetry = self._resolve_telemetry_actor()
             if telemetry is not None:
@@ -2491,6 +2639,17 @@ class PlanGateExecAlgorithm(ExecutionAlgorithm):
         if telemetry is not None:
             telemetry.on_order_expired(event)
         self._release_for_terminal_event(event, "ORDER_EXPIRED")
+
+    def on_order_denied(self, event: Any) -> None:
+        """Release unfilled reserved entry capacity when a downstream engine denies an order."""
+        telemetry = self._resolve_telemetry_actor()
+        if telemetry is not None:
+            on_denied_fn = getattr(telemetry, "on_order_denied", None)
+            if callable(on_denied_fn):
+                on_denied_fn(event)
+            else:
+                telemetry.on_order_event(event)
+        self._release_for_terminal_event(event, "ORDER_DENIED")
 
     def _release_for_terminal_event(self, event: Any, default_reason: str) -> None:
         cid = self._resolve_event_client_order_id(event)
