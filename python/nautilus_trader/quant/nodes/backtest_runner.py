@@ -13,6 +13,7 @@ Implements Ticket #14 (`14-isomorphic-backtest-runner-and-stress-falsifier-seam.
 
 from __future__ import annotations
 
+import gc
 import math
 import statistics
 import uuid
@@ -758,6 +759,8 @@ class IsomorphicBacktestRunner:
                 plan_gate._telemetry_actor = None
                 plan_gate._oco_monitor = None
             engine.dispose()
+            del engine
+            gc.collect()
 
     def run_walk_forward(
         self,

@@ -2407,6 +2407,13 @@ class PostgresTelemetryActor(DataActor):
             if is_closed
             else abs(_to_decimal(getattr(pos, "quantity", None), "0"))
         )
+        pos_id = str(getattr(pos, "id", "") or "")
+        ts_last = int(getattr(pos, "ts_last", 0) or 0)
+        synth_event_id = f"pos_snap:{pos_id}:{qty}:{is_closed}:{ts_last}"
+        if synth_event_id in self._processed_event_ids:
+            if not is_closed:
+                self._oco_monitor._positions_qty[symbol] = qty
+            return
         if is_closed:
             self.end_safe_exit(symbol)
             self._oco_monitor._positions_qty[symbol] = Decimal("0")
@@ -2415,13 +2422,6 @@ class PostgresTelemetryActor(DataActor):
                 self._oco_monitor.verify_position_coverage(
                     symbol=symbol, pos_qty=Decimal("0")
                 )
-        pos_id = str(getattr(pos, "id", "") or "")
-        ts_last = int(getattr(pos, "ts_last", 0) or 0)
-        synth_event_id = f"pos_snap:{pos_id}:{qty}:{is_closed}:{ts_last}"
-        if synth_event_id in self._processed_event_ids:
-            if not is_closed:
-                self._oco_monitor._positions_qty[symbol] = qty
-            return
         plan_event_type = (
             "POSITION_CLOSED"
             if is_closed
@@ -2557,6 +2557,8 @@ class PostgresTelemetryActor(DataActor):
         filled_avg_float = (
             float(filled_avg_price) if filled_avg_price is not None else None
         )
+        if self._trading_date is not None and "trading_date" not in raw_response:
+            raw_response = {**raw_response, "trading_date": self._trading_date.isoformat()}
         cur.execute(
             """
             INSERT INTO orders (

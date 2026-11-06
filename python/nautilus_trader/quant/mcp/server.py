@@ -14,6 +14,7 @@ Implements Ticket #15 (`15-nautilus-mcp-server-and-tool-schema-seam.md`):
 
 from __future__ import annotations
 
+import gc
 import hashlib
 import hmac
 import json
@@ -27,7 +28,7 @@ from dataclasses import replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
@@ -87,16 +88,23 @@ def _canonicalize_risk_envelope(
     else:
         raw = dict(risk_envelope)
     collar = raw.get("collar")
-    collar_dict = (
-        {
-            "max_slippage_bps": str(Decimal(str(collar.get("max_slippage_bps", "0")))),
-            "max_atr_fraction": str(Decimal(str(collar.get("max_atr_fraction", "0")))),
+    if isinstance(collar, MarketableLimitCollar):
+        collar_dict: Optional[Dict[str, str]] = collar.to_dict()
+    elif isinstance(collar, Mapping):
+        collar_dict = {
+            "limit_collar_pct": str(
+                Decimal(str(collar.get("limit_collar_pct", collar.get("max_slippage_bps", "0"))))
+            ),
+            "limit_collar_atr": str(
+                Decimal(str(collar.get("limit_collar_atr", collar.get("max_atr_fraction", "0"))))
+            ),
         }
-        if isinstance(collar, Mapping)
-        else None
-    )
+    else:
+        collar_dict = None
+    side_val = raw.get("side", "LONG")
+    side_str = side_val.value if isinstance(side_val, PlanSide) else str(side_val).strip().upper()
     return {
-        "side": str(raw.get("side", "LONG")).strip().upper(),
+        "side": side_str,
         "target_qty": str(Decimal(str(raw.get("target_qty", "0")))),
         "approved_qty_cap": str(Decimal(str(raw.get("approved_qty_cap", "0")))),
         "target_notional_usd": str(Decimal(str(raw.get("target_notional_usd", "0")))),
@@ -787,6 +795,15 @@ class NautilusMcpServer:
                     f"Candidate {sym} ({arch_id}) FAILED run_stress_falsification: "
                     f"{list(falsification_report.failure_reasons)}"
                 )
+            raw_m_regime = (
+                raw_item.get("m_regime")
+                if raw_item.get("m_regime") is not None
+                else committee_attestation.get("m_regime", 1.0)
+            )
+            eff_m_regime = float(raw_m_regime if raw_m_regime is not None else 1.0)
+            if eff_m_regime < 0.0 or eff_m_regime > 1.0:
+                raise McpPlanLockRejectedError(f"m_regime must be in [0.0, 1.0], got {raw_m_regime}")
+
             if falsified_env is not None:
                 falsified_env_fp = compute_strategy_fingerprint(
                     sym, strat_cfg, risk_envelope=falsified_env
@@ -857,14 +874,6 @@ class NautilusMcpServer:
                     f"{decision.reject_reason or 'ZERO_QTY'}"
                 )
 
-            raw_m_regime = (
-                raw_item.get("m_regime")
-                if raw_item.get("m_regime") is not None
-                else committee_attestation.get("m_regime", 1.0)
-            )
-            eff_m_regime = float(raw_m_regime if raw_m_regime is not None else 1.0)
-            if eff_m_regime < 0.0 or eff_m_regime > 1.0:
-                raise McpPlanLockRejectedError(f"m_regime must be in [0.0, 1.0], got {raw_m_regime}")
             if eff_m_regime == 0.0:
                 continue
             scaled_decision_qty = max(
@@ -1226,6 +1235,13 @@ class NautilusMcpServer:
                         "error": {"code": -32700, "message": str(exc)},
                     }
                     status_code = 400
+                finally:
+                    if not mcp_server._custom_runner_injected and mcp_server._runner is not None:
+                        mcp_server._runner._last_plan_gate = None
+                        mcp_server._runner._last_strategy = None
+                        mcp_server._runner._last_telemetry_actor = None
+                        mcp_server._runner._last_oco_monitor = None
+                    gc.collect()
                 payload = json.dumps(resp_obj).encode("utf-8")
                 self.send_response(status_code)
                 self.send_header("Content-Type", "application/json")

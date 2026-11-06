@@ -733,10 +733,11 @@ fn test_decode_sip_trading_statuses_arrow_stream_all_canonical_states() {
 
 #[rstest]
 fn test_decode_empty_or_corrupted_arrow_and_parquet_buffers_fail_closed() {
-    assert!(matches!(
-        decode_arrow_ipc_stream(&[]),
-        Err(DataInfraError::Transport(_))
-    ));
+    assert!(
+        decode_arrow_ipc_stream(&[])
+            .expect("empty ArrowStream body represents 0 matching ClickHouse rows")
+            .is_empty()
+    );
     assert!(matches!(
         decode_arrow_ipc_stream(b"not-an-arrow-ipc-stream"),
         Err(DataInfraError::Transport(_))
@@ -1136,15 +1137,12 @@ async fn test_http_clickhouse_transport_fail_closed_on_400_500_empty_200_and_cor
         "unexpected error for HTTP 500: {err_500:?}"
     );
 
-    // 3. HTTP 200 empty body -> Transport error (fail-closed)
-    let err_empty = transport
+    // 3. HTTP 200 empty body -> 0 matching ClickHouse rows (empty result set)
+    let empty_bars = transport
         .fetch_bars(&bar_req)
         .await
-        .expect_err("empty HTTP 200 body must fail closed");
-    assert!(
-        matches!(err_empty, DataInfraError::Transport(ref msg) if msg.contains("empty ArrowStream body")),
-        "unexpected error for empty HTTP 200: {err_empty:?}"
-    );
+        .expect("empty HTTP 200 ArrowStream body represents 0 rows");
+    assert!(empty_bars.is_empty());
 
     // 4. HTTP 200 corrupted Arrow IPC body -> Transport error
     let err_corrupt = transport

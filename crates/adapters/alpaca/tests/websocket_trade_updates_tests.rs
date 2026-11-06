@@ -530,8 +530,8 @@ fn test_parse_trade_update_fail_closed_validation() {
     let account_id = AccountId::new("ALPACA-PA123456");
     let ts_init = UnixNanos::from(1_775_000_000_000_000_000u64);
 
-    // Missing client_order_id -> fail-closed Parse error
-    let missing_cid_payload = AlpacaTradeUpdatePayload {
+    // Blank client_order_id with valid venue order.id falls back to order.id as ClientOrderId
+    let fallback_cid_payload = AlpacaTradeUpdatePayload {
         event: AlpacaTradeEventKind::New,
         execution_id: None,
         price: None,
@@ -540,6 +540,32 @@ fn test_parse_trade_update_fail_closed_validation() {
         timestamp: Some("2026-03-31T13:30:00Z".to_string()),
         order: sample_order_response(
             "venue-ord-err-1",
+            "   ",
+            "NVDA",
+            AlpacaOrderSide::Buy,
+            AlpacaOrderType::Market,
+            "new",
+            dec!(10),
+            dec!(0),
+            None,
+            None,
+        ),
+    };
+    let fallback_parsed =
+        parse_trade_update_payload(&fallback_cid_payload, account_id, ALPACA_VENUE, 2, 0, ts_init)
+            .expect("blank client_order_id should fall back to venue order id");
+    assert_eq!(fallback_parsed.client_order_id.as_str(), "venue-ord-err-1");
+
+    // Missing both order.id and client_order_id -> fail-closed Parse error
+    let missing_cid_payload = AlpacaTradeUpdatePayload {
+        event: AlpacaTradeEventKind::New,
+        execution_id: None,
+        price: None,
+        qty: None,
+        position_qty: None,
+        timestamp: Some("2026-03-31T13:30:00Z".to_string()),
+        order: sample_order_response(
+            "   ",
             "   ",
             "NVDA",
             AlpacaOrderSide::Buy,

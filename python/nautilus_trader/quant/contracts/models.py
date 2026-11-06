@@ -518,6 +518,21 @@ class PlanRiskEnvelope:
             )
         return replace(self, approved_qty_cap=cap_dec)
 
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "side": self.side.value if isinstance(self.side, PlanSide) else str(self.side),
+            "target_qty": str(self.target_qty),
+            "approved_qty_cap": str(self.approved_qty_cap),
+            "target_notional_usd": str(self.target_notional_usd),
+            "max_risk_budget_usd": str(self.max_risk_budget_usd),
+            "initial_stop_price": str(self.initial_stop_price),
+            "take_profit_price": (
+                str(self.take_profit_price) if self.take_profit_price is not None else None
+            ),
+            "collar": self.collar.to_dict() if self.collar is not None else None,
+            "valid_until": self.valid_until.isoformat(),
+        }
+
 
 @dataclass(frozen=True)
 class PlanItemContract:

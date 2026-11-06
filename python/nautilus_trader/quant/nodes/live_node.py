@@ -760,9 +760,9 @@ class NautilusLiveNodeAssembler:
             plan_gate_backend=pg_backend,
             telemetry_actor=telemetry_actor,
             strategies_by_symbol={
-                item.symbol: strat for item, strat in zip(primary_locked_items, strategies)
+                item.symbol: strat for item, strat in zip(locked_items, strategies)
             },
-            plan_items_by_symbol={item.symbol: item for item in primary_locked_items},
+            plan_items_by_symbol={item.symbol: item for item in locked_items},
             node=node,
             assembler=self,
             repository=self._repo,
@@ -1915,6 +1915,8 @@ def _capture_pipeline_order_intents(
         if telemetry_actor is not None:
             telemetry_actor.close()
         engine.dispose()
+        del engine
+        gc.collect()
 
 
 def _capture_live_node_order_intents(
@@ -2122,7 +2124,10 @@ def _drive_live_node_bundle_order_intents(
             decisions=bundle.plan_gate.decisions,
         )
     finally:
+        bundle.telemetry_actor._cached_cache = None
         engine.dispose()
+        del engine
+        gc.collect()
 
 
 def verify_backtest_to_live_parity(
