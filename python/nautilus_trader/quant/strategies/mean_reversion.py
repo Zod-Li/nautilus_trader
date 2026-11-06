@@ -19,7 +19,7 @@ from nautilus_trader.quant.strategies.empirical import (
     quantile_to_float,
     rolling_atr,
     rolling_mad_zscore,
-    rolling_mean,
+    rolling_vwap,
 )
 from nautilus_trader.model import Bar, OrderSide
 
@@ -59,18 +59,13 @@ class MeanReversionStrategy(BaseArchetypeStrategy):
         self._mad_zscores.clear()
 
     def _compute_rolling_vwap_anchor(self, window: int) -> float:
-        closes = self._closes[-window:]
-        vols = self._volumes[-window:]
         typical_prices = [
             (h + lo + c) / 3.0
             for h, lo, c in zip(
-                self._highs[-window:], self._lows[-window:], closes
+                self._highs[-window:], self._lows[-window:], self._closes[-window:]
             )
         ]
-        total_vol = sum(vols)
-        if total_vol > 0.0:
-            return sum(tp * v for tp, v in zip(typical_prices, vols)) / total_vol
-        return rolling_mean(closes)
+        return rolling_vwap(typical_prices, self._volumes[-window:], window)
 
     def on_bar(self, bar: Bar) -> None:
         if bar.bar_type != self._archetype_config.bar_type:

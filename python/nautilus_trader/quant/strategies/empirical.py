@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from decimal import Decimal
 import math
-from typing import Sequence, Tuple
+from typing import Sequence
 
 
 def empirical_rank_quantile(window: Sequence[float], value: float) -> float:
@@ -125,84 +125,8 @@ def rolling_linear_slope(window: Sequence[float]) -> float:
     return num / den
 
 
-def rolling_ols_hedge_params(
-    primary_series: Sequence[float],
-    secondary_series: Sequence[float],
-) -> Tuple[float, float, float]:
-    """Computes rolling OLS intercept `alpha`, hedge ratio `beta`, and current residual
-    `spread = primary[-1] - (alpha + beta * secondary[-1])` for two synchronized price series.
-    """
-    n = min(len(primary_series), len(secondary_series))
-    if n < 2:
-        return 0.0, 1.0, 0.0
-    xs = secondary_series[-n:]
-    ys = primary_series[-n:]
-    mean_x = rolling_mean(xs)
-    mean_y = rolling_mean(ys)
-    cov_xy = 0.0
-    var_x = 0.0
-    for x_val, y_val in zip(xs, ys):
-        dx = x_val - mean_x
-        dy = y_val - mean_y
-        cov_xy += dx * dy
-        var_x += dx * dx
-    if var_x <= 1e-12:
-        return float(mean_y), 1.0, 0.0
-    beta = cov_xy / var_x
-    alpha = mean_y - beta * mean_x
-    residual = ys[-1] - (alpha + beta * xs[-1])
-    return alpha, beta, residual
-
-
 def quantile_to_float(val: Decimal | float) -> float:
     return float(val)
-
-
-def ewma_mean(series: Sequence[float], span: int) -> float:
-    """Computes Exponentially Weighted Moving Average over `series` with decay `span`."""
-    if not series:
-        return 0.0
-    eff_span = max(1, int(span))
-    alpha = 2.0 / (float(eff_span) + 1.0)
-    ema = float(series[0])
-    for val in series[1:]:
-        ema = alpha * float(val) + (1.0 - alpha) * ema
-    return ema
-
-
-def ewma_slope(series: Sequence[float], fast_span: int, slow_span: int) -> float:
-    """Computes volatility-normalized EWMA differential `(ewma_fast - ewma_slow) / std`."""
-    if len(series) < 2:
-        return 0.0
-    fast_val = ewma_mean(series, fast_span)
-    slow_val = ewma_mean(series, slow_span)
-    std_val = rolling_std(series[-max(2, int(slow_span)) :])
-    if std_val <= 0.0:
-        return fast_val - slow_val
-    return (fast_val - slow_val) / std_val
-
-
-def volatility_standardized_momentum(series: Sequence[float], window: int) -> float:
-    """Computes return over `window` standardized by rolling return volatility."""
-    n = len(series)
-    eff_win = max(1, min(int(window), n - 1))
-    if n < 2 or eff_win < 1:
-        return 0.0
-    start_px = float(series[-eff_win - 1])
-    end_px = float(series[-1])
-    if start_px <= 0.0:
-        return 0.0
-    cum_ret = (end_px - start_px) / start_px
-    sub = series[-(eff_win + 1) :]
-    rets = [
-        (float(sub[i]) - float(sub[i - 1])) / float(sub[i - 1])
-        for i in range(1, len(sub))
-        if float(sub[i - 1]) > 0.0
-    ]
-    vol = rolling_std(rets)
-    if vol <= 0.0:
-        return cum_ret
-    return cum_ret / (vol * math.sqrt(float(len(rets))))
 
 
 def rolling_vwap(

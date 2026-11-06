@@ -302,7 +302,6 @@ class FrozenRegimeParamRecord:
             entry_quantile_threshold=Decimal(str(self.entry_quantile_threshold)),
             exit_quantile_threshold=Decimal(str(self.exit_quantile_threshold)),
             atr_stop_multiplier=Decimal(str(self.atr_stop_multiplier)),
-            secondary_instrument_id=None,
         )
 
     def to_limit_collar(
@@ -798,7 +797,6 @@ class OfflineRegimePanelCalibrator:
             entry_quantile_threshold=entry_q,
             exit_quantile_threshold=exit_q,
             atr_stop_multiplier=atr_mult,
-            secondary_instrument_id=None,
         )
 
         sorted_bars = sorted(bars, key=lambda b: int(b.ts_init))

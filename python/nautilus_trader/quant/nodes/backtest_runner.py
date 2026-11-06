@@ -507,12 +507,6 @@ class IsomorphicBacktestRunner:
             )
         catalog = DataInfraCatalog(self._datainfra_config)
         symbols = [plan_item.symbol]
-        sec_id = plan_item.strategy_config.secondary_instrument_id
-        if sec_id:
-            sec_sym = sec_id.split(".", 1)[0].strip().upper()
-            if sec_sym and sec_sym not in symbols:
-                symbols.append(sec_sym)
-
         venue = plan_item.venue or self._venue_name
         equities = [
             catalog.register_equity(sym, venue=venue, lot_size=1)
@@ -597,15 +591,7 @@ class IsomorphicBacktestRunner:
             if equities is not None:
                 equity_list = list(equities)
             else:
-                symbols = [plan_item.symbol]
-                sec_id = plan_item.strategy_config.secondary_instrument_id
-                if sec_id:
-                    sec_sym = sec_id.split(".", 1)[0].strip().upper()
-                    if sec_sym and sec_sym not in symbols:
-                        symbols.append(sec_sym)
-                equity_list = [
-                    _create_default_equity(sym, venue_str) for sym in symbols
-                ]
+                equity_list = [_create_default_equity(plan_item.symbol, venue_str)]
 
         if not bar_list:
             raise ValueError(f"Cannot run backtest for {plan_item.symbol}: bar list is empty")

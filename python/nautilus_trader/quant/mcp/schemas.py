@@ -87,7 +87,6 @@ def get_mcp_tool_input_schemas() -> List[Dict[str, Any]]:
             "entry_quantile_threshold": {"type": ["number", "string"]},
             "exit_quantile_threshold": {"type": ["number", "string"]},
             "atr_stop_multiplier": {"type": ["number", "string"]},
-            "secondary_instrument_id": {"type": ["string", "null"]},
         },
     }
 

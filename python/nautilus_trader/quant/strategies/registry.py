@@ -41,8 +41,8 @@ MIN_ATR_STOP_MULTIPLIER = "0.5"
 MAX_ATR_STOP_MULTIPLIER = "10.0"
 
 
-def _default_parameter_bounds(requires_secondary: bool = False) -> Dict[str, Dict[str, Any]]:
-    bounds: Dict[str, Dict[str, Any]] = {
+def _default_parameter_bounds() -> Dict[str, Dict[str, Any]]:
+    return {
         "bar_timeframe": {
             "type": "enum",
             "allowed": list(ALLOWED_BAR_TIMEFRAMES),
@@ -92,13 +92,6 @@ def _default_parameter_bounds(requires_secondary: bool = False) -> Dict[str, Dic
             "description": "Rolling ATR multiplier for adaptive volatility-scaled stop placement.",
         },
     }
-    if requires_secondary:
-        bounds["secondary_instrument_id"] = {
-            "type": "instrument_id",
-            "required": True,
-            "description": "Secondary hedge leg instrument identifier (e.g. 'MSFT.ALPACA').",
-        }
-    return bounds
 
 
 @dataclass(frozen=True)
@@ -110,7 +103,6 @@ class ArchetypeDescriptor:
     description: str
     config_cls: Type[BaseArchetypeStrategyConfig]
     strategy_cls: Type[BaseArchetypeStrategy]
-    requires_secondary_instrument: bool
     parameter_bounds: Dict[str, Dict[str, Any]]
 
     def to_schema_dict(self) -> Dict[str, Any]:
@@ -121,7 +113,6 @@ class ArchetypeDescriptor:
             "description": self.description,
             "config_class": f"{self.config_cls.__module__}.{self.config_cls.__qualname__}",
             "strategy_class": f"{self.strategy_cls.__module__}.{self.strategy_cls.__qualname__}",
-            "requires_secondary_instrument": self.requires_secondary_instrument,
             "exec_algorithm_id": "PLAN_GATE",
             "parameter_bounds": dict(self.parameter_bounds),
         }
@@ -137,8 +128,7 @@ STRATEGY_ARCHETYPE_REGISTRY: Dict[StrategyArchetypeId, ArchetypeDescriptor] = {
         ),
         config_cls=TrendMomentumConfig,
         strategy_cls=TrendMomentumStrategy,
-        requires_secondary_instrument=False,
-        parameter_bounds=_default_parameter_bounds(requires_secondary=False),
+        parameter_bounds=_default_parameter_bounds(),
     ),
     StrategyArchetypeId.VOLATILITY_BREAKOUT: ArchetypeDescriptor(
         archetype_id=StrategyArchetypeId.VOLATILITY_BREAKOUT,
@@ -149,8 +139,7 @@ STRATEGY_ARCHETYPE_REGISTRY: Dict[StrategyArchetypeId, ArchetypeDescriptor] = {
         ),
         config_cls=VolatilityBreakoutConfig,
         strategy_cls=VolatilityBreakoutStrategy,
-        requires_secondary_instrument=False,
-        parameter_bounds=_default_parameter_bounds(requires_secondary=False),
+        parameter_bounds=_default_parameter_bounds(),
     ),
     StrategyArchetypeId.MEAN_REVERSION: ArchetypeDescriptor(
         archetype_id=StrategyArchetypeId.MEAN_REVERSION,
@@ -161,8 +150,7 @@ STRATEGY_ARCHETYPE_REGISTRY: Dict[StrategyArchetypeId, ArchetypeDescriptor] = {
         ),
         config_cls=MeanReversionConfig,
         strategy_cls=MeanReversionStrategy,
-        requires_secondary_instrument=False,
-        parameter_bounds=_default_parameter_bounds(requires_secondary=False),
+        parameter_bounds=_default_parameter_bounds(),
     ),
 }
 
@@ -240,11 +228,6 @@ def instantiate_strategy_by_archetype(
         entry_quantile_threshold=kwargs.get("entry_quantile_threshold", "0.80"),
         exit_quantile_threshold=kwargs.get("exit_quantile_threshold", "0.35"),
         atr_stop_multiplier=kwargs.get("atr_stop_multiplier", "2.0"),
-        secondary_instrument_id=(
-            str(kwargs["secondary_instrument_id"])
-            if kwargs.get("secondary_instrument_id") is not None
-            else None
-        ),
     )
     config = descriptor.config_cls(**kwargs)
     return descriptor.strategy_cls(config)

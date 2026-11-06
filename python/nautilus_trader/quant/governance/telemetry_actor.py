@@ -1209,13 +1209,6 @@ class PostgresTelemetryActor(DataActor):
     def oco_monitor(self) -> ProtectiveOcoMonitor:
         return self._oco_monitor
 
-    def _connect(self):
-        return psycopg2.connect(
-            self._dsn,
-            cursor_factory=RealDictCursor,
-            connect_timeout=self._connect_timeout_secs,
-        )
-
     def ensure_schema(self) -> None:
         """Idempotently ensures `order_fills` and dependent telemetry tables exist via `db/migrations/`."""
         if not self._dsn:
@@ -1261,13 +1254,13 @@ class PostgresTelemetryActor(DataActor):
         self.sync_from_cache()
 
     def flush(self, timeout_secs: float = 5.0) -> None:
+        self.sync_from_cache()
         if self._async_writer is not None:
             self._async_writer.flush(timeout_secs=timeout_secs)
 
     def on_stop(self) -> None:
         self._is_started = False
         _ACTIVE_TELEMETRY_ACTORS.discard(self)
-        self.sync_from_cache()
         self.flush(timeout_secs=2.0)
 
     def on_reset(self) -> None:
@@ -1295,12 +1288,13 @@ class PostgresTelemetryActor(DataActor):
             pass
 
     def on_bar(self, bar: Any) -> None:
-        self.sync_from_cache()
+        _ = bar
 
     def on_quote(self, quote: Any) -> None:
-        self.sync_from_cache()
+        _ = quote
 
     def on_time_event(self, event: Any) -> None:
+        _ = event
         self.sync_from_cache()
 
     def sync_from_cache(self) -> None:

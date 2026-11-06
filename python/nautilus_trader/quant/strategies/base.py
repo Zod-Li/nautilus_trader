@@ -96,7 +96,6 @@ class BaseArchetypeStrategyConfig(StrategyConfig):
         atr_stop_multiplier: Decimal | float | str = Decimal("2.0"),
         trade_qty: Decimal | float | int | str = Decimal("100"),
         plan_side: str | PlanSide = PlanSide.LONG,
-        secondary_instrument_id: Optional[str | InstrumentId] = None,
         use_limit_orders: bool = True,
         submit_protective_stop: bool = False,
         execution_delay_bars: int = 0,
@@ -139,7 +138,6 @@ class BaseArchetypeStrategyConfig(StrategyConfig):
         atr_stop_multiplier: Decimal | float | str = Decimal("2.0"),
         trade_qty: Decimal | float | int | str = Decimal("100"),
         plan_side: str | PlanSide = PlanSide.LONG,
-        secondary_instrument_id: Optional[str | InstrumentId] = None,
         use_limit_orders: bool = True,
         submit_protective_stop: bool = False,
         execution_delay_bars: int = 0,
@@ -151,11 +149,6 @@ class BaseArchetypeStrategyConfig(StrategyConfig):
         log_commands: bool = True,
     ) -> None:
         inst_str = str(instrument_id).strip()
-        sec_str = (
-            str(secondary_instrument_id).strip()
-            if secondary_instrument_id is not None
-            else None
-        )
         self.archetype_contract = ArchetypeStrategyConfig(
             archetype_id=self.ARCHETYPE_ID,
             instrument_id=inst_str,
@@ -166,19 +159,10 @@ class BaseArchetypeStrategyConfig(StrategyConfig):
             entry_quantile_threshold=_to_decimal(entry_quantile_threshold),
             exit_quantile_threshold=_to_decimal(exit_quantile_threshold),
             atr_stop_multiplier=_to_decimal(atr_stop_multiplier),
-            secondary_instrument_id=sec_str,
         )
         self.instrument_id = InstrumentId.from_str(inst_str)
-        self.secondary_instrument_id = (
-            InstrumentId.from_str(sec_str) if sec_str else None
-        )
         self.bar_timeframe = self.archetype_contract.bar_timeframe
         self.bar_type = format_datainfra_bar_type(inst_str, self.bar_timeframe)
-        self.secondary_bar_type = (
-            format_datainfra_bar_type(sec_str, self.bar_timeframe)
-            if sec_str
-            else None
-        )
         self.lookback_window = self.archetype_contract.lookback_window
         self.fast_window = self.archetype_contract.fast_window
         self.slow_window = self.archetype_contract.slow_window
@@ -241,7 +225,6 @@ class BaseArchetypeStrategyConfig(StrategyConfig):
             atr_stop_multiplier=cfg.atr_stop_multiplier,
             trade_qty=plan_item.risk_envelope.target_qty,
             plan_side=plan_item.risk_envelope.side,
-            secondary_instrument_id=cfg.secondary_instrument_id,
             use_limit_orders=use_limit_orders,
             submit_protective_stop=submit_protective_stop,
             execution_delay_bars=execution_delay_bars,
@@ -253,38 +236,6 @@ class BaseArchetypeStrategyConfig(StrategyConfig):
         return instance
 
 
-_CROSS_THREAD_STRATEGY_LOCK = threading.Lock()
-_CROSS_THREAD_STRATEGY_ANCHORS: List[Any] = []
-_CROSS_THREAD_STRATEGY_ANCHOR_EVENT = threading.Event()
-_CROSS_THREAD_STRATEGY_ANCHOR_THREAD: Optional[threading.Thread] = None
-
-
-def _anchor_strategy_if_non_main_thread(strategy: Any) -> None:
-    """Prevents PyO3 `unsendable` `PyStrategy` instances created on background threads
-    from being deallocated on `MainThread` during garbage collection.
-    """
-    global _CROSS_THREAD_STRATEGY_ANCHOR_THREAD
-    if threading.current_thread() is threading.main_thread():
-        return
-    with _CROSS_THREAD_STRATEGY_LOCK:
-        _CROSS_THREAD_STRATEGY_ANCHORS.append(strategy)
-        if (
-            _CROSS_THREAD_STRATEGY_ANCHOR_THREAD is None
-            or not _CROSS_THREAD_STRATEGY_ANCHOR_THREAD.is_alive()
-        ):
-            def _hold_refs() -> None:
-                local_refs = _CROSS_THREAD_STRATEGY_ANCHORS
-                _CROSS_THREAD_STRATEGY_ANCHOR_EVENT.wait()
-                _ = len(local_refs)
-
-            _CROSS_THREAD_STRATEGY_ANCHOR_THREAD = threading.Thread(
-                target=_hold_refs,
-                name="nautilus-pystrategy-anchor",
-                daemon=True,
-            )
-            _CROSS_THREAD_STRATEGY_ANCHOR_THREAD.start()
-
-
 class BaseArchetypeStrategy(Strategy):
     """Base pre-audited Nautilus `Strategy` routing all orders through `PLAN_GATE`."""
 
@@ -294,7 +245,6 @@ class BaseArchetypeStrategy(Strategy):
     def __init__(self, config: BaseArchetypeStrategyConfig) -> None:
         super().__init__(config)
         self._owner_thread_id: int = threading.get_ident()
-        _anchor_strategy_if_non_main_thread(self)
         self._archetype_config = config
         self._risk_envelope: Optional[PlanRiskEnvelope] = getattr(
             config, "_plan_risk_envelope", None
@@ -2146,18 +2096,6 @@ class BaseArchetypeStrategy(Strategy):
             instrument_id=target_inst,
             signal_tags=["THESIS_INVALIDATED_EXIT"],
         )
-        sec_inst = self._archetype_config.secondary_instrument_id
-        if sec_inst is not None:
-            sec_pos = self._open_position_signed_qty(sec_inst)
-            if sec_pos != Decimal("0"):
-                self._submit_plan_gated_exit(
-                    exit_side=OrderSide.BUY if sec_pos < Decimal("0") else OrderSide.SELL,
-                    quantity=abs(sec_pos),
-                    reference_price=eff_ref,
-                    reason_tag=self._pending_thesis_exit_reason,
-                    instrument_id=sec_inst,
-                    signal_tags=["THESIS_INVALIDATED_EXIT"],
-                )
         if exit_cid:
             self._pending_thesis_exit = False
         return exit_cid

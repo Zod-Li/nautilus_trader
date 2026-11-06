@@ -188,7 +188,6 @@ class ArchetypeStrategyConfig:
     entry_quantile_threshold: Decimal
     exit_quantile_threshold: Decimal
     atr_stop_multiplier: Decimal
-    secondary_instrument_id: Optional[str] = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "archetype_id", StrategyArchetypeId(self.archetype_id))
@@ -255,10 +254,6 @@ class ArchetypeStrategyConfig:
             raise PlanContractValidationError(
                 f"atr_stop_multiplier ({self.atr_stop_multiplier}) must be > 0"
             )
-        if self.secondary_instrument_id is not None and str(self.secondary_instrument_id).strip():
-            raise PlanContractValidationError(
-                f"{self.archetype_id.value} does not permit secondary_instrument_id"
-            )
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -271,7 +266,6 @@ class ArchetypeStrategyConfig:
             "entry_quantile_threshold": str(self.entry_quantile_threshold),
             "exit_quantile_threshold": str(self.exit_quantile_threshold),
             "atr_stop_multiplier": str(self.atr_stop_multiplier),
-            "secondary_instrument_id": self.secondary_instrument_id,
         }
 
     @classmethod
@@ -294,11 +288,6 @@ class ArchetypeStrategyConfig:
                 ),
                 atr_stop_multiplier=_to_decimal(
                     data["atr_stop_multiplier"], "atr_stop_multiplier"
-                ),
-                secondary_instrument_id=(
-                    str(data["secondary_instrument_id"])
-                    if data.get("secondary_instrument_id") is not None
-                    else None
                 ),
             )
         except KeyError as exc:

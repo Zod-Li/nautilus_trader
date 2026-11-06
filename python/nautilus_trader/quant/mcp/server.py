@@ -1195,7 +1195,6 @@ class NautilusMcpServer:
         params: Dict[str, Any],
     ) -> ArchetypeStrategyConfig:
         inst_id = str(params.get("instrument_id") or f"{symbol}.{self._venue_name}").strip()
-        sec_id = params.get("secondary_instrument_id")
         return ArchetypeStrategyConfig(
             archetype_id=StrategyArchetypeId(str(archetype_id).strip()),
             instrument_id=inst_id,
@@ -1206,7 +1205,6 @@ class NautilusMcpServer:
             entry_quantile_threshold=Decimal(str(params.get("entry_quantile_threshold", "0.80"))),
             exit_quantile_threshold=Decimal(str(params.get("exit_quantile_threshold", "0.35"))),
             atr_stop_multiplier=Decimal(str(params.get("atr_stop_multiplier", "2.0"))),
-            secondary_instrument_id=(str(sec_id).strip() if sec_id is not None else None),
         )
 
     def _build_risk_envelope(
@@ -1835,31 +1833,23 @@ class NautilusMcpServer:
         end_ns = _parse_date_to_ns(end_date, end_of_day=True)
 
         primary_sym = strategy_config.instrument_id.split(".", 1)[0].strip().upper()
-        symbols = [primary_sym]
-        if strategy_config.secondary_instrument_id:
-            sec_sym = strategy_config.secondary_instrument_id.split(".", 1)[0].strip().upper()
-            if sec_sym and sec_sym not in symbols:
-                symbols.append(sec_sym)
-
-        all_bars: List[Bar] = []
-        equities: List[Equity] = []
-        for sym in symbols:
-            all_bars.extend(
-                self._load_bars_for_symbol(
-                    symbol=sym,
-                    bar_timeframe=strategy_config.bar_timeframe,
-                    lookback_days=int(lookback_days),
-                    start_ns=start_ns,
-                    end_ns=end_ns,
-                )
+        all_bars = list(
+            self._load_bars_for_symbol(
+                symbol=primary_sym,
+                bar_timeframe=strategy_config.bar_timeframe,
+                lookback_days=int(lookback_days),
+                start_ns=start_ns,
+                end_ns=end_ns,
             )
-            if self._equity_provider is not None:
-                equities.append(self._equity_provider(sym))
-            elif self._datainfra_config is not None:
-                catalog = DataInfraCatalog(self._datainfra_config)
-                equities.append(
-                    catalog.register_equity(sym, venue=self._venue_name, lot_size=1)
-                )
+        )
+        equities: List[Equity] = []
+        if self._equity_provider is not None:
+            equities.append(self._equity_provider(primary_sym))
+        elif self._datainfra_config is not None:
+            catalog = DataInfraCatalog(self._datainfra_config)
+            equities.append(
+                catalog.register_equity(primary_sym, venue=self._venue_name, lot_size=1)
+            )
 
         all_bars.sort(key=lambda b: b.ts_init)
         return all_bars, (equities if equities else None)

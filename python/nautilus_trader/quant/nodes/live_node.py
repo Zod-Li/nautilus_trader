@@ -410,48 +410,41 @@ def _load_warmup_bars_for_strategy_with_sources(
         if "." in prim_inst_str
         else "ALPACA"
     )
-    symbols = [prim_sym]
-    if cfg.secondary_instrument_id is not None:
-        sec_sym = str(cfg.secondary_instrument_id).split(".", 1)[0].strip().upper()
-        if sec_sym and sec_sym not in symbols:
-            symbols.append(sec_sym)
 
     collected: List[Bar] = []
     if historical_bar_loader is not None:
-        for sym in symbols:
-            loaded = list(historical_bar_loader(sym, cfg.bar_timeframe, req_bars))
-            loaded.sort(
-                key=lambda b: int(
-                    getattr(b, "ts_init", 0) or getattr(b, "ts_event", 0) or 0
-                )
+        loaded = list(historical_bar_loader(prim_sym, cfg.bar_timeframe, req_bars))
+        loaded.sort(
+            key=lambda b: int(
+                getattr(b, "ts_init", 0) or getattr(b, "ts_event", 0) or 0
             )
-            if len(loaded) > req_bars:
-                loaded = loaded[-req_bars:]
-            collected.extend(loaded)
+        )
+        if len(loaded) > req_bars:
+            loaded = loaded[-req_bars:]
+        collected.extend(loaded)
     elif datainfra_config is not None and getattr(
         datainfra_config, "clickhouse_url", None
     ):
         try:
             catalog = DataInfraCatalog(datainfra_config)
             start_ts_ns = _compute_warmup_query_start_ns(cfg.bar_timeframe, req_bars)
-            for sym in symbols:
-                catalog.register_equity(sym, venue=venue, lot_size=1)
-                queried = sorted(
-                    catalog.query_bars(
-                        [sym],
-                        start_ts_ns=start_ts_ns,
-                        timeframe=cfg.bar_timeframe,
-                        adjustment="adjusted",
-                        market_session="REG",
-                        venue=venue,
-                    ),
-                    key=lambda b: int(
-                        getattr(b, "ts_init", 0) or getattr(b, "ts_event", 0) or 0
-                    ),
-                )
-                if len(queried) > req_bars:
-                    queried = queried[-req_bars:]
-                collected.extend(queried)
+            catalog.register_equity(prim_sym, venue=venue, lot_size=1)
+            queried = sorted(
+                catalog.query_bars(
+                    [prim_sym],
+                    start_ts_ns=start_ts_ns,
+                    timeframe=cfg.bar_timeframe,
+                    adjustment="adjusted",
+                    market_session="REG",
+                    venue=venue,
+                ),
+                key=lambda b: int(
+                    getattr(b, "ts_init", 0) or getattr(b, "ts_event", 0) or 0
+                ),
+            )
+            if len(queried) > req_bars:
+                queried = queried[-req_bars:]
+            collected.extend(queried)
         except Exception as exc:
             logger.debug(
                 "ClickHouse warmup query skipped/unavailable for %s: %s",
@@ -732,16 +725,8 @@ class NautilusLiveNodeAssembler:
                 else self._warmup_on_build
             )
         )
-        primary_locked_items = [
-            item
-            for item in locked_items
-            if not (
-                str(item.sizing_trace.get("role", "")).strip() == "secondary_leg"
-                or bool(item.sizing_trace.get("is_secondary_leg", False))
-            )
-        ] or list(locked_items)
         strategies: List[BaseArchetypeStrategy] = []
-        for item in primary_locked_items:
+        for item in locked_items:
             strategy = instantiate_strategy_from_contract(
                 item,
                 use_limit_orders=use_limit_orders,
@@ -1112,14 +1097,7 @@ class DailyPlanReconciler:
             str(s).strip().upper() for s in (vetoed_symbols or ()) if str(s).strip()
         }
         new_items_by_symbol: Dict[str, PlanItemContract] = {}
-        secondary_items_by_symbol: Dict[str, PlanItemContract] = {}
         for item in resolved_items:
-            if (
-                str(item.sizing_trace.get("role", "")).strip() == "secondary_leg"
-                or bool(item.sizing_trace.get("is_secondary_leg", False))
-            ):
-                secondary_items_by_symbol[item.symbol] = item
-                continue
             sym = item.symbol
             status_upper = str(item.status or "").strip().upper()
             is_vetoed = (
@@ -1836,13 +1814,7 @@ def _capture_pipeline_order_intents(
     """
     normalized_bars = _normalize_bars_for_parity(bars)
     venue_str = plan_item.strategy_config.instrument_id.split(".", 1)[1].strip().upper()
-    symbols = [plan_item.symbol]
-    if plan_item.strategy_config.secondary_instrument_id:
-        sec_sym = plan_item.strategy_config.secondary_instrument_id.split(".", 1)[0].strip().upper()
-        if sec_sym and sec_sym not in symbols:
-            symbols.append(sec_sym)
-
-    equities: List[Equity] = [_create_default_equity(sym, venue_str) for sym in symbols]
+    equities: List[Equity] = [_create_default_equity(plan_item.symbol, venue_str)]
     items_to_lock = _build_parity_plan_items(plan_item, venue_str)
     can_persist = bool(
         include_telemetry_actor
@@ -2045,12 +2017,7 @@ def _drive_live_node_bundle_order_intents(
     live_strat = matching_strategies[0]
     venue_str = plan_item.strategy_config.instrument_id.split(".", 1)[1].strip().upper()
     sorted_bars = _normalize_bars_for_parity(bars)
-    symbols = [plan_item.symbol]
-    if plan_item.strategy_config.secondary_instrument_id:
-        sec_sym = plan_item.strategy_config.secondary_instrument_id.split(".", 1)[0].strip().upper()
-        if sec_sym and sec_sym not in symbols:
-            symbols.append(sec_sym)
-    equities: List[Equity] = [_create_default_equity(sym, venue_str) for sym in symbols]
+    equities: List[Equity] = [_create_default_equity(plan_item.symbol, venue_str)]
 
     items_to_lock = _build_parity_plan_items(plan_item, venue_str)
     if hasattr(bundle.plan_gate.backend, "upsert_plan_item"):
@@ -2118,7 +2085,6 @@ def _drive_live_node_bundle_order_intents(
             "_closes",
             "_volumes",
             "_timestamps",
-            "_secondary_closes",
         ):
             src_buf = getattr(live_strat, buf_attr, None)
             dst_buf = getattr(exec_strategy, buf_attr, None)
@@ -2140,7 +2106,6 @@ def _drive_live_node_bundle_order_intents(
             "_closes",
             "_volumes",
             "_timestamps",
-            "_secondary_closes",
         ):
             src_buf = getattr(exec_strategy, buf_attr, None)
             dst_buf = getattr(live_strat, buf_attr, None)

@@ -1008,45 +1008,6 @@ class PostgresPlanGateBackend:
             conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
             with conn.cursor() as cur:
                 cur.execute(
-                    """
-                    SELECT COUNT(*) AS cnt
-                    FROM pg_trigger
-                    WHERE tgname IN (
-                        'trg_notify_plan_gate_flags',
-                        'trg_notify_plan_gate_plans',
-                        'trg_notify_plan_gate_items'
-                    )
-                    """
-                )
-                row = cur.fetchone()
-                if not row or int(row.get("cnt", 0)) < 3:
-                    cur.execute(
-                        f"""
-                        CREATE OR REPLACE FUNCTION notify_nautilus_plan_gate_change()
-                        RETURNS trigger AS $$
-                        BEGIN
-                            PERFORM pg_notify('{NOTIFY_CHANNEL}', TG_TABLE_NAME);
-                            RETURN NULL;
-                        END;
-                        $$ LANGUAGE plpgsql;
-
-                        DROP TRIGGER IF EXISTS trg_notify_plan_gate_flags ON system_flags;
-                        CREATE TRIGGER trg_notify_plan_gate_flags
-                        AFTER INSERT OR UPDATE OR DELETE ON system_flags
-                        FOR EACH STATEMENT EXECUTE FUNCTION notify_nautilus_plan_gate_change();
-
-                        DROP TRIGGER IF EXISTS trg_notify_plan_gate_plans ON trading_plans;
-                        CREATE TRIGGER trg_notify_plan_gate_plans
-                        AFTER INSERT OR UPDATE OR DELETE ON trading_plans
-                        FOR EACH STATEMENT EXECUTE FUNCTION notify_nautilus_plan_gate_change();
-
-                        DROP TRIGGER IF EXISTS trg_notify_plan_gate_items ON trading_plan_items;
-                        CREATE TRIGGER trg_notify_plan_gate_items
-                        AFTER INSERT OR UPDATE OR DELETE ON trading_plan_items
-                        FOR EACH STATEMENT EXECUTE FUNCTION notify_nautilus_plan_gate_change();
-                        """
-                    )
-                cur.execute(
                     f"""
                     LISTEN {NOTIFY_CHANNEL};
                     LISTEN nautilus_plan_locked;
@@ -2279,10 +2240,9 @@ class PlanGateExecAlgorithm(ExecutionAlgorithm):
                     or ""
                 )
                 prim_inst = str(getattr(cfg, "instrument_id", "") or "")
-                sec_inst = str(getattr(cfg, "secondary_instrument_id", "") or "")
                 if (
                     (ord_strat_id and strat_id and ord_strat_id == strat_id)
-                    or (ord_inst_id and ord_inst_id in (prim_inst, sec_inst))
+                    or (ord_inst_id and ord_inst_id == prim_inst)
                 ):
                     on_denied = getattr(strat, "on_order_denied", None)
                     if callable(on_denied):
