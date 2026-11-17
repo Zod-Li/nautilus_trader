@@ -581,6 +581,7 @@ class PlanItemContract:
     status: str = "ARMED"
     filled_qty: Decimal = Decimal("0")
     reserved_notional_usd: Decimal = Decimal("0")
+    carry_over_status: Optional[str] = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.item_id, UUID):
@@ -593,10 +594,16 @@ class PlanItemContract:
             "reserved_notional_usd",
             _to_decimal(self.reserved_notional_usd, "reserved_notional_usd"),
         )
-        if not isinstance(self.sizing_trace, MappingProxyType):
-            object.__setattr__(
-                self, "sizing_trace", MappingProxyType(dict(self.sizing_trace or {}))
-            )
+        raw_trace = dict(self.sizing_trace or {})
+        co_status = self.carry_over_status
+        if co_status is None and raw_trace.get("carry_over_status"):
+            co_status = str(raw_trace["carry_over_status"]).strip().upper()
+            object.__setattr__(self, "carry_over_status", co_status)
+        elif co_status is not None:
+            co_status = str(co_status).strip().upper()
+            object.__setattr__(self, "carry_over_status", co_status)
+            raw_trace.setdefault("carry_over_status", co_status)
+        object.__setattr__(self, "sizing_trace", MappingProxyType(raw_trace))
 
         sym = self.symbol.strip()
         ven = self.venue.strip()
@@ -612,6 +619,23 @@ class PlanItemContract:
             raise PlanContractValidationError(
                 f"status '{self.status}' not in {VALID_ITEM_STATUSES}"
             )
+
+    @property
+    def max_new_orders(self) -> int:
+        """Maximum number of new entry orders permitted for this item (`0` when exit-only/carry-over)."""
+        if (
+            self.risk_envelope.approved_qty_cap <= Decimal("0")
+            or str(self.carry_over_status or "").strip().upper()
+            in ("CARRY_OVER_EXIT_ONLY", "THESIS_INVALIDATED_EXIT")
+        ):
+            return 0
+        raw_max = self.sizing_trace.get("max_new_orders")
+        if raw_max is not None:
+            try:
+                return max(0, int(raw_max))
+            except (TypeError, ValueError):
+                pass
+        return 1
 
     def validate(
         self,
@@ -667,9 +691,11 @@ class PlanItemContract:
             )
 
         strat_cfg = ArchetypeStrategyConfig.from_dict(trigger_spec["strategy_config"])
-        collar_data = trigger_spec.get(
-            "collar", {"limit_collar_pct": "0.5", "limit_collar_atr": "0.25"}
-        )
+        collar_data = trigger_spec.get("collar")
+        if not isinstance(collar_data, Mapping):
+            raise PlanContractValidationError(
+                "trading_plan_items.trigger_spec missing 'collar' isomorphic payload"
+            )
         collar = MarketableLimitCollar.from_dict(collar_data)
 
         symbol = str(row["symbol"]).strip()
@@ -691,23 +717,51 @@ class PlanItemContract:
         if valid_until.tzinfo is None:
             valid_until = valid_until.replace(tzinfo=timezone.utc)
 
+        side = PlanSide(str(row["side"]).lower())
+        init_stop_raw = row.get("initial_stop_price")
+        curr_stop_raw = row.get("current_stop_price")
+        init_stop = (
+            _to_decimal(init_stop_raw, "initial_stop_price")
+            if init_stop_raw is not None and str(init_stop_raw).strip() != ""
+            else Decimal("0")
+        )
+        curr_stop = (
+            _to_decimal(curr_stop_raw, "current_stop_price")
+            if curr_stop_raw is not None and str(curr_stop_raw).strip() != ""
+            else Decimal("0")
+        )
+        if init_stop > Decimal("0") and curr_stop > Decimal("0"):
+            effective_stop = (
+                max(init_stop, curr_stop)
+                if side == PlanSide.LONG
+                else min(init_stop, curr_stop)
+            )
+        elif curr_stop > Decimal("0"):
+            effective_stop = curr_stop
+        else:
+            effective_stop = _to_decimal(row["initial_stop_price"], "initial_stop_price")
+
+        tp_price = (
+            _to_decimal(row["take_profit_price"], "take_profit_price")
+            if row.get("take_profit_price") is not None
+            else None
+        )
+        if tp_price is not None:
+            if side == PlanSide.LONG and tp_price <= effective_stop:
+                tp_price = None
+            elif side == PlanSide.SHORT and tp_price >= effective_stop:
+                tp_price = None
+
         risk_env = PlanRiskEnvelope(
-            side=PlanSide(str(row["side"]).lower()),
+            side=side,
             target_qty=target_qty,
             approved_qty_cap=approved_cap,
             target_notional_usd=_to_decimal(
                 row["target_notional_usd"], "target_notional_usd"
             ),
             max_risk_budget_usd=_to_decimal(row["risk_budget_usd"], "risk_budget_usd"),
-            initial_stop_price=_to_decimal(
-                row.get("current_stop_price") or row["initial_stop_price"],
-                "initial_stop_price",
-            ),
-            take_profit_price=(
-                _to_decimal(row["take_profit_price"], "take_profit_price")
-                if row.get("take_profit_price") is not None
-                else None
-            ),
+            initial_stop_price=effective_stop,
+            take_profit_price=tp_price,
             collar=collar,
             valid_until=valid_until,
         )
@@ -733,5 +787,10 @@ class PlanItemContract:
             filled_qty=_to_decimal(row.get("filled_qty", "0"), "filled_qty"),
             reserved_notional_usd=_to_decimal(
                 row.get("reserved_notional_usd", "0"), "reserved_notional_usd"
+            ),
+            carry_over_status=(
+                str(row["carry_over_status"])
+                if row.get("carry_over_status") is not None
+                else None
             ),
         )

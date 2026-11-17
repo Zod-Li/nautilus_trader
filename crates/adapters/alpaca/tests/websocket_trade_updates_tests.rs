@@ -526,6 +526,125 @@ fn test_parse_trade_update_stopped_event_maps_to_order_status_accepted() {
 }
 
 #[test]
+fn test_ticket03_parse_trade_update_replaces_and_replaced_by_lineage() {
+    let account_id = AccountId::new("ALPACA-PA123456");
+    let ts_init = UnixNanos::from(1_775_000_000_000_000_000u64);
+
+    // 1. `replaced` event carrying `replaced_by` on the old order promotes `venue_order_id` to
+    //    `replaced_by` and records `replaces = Some(old_venue_order_id)`.
+    let raw_replaced_frame = r#"{
+        "stream": "trade_updates",
+        "data": {
+            "event": "replaced",
+            "timestamp": "2026-03-31T14:15:00Z",
+            "order": {
+                "id": "venue-stop-old-1",
+                "client_order_id": "CID-STOP-ROOT-1",
+                "replaced_by": "venue-stop-new-2",
+                "created_at": "2026-03-31T14:10:00Z",
+                "updated_at": "2026-03-31T14:15:00Z",
+                "symbol": "AAPL",
+                "qty": "100",
+                "filled_qty": "0",
+                "type": "stop",
+                "side": "sell",
+                "time_in_force": "gtc",
+                "stop_price": "195.50",
+                "status": "replaced"
+            }
+        }
+    }"#;
+
+    let classified_replaced = classify_alpaca_ws_frame(raw_replaced_frame.as_bytes())
+        .expect("classify replaced trade_updates frame");
+    let replaced_payload = match classified_replaced {
+        AlpacaWsFrameClassification::TradeUpdate(p) => p,
+        other => panic!("expected TradeUpdate, got {other:?}"),
+    };
+    let parsed_replaced = parse_trade_update_payload(
+        &replaced_payload,
+        account_id,
+        ALPACA_VENUE,
+        2,
+        0,
+        ts_init,
+    )
+    .expect("parse replaced trade update");
+    assert_eq!(parsed_replaced.event_kind, AlpacaTradeEventKind::Replaced);
+    assert_eq!(
+        parsed_replaced.venue_order_id,
+        nautilus_model::identifiers::VenueOrderId::new("venue-stop-new-2")
+    );
+    assert_eq!(
+        parsed_replaced.replaces,
+        Some(nautilus_model::identifiers::VenueOrderId::new(
+            "venue-stop-old-1"
+        ))
+    );
+    assert_eq!(
+        parsed_replaced.order_report.venue_order_id,
+        nautilus_model::identifiers::VenueOrderId::new("venue-stop-new-2")
+    );
+
+    // 2. Replacement child `new` / `fill` event carrying `replaces` and an Alpaca-generated
+    //    `client_order_id` preserves `replaces = Some(old_venue_order_id)` for lineage resolution.
+    let raw_replacement_fill_frame = r#"{
+        "stream": "trade_updates",
+        "data": {
+            "event": "fill",
+            "execution_id": "exec-repl-fill-1",
+            "price": "195.40",
+            "qty": "100",
+            "position_qty": "0",
+            "timestamp": "2026-03-31T14:16:00Z",
+            "order": {
+                "id": "venue-stop-new-2",
+                "client_order_id": "alpaca-auto-generated-cid-999",
+                "replaces": "venue-stop-old-1",
+                "created_at": "2026-03-31T14:15:00Z",
+                "updated_at": "2026-03-31T14:16:00Z",
+                "filled_at": "2026-03-31T14:16:00Z",
+                "symbol": "AAPL",
+                "qty": "100",
+                "filled_qty": "100",
+                "filled_avg_price": "195.40",
+                "type": "stop",
+                "side": "sell",
+                "time_in_force": "gtc",
+                "stop_price": "195.50",
+                "status": "filled"
+            }
+        }
+    }"#;
+
+    let classified_fill = classify_alpaca_ws_frame(raw_replacement_fill_frame.as_bytes())
+        .expect("classify replacement fill frame");
+    let fill_payload = match classified_fill {
+        AlpacaWsFrameClassification::TradeUpdate(p) => p,
+        other => panic!("expected TradeUpdate, got {other:?}"),
+    };
+    let parsed_fill =
+        parse_trade_update_payload(&fill_payload, account_id, ALPACA_VENUE, 2, 0, ts_init)
+            .expect("parse replacement fill update");
+    assert_eq!(parsed_fill.event_kind, AlpacaTradeEventKind::Fill);
+    assert_eq!(
+        parsed_fill.venue_order_id,
+        nautilus_model::identifiers::VenueOrderId::new("venue-stop-new-2")
+    );
+    assert_eq!(
+        parsed_fill.replaces,
+        Some(nautilus_model::identifiers::VenueOrderId::new(
+            "venue-stop-old-1"
+        ))
+    );
+    assert_eq!(
+        parsed_fill.client_order_id,
+        ClientOrderId::new("alpaca-auto-generated-cid-999")
+    );
+    assert!(parsed_fill.fill_report.is_some());
+}
+
+#[test]
 fn test_parse_trade_update_fail_closed_validation() {
     let account_id = AccountId::new("ALPACA-PA123456");
     let ts_init = UnixNanos::from(1_775_000_000_000_000_000u64);

@@ -22,7 +22,9 @@ import os
 import select
 import threading
 import time
+import urllib.request
 import uuid
+import weakref
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -76,6 +78,7 @@ from nautilus_trader.adapters.datainfra import (
 )
 from nautilus_trader.backtest import BacktestEngine, BacktestEngineConfig
 from nautilus_trader.common import CacheConfig, Environment
+from nautilus_trader.core import UUID4
 from nautilus_trader.execution import (
     BestPriceFillModel,
     MakerTakerFeeModel,
@@ -88,18 +91,46 @@ from nautilus_trader.live import (
     LiveRiskEngineConfig,
 )
 from nautilus_trader.model import (
+    AccountId,
     AccountType,
     Bar,
     Currency,
     Equity,
+    LiquiditySide,
     Money,
     OmsType,
+    OrderAccepted,
+    OrderCanceled,
+    OrderCancelRejected,
+    OrderFilled,
+    OrderRejected,
+    OrderSide,
+    OrderSubmitted,
+    OrderType,
+    OrderUpdated,
+    Position,
+    PositionChanged,
+    PositionClosed,
+    PositionId,
+    PositionOpened,
+    Price,
+    Quantity,
+    TradeId,
     TraderId,
     Venue,
+    VenueOrderId,
 )
 
 PLAN_LOCKED_NOTIFY_CHANNEL: str = "nautilus_plan_locked"
 logger = logging.getLogger(__name__)
+
+
+class EmptyPlanStartupError(RuntimeError, ValueError):
+    """Raised when no LOCKED TradingPlan exists in PostgreSQL at startup."""
+
+
+class PlanWaitTimeoutError(EmptyPlanStartupError, TimeoutError):
+    """Raised when waiting on LISTEN nautilus_plan_locked times out without a LOCKED plan."""
 
 TRADING_MODE_ENV_VARS: Tuple[str, ...] = (
     "TRADING_MODE",
@@ -248,6 +279,7 @@ def build_alpaca_config_from_env(explicit_mode: Optional[str] = None) -> AlpacaE
         api_key=api_key,
         api_secret=api_secret,
         environment="live" if is_live else "paper",
+        http_base_url=base_url,
     )
 
 
@@ -298,6 +330,7 @@ class DailyPlanRolloverReport:
 
     trading_date: date
     decisions: Tuple[SymbolRolloverDecision, ...]
+    sip_feeder_subscriptions: Optional[Dict[str, Any]] = None
 
     @property
     def decisions_by_symbol(self) -> Dict[str, SymbolRolloverDecision]:
@@ -336,13 +369,121 @@ class DailyPlanRolloverReport:
         )
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        payload: Dict[str, Any] = {
             "trading_date": self.trading_date.isoformat(),
             "new_active_symbols": list(self.new_active_symbols),
             "renewed_active_symbols": list(self.renewed_active_symbols),
             "carry_over_exit_only_symbols": list(self.carry_over_exit_only_symbols),
             "thesis_invalidated_exit_symbols": list(self.thesis_invalidated_exit_symbols),
             "decisions": [d.to_dict() for d in self.decisions],
+        }
+        if self.sip_feeder_subscriptions is not None:
+            payload["sip_feeder_subscriptions"] = dict(self.sip_feeder_subscriptions)
+        return payload
+
+
+class SipFeederSubscriptionClient:
+    """Single-responsibility HTTP client synchronizing active `TradingPlan` and carry-over
+    symbols with `sip-feeder` (`:8011/v1/subscriptions`).
+    """
+
+    def __init__(
+        self,
+        base_url: Optional[str] = None,
+        *,
+        timeout_secs: float = 5.0,
+        max_retries: int = 2,
+    ) -> None:
+        resolved = (
+            str(base_url).strip()
+            if base_url is not None
+            else os.environ.get("SIP_FEEDER_URL", "").strip()
+        )
+        self._base_url = resolved.rstrip("/")
+        self._timeout_secs = max(0.5, float(timeout_secs))
+        self._max_retries = max(0, int(max_retries))
+
+    @property
+    def base_url(self) -> str:
+        return self._base_url
+
+    @property
+    def is_configured(self) -> bool:
+        return bool(self._base_url)
+
+    @staticmethod
+    def normalize_symbols(symbols: Iterable[str]) -> List[str]:
+        normalized: Set[str] = set()
+        for raw in symbols:
+            if not raw:
+                continue
+            token = str(raw).strip().upper().split(".", 1)[0].strip()
+            if token:
+                normalized.add(token)
+        return sorted(normalized)
+
+    def _request_subscriptions(
+        self,
+        method: str,
+        symbols: Sequence[str],
+    ) -> Dict[str, Any]:
+        payload_bytes = json.dumps(
+            {
+                "bars": list(symbols),
+                "quotes": list(symbols),
+                "statuses": list(symbols),
+            }
+        ).encode("utf-8")
+        url = f"{self._base_url}/v1/subscriptions"
+        last_exc: Optional[Exception] = None
+        for attempt in range(self._max_retries + 1):
+            req = urllib.request.Request(
+                url,
+                data=payload_bytes,
+                headers={"Content-Type": "application/json"},
+                method=method.upper(),
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=self._timeout_secs) as resp:
+                    raw_body = resp.read().decode("utf-8")
+                    return json.loads(raw_body) if raw_body.strip() else {}
+            except Exception as exc:
+                last_exc = exc
+                if attempt < self._max_retries:
+                    continue
+        assert last_exc is not None
+        raise RuntimeError(
+            f"sip-feeder {method.upper()} {url} failed for symbols={list(symbols)}: {last_exc}"
+        ) from last_exc
+
+    def sync_plan_subscriptions(
+        self,
+        active_symbols: Iterable[str],
+        remove_symbols: Iterable[str] = (),
+    ) -> Dict[str, Any]:
+        active_list = self.normalize_symbols(active_symbols)
+        active_set = set(active_list)
+        remove_list = [
+            s for s in self.normalize_symbols(remove_symbols) if s not in active_set
+        ]
+        if not self.is_configured:
+            return {
+                "status": "SKIPPED_UNCONFIGURED",
+                "added": active_list,
+                "removed": remove_list,
+            }
+        added_view: Optional[Dict[str, Any]] = None
+        removed_view: Optional[Dict[str, Any]] = None
+        if active_list:
+            added_view = self._request_subscriptions("POST", active_list)
+        if remove_list:
+            removed_view = self._request_subscriptions("DELETE", remove_list)
+        return {
+            "status": "SYNCED",
+            "added": active_list,
+            "removed": remove_list,
+            "added_view": added_view,
+            "removed_view": removed_view,
         }
 
 
@@ -368,6 +509,50 @@ class AssembledLiveNodeBundle:
     telemetry_actor: PostgresTelemetryActor
     routed_venues: Tuple[str, ...]
     reconciler: Optional["DailyPlanReconciler"] = None
+
+    @property
+    def instruments(self) -> Tuple[str, ...]:
+        return tuple(item.strategy_config.instrument_id for item in self.plan_items)
+
+    def run_bar_stream(
+        self,
+        bars_by_instrument: Mapping[str, Sequence[Bar]] | Sequence[Bar],
+    ) -> List[Dict[str, Any]]:
+        """Drives the bundle's isomorphic strategy + `PlanGate` + `TelemetryActor` pipeline over `bars_by_instrument`
+        using the real Nautilus `BacktestEngine` kernel and returns the emitted order intents as dicts.
+        """
+        if isinstance(bars_by_instrument, Mapping):
+            results: List[Dict[str, Any]] = []
+            for key, bar_seq in bars_by_instrument.items():
+                norm_key = str(key).strip().upper()
+                sym_key = norm_key.split(".", 1)[0]
+                matched_item = next(
+                    (
+                        it
+                        for it in self.plan_items
+                        if it.symbol.upper() == sym_key
+                        or it.strategy_config.instrument_id.upper() == norm_key
+                    ),
+                    self.plan_items[0] if self.plan_items else None,
+                )
+                if matched_item is None:
+                    continue
+                intents = _drive_live_node_bundle_order_intents(
+                    bundle=self,
+                    plan_item=matched_item,
+                    bars=bar_seq,
+                )
+                results.extend(i.to_dict() for i in intents)
+            return results
+
+        if not self.plan_items:
+            return []
+        intents = _drive_live_node_bundle_order_intents(
+            bundle=self,
+            plan_item=self.plan_items[0],
+            bars=bars_by_instrument,
+        )
+        return [i.to_dict() for i in intents]
 
 
 def _compute_warmup_query_start_ns(
@@ -427,17 +612,33 @@ def _load_warmup_bars_for_strategy_with_sources(
     ):
         try:
             catalog = DataInfraCatalog(datainfra_config)
-            start_ts_ns = _compute_warmup_query_start_ns(cfg.bar_timeframe, req_bars)
-            catalog.register_equity(prim_sym, venue=venue, lot_size=1)
-            queried = sorted(
-                catalog.query_bars(
+            now_ns = int(time.time() * 1_000_000_000)
+            start_ts_ns = _compute_warmup_query_start_ns(
+                cfg.bar_timeframe,
+                req_bars,
+                end_ts_ns=now_ns,
+            )
+            if hasattr(catalog, "register_equity"):
+                catalog.register_equity(prim_sym, venue=venue, lot_size=1)
+            try:
+                raw_queried = catalog.query_bars(
                     [prim_sym],
                     start_ts_ns=start_ts_ns,
+                    end_ts_ns=now_ns,
                     timeframe=cfg.bar_timeframe,
                     adjustment="adjusted",
                     market_session="REG",
                     venue=venue,
-                ),
+                )
+            except TypeError:
+                raw_queried = catalog.query_bars(
+                    [prim_sym],
+                    start_ns=start_ts_ns,
+                    end_ns=now_ns,
+                    timeframe=cfg.bar_timeframe,
+                )
+            queried = sorted(
+                raw_queried,
                 key=lambda b: int(
                     getattr(b, "ts_init", 0) or getattr(b, "ts_event", 0) or 0
                 ),
@@ -446,11 +647,12 @@ def _load_warmup_bars_for_strategy_with_sources(
                 queried = queried[-req_bars:]
             collected.extend(queried)
         except Exception as exc:
-            logger.debug(
-                "ClickHouse warmup query skipped/unavailable for %s: %s",
+            logger.error(
+                "ClickHouse warmup query failed for %s: %s",
                 prim_sym,
                 exc,
             )
+            raise
 
     collected.sort(
         key=lambda b: int(getattr(b, "ts_init", 0) or getattr(b, "ts_event", 0) or 0)
@@ -473,13 +675,18 @@ class NautilusLiveNodeAssembler:
         market: str = "US_EQUITY",
         reconciliation_enabled: bool = True,
         reconciliation_lookback_mins: int = 1440,
+        open_check_interval_secs: Optional[float] = None,
+        position_check_interval_secs: Optional[float] = None,
         cache_config: Optional[CacheConfig] = None,
         historical_bar_loader: Optional[Callable[[str, str, int], Sequence[Bar]]] = None,
-        warmup_on_build: bool = True,
+        warmup_on_build: Optional[bool] = None,
+        sip_feeder_url: Optional[str] = None,
+        sip_feeder_client: Optional[SipFeederSubscriptionClient] = None,
     ) -> None:
         resolved_mode = resolve_trading_mode()
         self._dsn = resolve_database_dsn(dsn)
-        self._datainfra_config = datainfra_config or DataInfraConfig()
+        self._explicit_datainfra_config = datainfra_config
+        self._datainfra_config = datainfra_config or self._build_default_datainfra_config()
         self._alpaca_config = alpaca_config
         self._extra_exec_clients = tuple(extra_exec_clients or ())
         self._node_name = str(node_name or "nautilus-live-node").strip()
@@ -496,10 +703,132 @@ class NautilusLiveNodeAssembler:
         self._market = str(market or "US_EQUITY").strip().upper()
         self._reconciliation_enabled = bool(reconciliation_enabled)
         self._reconciliation_lookback_mins = max(60, int(reconciliation_lookback_mins))
+        default_reconcile_secs = float(
+            os.environ.get("NAUTILUS_RECONCILE_INTERVAL_SECS", "30.0") or 30.0
+        )
+        self._open_check_interval_secs = (
+            float(open_check_interval_secs)
+            if open_check_interval_secs is not None
+            else default_reconcile_secs
+        )
+        self._position_check_interval_secs = (
+            float(position_check_interval_secs)
+            if position_check_interval_secs is not None
+            else default_reconcile_secs
+        )
         self._cache_config = cache_config
         self._historical_bar_loader = historical_bar_loader
-        self._warmup_on_build = bool(warmup_on_build)
+        self._warmup_on_build = (
+            bool(warmup_on_build)
+            if warmup_on_build is not None
+            else bool(historical_bar_loader is not None)
+        )
+        self._sip_feeder_client = sip_feeder_client or SipFeederSubscriptionClient(
+            base_url=sip_feeder_url
+        )
         self._repo = PlanContractRepository(dsn=self._dsn)
+
+    @staticmethod
+    def _build_default_datainfra_config() -> DataInfraConfig:
+        from urllib.parse import quote
+
+        ch_url = (
+            os.environ.get("DATAINFRA_CLICKHOUSE_URL")
+            or os.environ.get("CLICKHOUSE_URL")
+            or os.environ.get("CLICKHOUSE_HTTP_URL")
+            or ""
+        ).strip()
+        ch_user = (
+            os.environ.get("DATAINFRA_CLICKHOUSE_USER")
+            or os.environ.get("CLICKHOUSE_USER")
+            or os.environ.get("CH_USER")
+            or ""
+        ).strip()
+        ch_pw = (
+            os.environ.get("DATAINFRA_CLICKHOUSE_PASSWORD")
+            or os.environ.get("CLICKHOUSE_PASSWORD")
+            or os.environ.get("CH_PASSWORD")
+            or ""
+        ).strip()
+        if not ch_url:
+            ch_host = os.environ.get("CH_HOST", "127.0.0.1").strip()
+            ch_port = (os.environ.get("CH_HTTP_PORT") or os.environ.get("CH_PORT") or "8123").strip()
+            if ch_user:
+                ch_url = f"http://{ch_host}:{ch_port}/?user={quote(ch_user)}&password={quote(ch_pw)}"
+            else:
+                ch_url = f"http://{ch_host}:{ch_port}"
+        elif ch_user and "user=" not in ch_url and "@" not in ch_url:
+            sep = "&" if "?" in ch_url else "?"
+            ch_url = f"{ch_url}{sep}user={quote(ch_user)}&password={quote(ch_pw)}"
+        ch_db = (
+            os.environ.get("DATAINFRA_CLICKHOUSE_DATABASE")
+            or os.environ.get("CLICKHOUSE_DATABASE")
+            or os.environ.get("CH_DB")
+            or "quant_market_data"
+        ).strip()
+        brokers_raw = (
+            os.environ.get("DATAINFRA_KAFKA_BROKERS")
+            or os.environ.get("KAFKA_BROKERS")
+            or "127.0.0.1:9092"
+        )
+        brokers = [b.strip() for b in brokers_raw.split(",") if b.strip()]
+        cal_url = (
+            os.environ.get("DATAINFRA_CALENDAR_SERVICE_URL")
+            or os.environ.get("CALENDAR_SERVICE_URL")
+            or "http://127.0.0.1:8012"
+        ).strip()
+        venue = (
+            os.environ.get("DATAINFRA_DEFAULT_VENUE")
+            or os.environ.get("DEFAULT_VENUE")
+            or "ALPACA"
+        ).strip().upper()
+        return DataInfraConfig(
+            clickhouse_url=ch_url,
+            clickhouse_database=ch_db,
+            kafka_brokers=brokers,
+            kafka_group_id=os.environ.get("KAFKA_GROUP_ID", "nautilus-datainfra-live"),
+            calendar_service_url=cal_url,
+            default_venue=venue,
+        )
+
+    @property
+    def sip_feeder_client(self) -> SipFeederSubscriptionClient:
+        return self._sip_feeder_client
+
+    def _sync_sip_feeder_subscriptions(
+        self,
+        active_symbols: Iterable[str],
+        *,
+        remove_symbols: Iterable[str] = (),
+        pg_backend: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        try:
+            return self._sip_feeder_client.sync_plan_subscriptions(
+                active_symbols=active_symbols,
+                remove_symbols=remove_symbols,
+            )
+        except Exception as exc:
+            logger.error(
+                "Failed to synchronize sip-feeder subscriptions (active=%s, remove=%s): %s",
+                list(active_symbols),
+                list(remove_symbols),
+                exc,
+            )
+            if pg_backend is not None and hasattr(pg_backend, "set_entry_freeze"):
+                try:
+                    pg_backend.set_entry_freeze(
+                        True,
+                        reason=f"SIP_FEEDER_SUBSCRIPTION_SYNC_FAILED: {exc}",
+                        updated_by="nautilus:sip_feeder_sync",
+                    )
+                except Exception:
+                    pass
+            return {
+                "status": "ERROR",
+                "error": str(exc),
+                "added": SipFeederSubscriptionClient.normalize_symbols(active_symbols),
+                "removed": SipFeederSubscriptionClient.normalize_symbols(remove_symbols),
+            }
 
     @property
     def dsn(self) -> str:
@@ -508,6 +837,74 @@ class NautilusLiveNodeAssembler:
     @property
     def repository(self) -> PlanContractRepository:
         return self._repo
+
+    def _has_locked_plan(self, trading_date: date) -> bool:
+        has_locked_fn = getattr(self._repo, "has_locked_plan", None)
+        if not callable(has_locked_fn):
+            return False
+        try:
+            return bool(has_locked_fn(trading_date=trading_date, market=self._market))
+        except TypeError:
+            return bool(has_locked_fn(trading_date, self._market))
+
+    def _hydrate_carry_over_items(
+        self,
+        trading_date: date,
+        locked_items: Sequence[PlanItemContract],
+        *,
+        allow_db_query: bool = True,
+    ) -> List[PlanItemContract]:
+        combined = list(locked_items)
+        if not allow_db_query:
+            return combined
+        load_co_fn = getattr(
+            self._repo, "load_carry_over_items_for_open_positions", None
+        )
+        if not callable(load_co_fn):
+            return combined
+        existing_idx_by_sym = {it.symbol: idx for idx, it in enumerate(combined)}
+        existing_syms = set(existing_idx_by_sym.keys())
+        try:
+            carry_over = load_co_fn(
+                trading_date=trading_date,
+                market=self._market,
+                excluded_symbols=set(),
+            )
+        except TypeError:
+            carry_over = load_co_fn(trading_date, self._market, set())
+        for co_item in carry_over or ():
+            if co_item.symbol not in existing_syms:
+                combined.append(co_item)
+                existing_syms.add(co_item.symbol)
+            else:
+                idx = existing_idx_by_sym[co_item.symbol]
+                existing_it = combined[idx]
+                co_stop = co_item.risk_envelope.initial_stop_price
+                cur_stop = existing_it.risk_envelope.initial_stop_price
+                if co_stop > Decimal("0"):
+                    if existing_it.risk_envelope.side == PlanSide.LONG:
+                        tight_stop = max(cur_stop, co_stop)
+                    else:
+                        tight_stop = min(cur_stop, co_stop) if cur_stop > Decimal("0") else co_stop
+                else:
+                    tight_stop = cur_stop
+                merged_trace = dict(existing_it.sizing_trace)
+                merged_trace.setdefault("carry_over_status", "RENEWED_ACTIVE")
+                if "carry_over_position_qty" not in merged_trace:
+                    raw_co_q = co_item.sizing_trace.get("carry_over_position_qty")
+                    merged_trace["carry_over_position_qty"] = (
+                        str(raw_co_q) if raw_co_q is not None else str(co_item.filled_qty)
+                    )
+                combined[idx] = replace(
+                    existing_it,
+                    risk_envelope=replace(
+                        existing_it.risk_envelope,
+                        initial_stop_price=tight_stop,
+                    ),
+                    sizing_trace=merged_trace,
+                    filled_qty=max(existing_it.filled_qty, co_item.filled_qty),
+                )
+        return combined
 
     def load_warmup_bars_for_strategy(
         self,
@@ -541,21 +938,29 @@ class NautilusLiveNodeAssembler:
 
     def load_locked_plan_items_or_wait(
         self,
-        trading_date: date,
+        trading_date: date | str,
         listen_timeout_secs: float = 0.0,
     ) -> List[PlanItemContract]:
-        """Loads today's `LOCKED` `PlanItemContract` list or waits via PG `LISTEN nautilus_plan_locked`."""
+        """Loads today's `LOCKED` `PlanItemContract` list (plus any open overnight carry-over positions)
+        or waits via PG `LISTEN nautilus_plan_locked`. Returns immediately (including `[]`) when a
+        `LOCKED` 0-item `LOCKED_NO_TRADE` plan is present in `trading_plans`.
+        """
+        td = (
+            date.fromisoformat(str(trading_date)[:10])
+            if isinstance(trading_date, str)
+            else trading_date
+        )
         existing = self._repo.load_locked_plan_items(
-            trading_date=trading_date,
+            trading_date=td,
             market=self._market,
         )
-        if existing:
-            return existing
+        if existing or self._has_locked_plan(td):
+            return self._hydrate_carry_over_items(td, existing, allow_db_query=True)
 
         if listen_timeout_secs <= 0.0:
-            raise RuntimeError(
+            raise EmptyPlanStartupError(
                 f"No LOCKED TradingPlan items found in PostgreSQL for market={self._market} "
-                f"trading_date={trading_date.isoformat()} (fail-closed)"
+                f"trading_date={td.isoformat()} (fail-closed)"
             )
 
         conn = psycopg2.connect(self._dsn, connect_timeout=5)
@@ -564,11 +969,13 @@ class NautilusLiveNodeAssembler:
             with conn.cursor() as cur:
                 cur.execute(f"LISTEN {PLAN_LOCKED_NOTIFY_CHANNEL};")
                 rechecked = self._repo.load_locked_plan_items(
-                    trading_date=trading_date,
+                    trading_date=td,
                     market=self._market,
                 )
-                if rechecked:
-                    return rechecked
+                if rechecked or self._has_locked_plan(td):
+                    return self._hydrate_carry_over_items(
+                        td, rechecked, allow_db_query=True
+                    )
 
                 deadline = time.monotonic() + float(listen_timeout_secs)
                 while True:
@@ -582,22 +989,24 @@ class NautilusLiveNodeAssembler:
                     while conn.notifies:
                         _ = conn.notifies.pop(0)
                     notified_items = self._repo.load_locked_plan_items(
-                        trading_date=trading_date,
+                        trading_date=td,
                         market=self._market,
                     )
-                    if notified_items:
-                        return notified_items
+                    if notified_items or self._has_locked_plan(td):
+                        return self._hydrate_carry_over_items(
+                            td, notified_items, allow_db_query=True
+                        )
         finally:
             conn.close()
 
-        raise RuntimeError(
+        raise PlanWaitTimeoutError(
             f"Timed out waiting ({listen_timeout_secs:.1f}s) on LISTEN {PLAN_LOCKED_NOTIFY_CHANNEL} "
-            f"for LOCKED TradingPlan on {trading_date.isoformat()} (fail-closed)"
+            f"for LOCKED TradingPlan on {td.isoformat()} (fail-closed)"
         )
 
     def build_live_node(
         self,
-        trading_date: date,
+        trading_date: date | str,
         *,
         plan_items: Optional[Sequence[PlanItemContract]] = None,
         plan_gate_backend: Optional[Any] = None,
@@ -611,16 +1020,22 @@ class NautilusLiveNodeAssembler:
         perform_warmup: Optional[bool] = None,
     ) -> AssembledLiveNodeBundle:
         """Constructs a `LiveNode` wired with `DataInfra`, `Alpaca`, `PlanGate`, `TelemetryActor`, and `Strategy`s."""
-        locked_items = (
-            list(plan_items)
-            if plan_items is not None
-            else self.load_locked_plan_items_or_wait(
-                trading_date=trading_date,
+        td = (
+            date.fromisoformat(str(trading_date)[:10])
+            if isinstance(trading_date, str)
+            else trading_date
+        )
+        if plan_items is not None:
+            locked_items = list(plan_items)
+            if not locked_items and not self._has_locked_plan(td):
+                raise EmptyPlanStartupError(
+                    "LiveNode cannot start with an empty PlanItemContract list"
+                )
+        else:
+            locked_items = self.load_locked_plan_items_or_wait(
+                trading_date=td,
                 listen_timeout_secs=listen_timeout_secs,
             )
-        )
-        if not locked_items:
-            raise ValueError("LiveNode cannot start with an empty PlanItemContract list")
 
         builder = LiveNode.builder(
             self._node_name,
@@ -628,7 +1043,12 @@ class NautilusLiveNodeAssembler:
             self._environment,
         )
         builder.with_data_engine_config(LiveDataEngineConfig())
-        builder.with_exec_engine_config(LiveExecutionEngineConfig())
+        builder.with_exec_engine_config(
+            LiveExecutionEngineConfig(
+                open_check_interval_secs=self._open_check_interval_secs,
+                position_check_interval_secs=self._position_check_interval_secs,
+            )
+        )
         builder.with_risk_engine_config(LiveRiskEngineConfig())
         builder.with_reconciliation(self._reconciliation_enabled)
         builder.with_reconciliation_lookback_mins(self._reconciliation_lookback_mins)
@@ -659,128 +1079,260 @@ class NautilusLiveNodeAssembler:
             routed_venues.append(extra.venue.strip().upper())
 
         node = builder.build()
-
-        env_label = "LIVE" if self._environment == Environment.LIVE else "PAPER"
-        pg_backend = (
-            plan_gate_backend
-            if plan_gate_backend is not None
-            else PostgresPlanGateBackend(
-                dsn=self._dsn,
-                trading_date=trading_date,
-                market=self._market,
+        plan_gate: Optional[PlanGateExecAlgorithm] = None
+        telemetry_actor: Optional[PostgresTelemetryActor] = None
+        try:
+            env_label = "LIVE" if self._environment == Environment.LIVE else "PAPER"
+            pg_backend = (
+                plan_gate_backend
+                if plan_gate_backend is not None
+                else PostgresPlanGateBackend(
+                    dsn=self._dsn,
+                    trading_date=td,
+                    market=self._market,
+                )
             )
-        )
-        oco_monitor = ProtectiveOcoMonitor(
-            dsn=self._dsn if persist_telemetry_to_db else None,
-            broker="alpaca",
-            persist_to_db=bool(persist_telemetry_to_db),
-            on_entry_freeze_callback=lambda sym, reason: pg_backend.set_entry_freeze(
-                True,
-                reason=reason,
-                updated_by=f"nautilus:protective_oco_monitor:{sym}",
-            ),
-        )
-        telemetry_actor = PostgresTelemetryActor(
-            PostgresTelemetryActorConfig(
+            oco_monitor = ProtectiveOcoMonitor(
                 dsn=self._dsn if persist_telemetry_to_db else None,
-                market=self._market,
-                trading_date=trading_date,
-                environment=env_label,
+                broker="alpaca",
                 persist_to_db=bool(persist_telemetry_to_db),
-                enforce_protective_oco_on_position_events=bool(
-                    enforce_protective_oco_on_position_events
+                on_entry_freeze_callback=lambda sym, reason: pg_backend.set_entry_freeze(
+                    True,
+                    reason=reason,
+                    updated_by=f"nautilus:protective_oco_monitor:{sym}",
                 ),
-            ),
-            oco_monitor=oco_monitor,
-        )
-        plan_gate = PlanGateExecAlgorithm(
-            backend=pg_backend,
-            telemetry_actor=telemetry_actor,
-            oco_monitor=oco_monitor,
-            config=PlanGateExecAlgorithmConfig(
-                exec_algorithm_id=PLAN_GATE_EXEC_ALGORITHM_ID,
-                collar_market_orders=bool(use_limit_orders),
-            ),
-        )
-        node.add_exec_algorithm(plan_gate)
-        node.add_actor(telemetry_actor)
-        if hasattr(node, "trader") and getattr(node, "trader", None) is not None:
-            if hasattr(node.trader, "add_exec_algorithm"):
-                try:
-                    node.trader.add_exec_algorithm(plan_gate)
-                except Exception:
-                    pass
-            if hasattr(node.trader, "add_actor"):
-                try:
-                    node.trader.add_actor(telemetry_actor)
-                except Exception:
-                    pass
-
-        should_warmup = (
-            bool(warmup_strategies)
-            if warmup_strategies is not None
-            else (
-                bool(perform_warmup)
-                if perform_warmup is not None
-                else self._warmup_on_build
             )
-        )
-        strategies: List[BaseArchetypeStrategy] = []
-        for item in locked_items:
-            strategy = instantiate_strategy_from_contract(
-                item,
+            if hasattr(pg_backend, "register_oco_monitor"):
+                try:
+                    pg_backend.register_oco_monitor(oco_monitor)
+                except Exception:
+                    pass
+            telemetry_actor = PostgresTelemetryActor(
+                PostgresTelemetryActorConfig(
+                    dsn=self._dsn if persist_telemetry_to_db else None,
+                    market=self._market,
+                    trading_date=td,
+                    environment=env_label,
+                    persist_to_db=bool(persist_telemetry_to_db),
+                    enforce_protective_oco_on_position_events=bool(
+                        enforce_protective_oco_on_position_events
+                    ),
+                ),
+                oco_monitor=oco_monitor,
+            )
+            plan_gate = PlanGateExecAlgorithm(
+                backend=pg_backend,
+                telemetry_actor=telemetry_actor,
+                oco_monitor=oco_monitor,
+                config=PlanGateExecAlgorithmConfig(
+                    exec_algorithm_id=PLAN_GATE_EXEC_ALGORITHM_ID,
+                    collar_market_orders=bool(use_limit_orders),
+                ),
+            )
+            node.add_exec_algorithm(plan_gate)
+            node.add_actor(telemetry_actor)
+            if hasattr(node, "trader") and getattr(node, "trader", None) is not None:
+                if hasattr(node.trader, "add_exec_algorithm"):
+                    try:
+                        node.trader.add_exec_algorithm(plan_gate)
+                    except Exception:
+                        pass
+                if hasattr(node.trader, "add_actor"):
+                    try:
+                        node.trader.add_actor(telemetry_actor)
+                    except Exception:
+                        pass
+
+            should_warmup = (
+                bool(warmup_strategies)
+                if warmup_strategies is not None
+                else (
+                    bool(perform_warmup)
+                    if perform_warmup is not None
+                    else self._warmup_on_build
+                )
+            )
+            strategies: List[BaseArchetypeStrategy] = []
+            for item in locked_items:
+                co_status = str(
+                    getattr(item, "carry_over_status", None)
+                    or item.sizing_trace.get("carry_over_status")
+                    or ""
+                ).strip().upper()
+                raw_co_qty = item.sizing_trace.get("carry_over_position_qty")
+                has_carry_over_pos = (
+                    co_status in ("RENEWED_ACTIVE", "CARRY_OVER_EXIT_ONLY", "THESIS_INVALIDATED_EXIT")
+                    or raw_co_qty is not None
+                    or item.filled_qty > Decimal("0")
+                )
+                signed_co_qty = Decimal("0")
+                if has_carry_over_pos:
+                    if raw_co_qty is not None:
+                        signed_co_qty = _to_decimal(
+                            raw_co_qty, "carry_over_position_qty"
+                        )
+                    elif co_status in ("CARRY_OVER_EXIT_ONLY", "THESIS_INVALIDATED_EXIT"):
+                        abs_co_qty = max(
+                            item.filled_qty, item.risk_envelope.target_qty
+                        )
+                        signed_co_qty = (
+                            abs_co_qty
+                            if item.risk_envelope.side == PlanSide.LONG
+                            else -abs_co_qty
+                        )
+                    else:
+                        signed_co_qty = (
+                            item.filled_qty
+                            if item.risk_envelope.side == PlanSide.LONG
+                            else -item.filled_qty
+                        )
+                abs_pos_qty = abs(signed_co_qty)
+                if hasattr(pg_backend, "upsert_runtime_plan_item"):
+                    if (
+                        co_status == "RENEWED_ACTIVE"
+                        and abs_pos_qty > Decimal("0")
+                        and not bool(item.sizing_trace.get("pyramid_enabled", False))
+                    ):
+                        init_reserved = max(
+                            item.filled_qty,
+                            abs_pos_qty,
+                            item.risk_envelope.approved_qty_cap,
+                        )
+                    else:
+                        init_reserved = max(item.filled_qty, abs_pos_qty)
+                    pg_backend.upsert_runtime_plan_item(
+                        item,
+                        reserved_qty=init_reserved,
+                    )
+                strategy = instantiate_strategy_from_contract(
+                    item,
+                    use_limit_orders=use_limit_orders,
+                    submit_protective_stop=submit_protective_stop,
+                )
+                if hasattr(strategy, "bind_telemetry_actor"):
+                    strategy.bind_telemetry_actor(telemetry_actor)
+                if hasattr(strategy, "bind_plan_gate"):
+                    strategy.bind_plan_gate(plan_gate)
+                if hasattr(strategy, "bind_warmup_loader") and (
+                    should_warmup
+                    or self._historical_bar_loader is not None
+                    or self._explicit_datainfra_config is not None
+                    or bool(warmup_bars_by_symbol)
+                ):
+                    weak_strat = weakref.ref(strategy)
+                    weak_self = weakref.ref(self)
+                    strategy.bind_warmup_loader(
+                        lambda ws=weak_strat, wa=weak_self: (
+                            wa().load_warmup_bars_for_strategy(ws())
+                            if wa() is not None and ws() is not None
+                            else []
+                        )
+                    )
+                if warmup_bars_by_symbol and item.symbol in warmup_bars_by_symbol:
+                    self.warmup_strategy_from_catalog(
+                        strategy,
+                        bars=warmup_bars_by_symbol[item.symbol],
+                    )
+                elif should_warmup:
+                    self.warmup_strategy_from_catalog(strategy)
+
+                if has_carry_over_pos and signed_co_qty != Decimal("0"):
+                    strategy.set_tracked_position_signed_qty(signed_co_qty)
+                    if abs_pos_qty > Decimal("0"):
+                        oco_monitor.record_position_qty_sync(item.symbol, abs_pos_qty)
+                        if (
+                            oco_monitor.get_coverage(item.symbol) is None
+                            and item.risk_envelope.initial_stop_price > Decimal("0")
+                        ):
+                            oco_monitor.register_protective_order(
+                                symbol=item.symbol,
+                                covered_qty=abs_pos_qty,
+                                stop_price=item.risk_envelope.initial_stop_price,
+                                item_id=item.item_id,
+                                status="ACTIVE",
+                                persist=bool(persist_telemetry_to_db),
+                            )
+                if co_status in ("CARRY_OVER_EXIT_ONLY", "THESIS_INVALIDATED_EXIT"):
+                    if co_status == "THESIS_INVALIDATED_EXIT":
+                        strategy.trigger_thesis_invalidated_exit(
+                            execute_immediately=False,
+                            reason_tag="THESIS_INVALIDATED_EXIT",
+                        )
+                    else:
+                        strategy.enter_carry_over_exit_only_mode()
+
+                node.add_strategy(strategy)
+                if hasattr(node, "trader") and getattr(node, "trader", None) is not None and hasattr(node.trader, "add_strategy"):
+                    try:
+                        node.trader.add_strategy(strategy)
+                    except Exception:
+                        pass
+                strategies.append(strategy)
+
+            self._sync_sip_feeder_subscriptions(
+                active_symbols=[item.symbol for item in locked_items],
+                pg_backend=pg_backend,
+            )
+
+            reconciler = DailyPlanReconciler(
+                plan_gate=plan_gate,
+                plan_gate_backend=pg_backend,
+                telemetry_actor=telemetry_actor,
+                strategies_by_symbol={
+                    item.symbol: strat for item, strat in zip(locked_items, strategies)
+                },
+                plan_items_by_symbol={item.symbol: item for item in locked_items},
+                node=node,
+                assembler=self,
+                repository=self._repo,
+                warmup_bar_loader=self._historical_bar_loader,
                 use_limit_orders=use_limit_orders,
                 submit_protective_stop=submit_protective_stop,
+                sip_feeder_client=self._sip_feeder_client,
             )
-            if hasattr(strategy, "bind_telemetry_actor"):
-                strategy.bind_telemetry_actor(telemetry_actor)
-            if hasattr(strategy, "bind_plan_gate"):
-                strategy.bind_plan_gate(plan_gate)
-            if hasattr(strategy, "bind_warmup_loader"):
-                strategy.bind_warmup_loader(
-                    lambda s=strategy: self.load_warmup_bars_for_strategy(s)
-                )
-            if warmup_bars_by_symbol and item.symbol in warmup_bars_by_symbol:
-                self.warmup_strategy_from_catalog(
-                    strategy,
-                    bars=warmup_bars_by_symbol[item.symbol],
-                )
-            elif should_warmup:
-                self.warmup_strategy_from_catalog(strategy)
-            node.add_strategy(strategy)
-            if hasattr(node, "trader") and getattr(node, "trader", None) is not None and hasattr(node.trader, "add_strategy"):
+            weak_rec = weakref.ref(reconciler)
+
+            def _clear_reconciler_refs() -> None:
+                rec = weak_rec()
+                if rec is not None:
+                    rec._node = None
+                    rec._plan_gate = None
+                    rec._telemetry_actor = None
+                    rec._strategies_by_symbol.clear()
+
+            if hasattr(plan_gate, "_close_callbacks"):
+                plan_gate._close_callbacks.append(_clear_reconciler_refs)
+
+            return AssembledLiveNodeBundle(
+                node=node,
+                trading_date=td,
+                plan_items=tuple(locked_items),
+                strategies=tuple(strategies),
+                plan_gate=plan_gate,
+                telemetry_actor=telemetry_actor,
+                routed_venues=tuple(routed_venues),
+                reconciler=reconciler,
+            )
+        except Exception:
+            if plan_gate is not None:
                 try:
-                    node.trader.add_strategy(strategy)
+                    plan_gate.close()
                 except Exception:
                     pass
-            strategies.append(strategy)
-
-        reconciler = DailyPlanReconciler(
-            plan_gate=plan_gate,
-            plan_gate_backend=pg_backend,
-            telemetry_actor=telemetry_actor,
-            strategies_by_symbol={
-                item.symbol: strat for item, strat in zip(locked_items, strategies)
-            },
-            plan_items_by_symbol={item.symbol: item for item in locked_items},
-            node=node,
-            assembler=self,
-            repository=self._repo,
-            warmup_bar_loader=self._historical_bar_loader,
-            use_limit_orders=use_limit_orders,
-            submit_protective_stop=submit_protective_stop,
-        )
-
-        return AssembledLiveNodeBundle(
-            node=node,
-            trading_date=trading_date,
-            plan_items=tuple(locked_items),
-            strategies=tuple(strategies),
-            plan_gate=plan_gate,
-            telemetry_actor=telemetry_actor,
-            routed_venues=tuple(routed_venues),
-            reconciler=reconciler,
-        )
+                plan_gate = None
+            if telemetry_actor is not None:
+                try:
+                    telemetry_actor.close()
+                except Exception:
+                    pass
+                telemetry_actor = None
+            try:
+                node.dispose()
+            except Exception:
+                pass
+            node = None  # type: ignore[assignment]
+            gc.collect()
+            raise
 
 
 class DailyPlanReconciler:
@@ -817,6 +1369,8 @@ class DailyPlanReconciler:
         warmup_bar_loader: Optional[Callable[[str, str, int], Sequence[Bar]]] = None,
         use_limit_orders: bool = True,
         submit_protective_stop: bool = True,
+        sip_feeder_url: Optional[str] = None,
+        sip_feeder_client: Optional[SipFeederSubscriptionClient] = None,
     ) -> None:
         resolved_backend = plan_gate_backend
         if resolved_backend is None and plan_gate is not None:
@@ -836,6 +1390,15 @@ class DailyPlanReconciler:
         )
         self._use_limit_orders = bool(use_limit_orders)
         self._submit_protective_stop = bool(submit_protective_stop)
+        self._sip_feeder_client = (
+            sip_feeder_client
+            or (
+                assembler._sip_feeder_client
+                if assembler is not None and hasattr(assembler, "_sip_feeder_client")
+                else None
+            )
+            or SipFeederSubscriptionClient(base_url=sip_feeder_url)
+        )
 
         self._strategies_by_symbol: Dict[str, BaseArchetypeStrategy] = {}
         if isinstance(strategies_by_symbol, Mapping):
@@ -854,6 +1417,12 @@ class DailyPlanReconciler:
             for item in plan_items_by_symbol:
                 self._plan_items_by_symbol[item.symbol] = item
 
+        self._subscribed_symbols: Set[str] = set(
+            SipFeederSubscriptionClient.normalize_symbols(
+                list(self._plan_items_by_symbol.keys())
+                + list(self._strategies_by_symbol.keys())
+            )
+        )
         self._trading_date: Optional[date] = getattr(
             self._backend, "trading_date", None
         )
@@ -861,7 +1430,12 @@ class DailyPlanReconciler:
         self._owner_thread_id: int = threading.get_ident()
         self._event_loop: Optional[asyncio.AbstractEventLoop] = None
         self._pending_node_strategies: List[BaseArchetypeStrategy] = []
+        self._node_reload_required: bool = False
         self._sync_owner_thread_state()
+
+    @property
+    def node_reload_required(self) -> bool:
+        return self._node_reload_required
 
     def bind_event_loop(self, loop: Optional[asyncio.AbstractEventLoop]) -> None:
         self._event_loop = loop
@@ -872,6 +1446,14 @@ class DailyPlanReconciler:
         return threading.get_ident() == getattr(
             self, "_owner_thread_id", threading.get_ident()
         )
+
+    def _mount_or_queue_strategy(self, strat: BaseArchetypeStrategy) -> None:
+        if self._node is None:
+            return
+        if self._is_owner_thread():
+            self._mount_strategy_on_node(strat)
+        else:
+            self._pending_node_strategies.append(strat)
 
     def _mount_strategy_on_node(self, strat: BaseArchetypeStrategy) -> None:
         strat._owner_thread_id = threading.get_ident()
@@ -911,7 +1493,24 @@ class DailyPlanReconciler:
             try:
                 self._node.add_strategy(strat)
             except Exception as exc:
-                logger.debug("Skipping duplicate/offline node.add_strategy: %s", exc)
+                self._node_reload_required = True
+                logger.warning(
+                    "LiveNode cannot mount strategy %s dynamically while running (%s); "
+                    "requesting clean node reload for trading_date=%s",
+                    getattr(strat, "id", strat),
+                    exc,
+                    self._trading_date,
+                )
+                if hasattr(self._node, "handle") and callable(self._node.handle):
+                    try:
+                        handle = self._node.handle()
+                        if hasattr(handle, "stop") and callable(handle.stop):
+                            handle.stop()
+                    except Exception as stop_exc:
+                        logger.debug(
+                            "LiveNode handle.stop() failed during reload request: %s",
+                            stop_exc,
+                        )
 
     def _sync_owner_thread_state(self) -> None:
         for strat in list(self._strategies_by_symbol.values()):
@@ -1184,6 +1783,7 @@ class DailyPlanReconciler:
                     if self._plan_gate is not None and hasattr(strat, "bind_plan_gate"):
                         strat.bind_plan_gate(self._plan_gate)
                     strat.set_tracked_position_signed_qty(pos_qty)
+                    self._mount_or_queue_strategy(strat)
                     self._strategies_by_symbol[sym] = strat
 
                 base_contract = prior_item or self._build_fallback_carry_over_contract(
@@ -1241,6 +1841,8 @@ class DailyPlanReconciler:
             if sym in new_items_by_symbol and has_open_pos:
                 new_item = new_items_by_symbol[sym]
                 if strat is not None:
+                    if strat._open_position_signed_qty() == Decimal("0"):
+                        strat.set_tracked_position_signed_qty(pos_qty)
                     renewed_env = strat.apply_renewed_plan_item(new_item)
                 else:
                     prior_stop = (
@@ -1273,6 +1875,7 @@ class DailyPlanReconciler:
                     if self._plan_gate is not None and hasattr(strat, "bind_plan_gate"):
                         strat.bind_plan_gate(self._plan_gate)
                     strat.set_tracked_position_signed_qty(pos_qty)
+                    self._mount_or_queue_strategy(strat)
                     self._strategies_by_symbol[sym] = strat
 
                 carried_reserved = max(new_item.filled_qty, abs(pos_qty))
@@ -1281,12 +1884,20 @@ class DailyPlanReconciler:
                     risk_envelope=renewed_env,
                     filled_qty=carried_reserved,
                 )
+                pyramid_enabled = bool(
+                    renewed_item.sizing_trace.get("pyramid_enabled", False)
+                )
+                effective_reserved_qty = (
+                    carried_reserved
+                    if pyramid_enabled
+                    else max(carried_reserved, renewed_env.approved_qty_cap)
+                )
                 if self._backend is not None and hasattr(
                     self._backend, "upsert_runtime_plan_item"
                 ):
                     self._backend.upsert_runtime_plan_item(
                         renewed_item,
-                        reserved_qty=carried_reserved,
+                        reserved_qty=effective_reserved_qty,
                     )
                 self._plan_items_by_symbol[sym] = renewed_item
 
@@ -1310,6 +1921,20 @@ class DailyPlanReconciler:
 
             # State 3: CARRY_OVER_EXIT_ONLY (Pos > 0 and Symbol NOT in Today's Plan)
             if sym not in new_items_by_symbol and has_open_pos:
+                if strat is None and prior_item is not None:
+                    strat = instantiate_strategy_from_contract(
+                        prior_item,
+                        use_limit_orders=self._use_limit_orders,
+                        submit_protective_stop=self._submit_protective_stop,
+                    )
+                    if self._telemetry_actor is not None:
+                        strat.bind_telemetry_actor(self._telemetry_actor)
+                    if self._plan_gate is not None and hasattr(strat, "bind_plan_gate"):
+                        strat.bind_plan_gate(self._plan_gate)
+                    strat.set_tracked_position_signed_qty(pos_qty)
+                    self._mount_or_queue_strategy(strat)
+                    self._strategies_by_symbol[sym] = strat
+
                 base_contract = prior_item or self._build_fallback_carry_over_contract(
                     sym, strat, pos_qty
                 )
@@ -1385,11 +2010,7 @@ class DailyPlanReconciler:
                         strat.bind_warmup_loader(
                             lambda s=strat: self._assembler.load_warmup_bars_for_strategy(s)
                         )
-                    if self._node is not None:
-                        if self._is_owner_thread():
-                            self._mount_strategy_on_node(strat)
-                        else:
-                            self._pending_node_strategies.append(strat)
+                    self._mount_or_queue_strategy(strat)
                     self._strategies_by_symbol[sym] = strat
                 else:
                     strat.apply_renewed_plan_item(new_item)
@@ -1431,6 +2052,11 @@ class DailyPlanReconciler:
             # Flat position and absent/vetoed in Today's Plan: freeze any residual strategy entry
             if strat is not None:
                 strat.enter_carry_over_exit_only_mode()
+                if self._is_owner_thread() and hasattr(strat, "on_stop"):
+                    try:
+                        strat.on_stop()
+                    except Exception:
+                        pass
             if self._backend is not None and hasattr(
                 self._backend, "remove_runtime_plan_item"
             ):
@@ -1440,9 +2066,50 @@ class DailyPlanReconciler:
         if self._is_owner_thread():
             self._sync_owner_thread_state()
 
+        active_syms = [d.symbol for d in decisions]
+        prior_tracked = (
+            set(prior_items_by_symbol.keys())
+            | set(self._subscribed_symbols)
+        )
+        stale_flat_syms = sorted(
+            prior_tracked
+            - set(SipFeederSubscriptionClient.normalize_symbols(active_syms))
+        )
+        try:
+            sip_sync_result = self._sip_feeder_client.sync_plan_subscriptions(
+                active_symbols=active_syms,
+                remove_symbols=stale_flat_syms,
+            )
+            self._subscribed_symbols = set(
+                SipFeederSubscriptionClient.normalize_symbols(active_syms)
+            )
+        except Exception as exc:
+            logger.error(
+                "Failed to synchronize sip-feeder subscriptions during rollover (active=%s, remove=%s): %s",
+                active_syms,
+                stale_flat_syms,
+                exc,
+            )
+            if self._backend is not None and hasattr(self._backend, "set_entry_freeze"):
+                try:
+                    self._backend.set_entry_freeze(
+                        True,
+                        reason=f"SIP_FEEDER_SUBSCRIPTION_SYNC_FAILED: {exc}",
+                        updated_by="nautilus:sip_feeder_sync",
+                    )
+                except Exception:
+                    pass
+            sip_sync_result = {
+                "status": "ERROR",
+                "error": str(exc),
+                "added": SipFeederSubscriptionClient.normalize_symbols(active_syms),
+                "removed": stale_flat_syms,
+            }
+
         report = DailyPlanRolloverReport(
             trading_date=trading_date,
             decisions=tuple(decisions),
+            sip_feeder_subscriptions=sip_sync_result,
         )
         self._last_report = report
         return report
@@ -1753,11 +2420,35 @@ def _has_existing_locked_plan_for_parity(
 def _extract_parity_order_intents(
     orders: Sequence[Any],
     decisions: Mapping[str, Any],
+    ts_init_overrides: Optional[Mapping[str, int]] = None,
 ) -> Tuple[ParityOrderIntent, ...]:
+    order_list = list(orders)
+    overrides = dict(ts_init_overrides or {})
+    primary_ts_by_cid: Dict[str, int] = {}
+    for o in order_list:
+        cid = str(getattr(o, "client_order_id", ""))
+        if cid:
+            primary_ts_by_cid[cid] = int(
+                overrides.get(cid, int(getattr(o, "ts_init", 0)))
+            )
+
+    def _effective_ts_init(o: Any) -> int:
+        cid = str(getattr(o, "client_order_id", ""))
+        spawn_id = str(getattr(o, "exec_spawn_id", "") or "")
+        if spawn_id and spawn_id != cid and spawn_id in primary_ts_by_cid:
+            return primary_ts_by_cid[spawn_id]
+        if "-E" in cid:
+            parent_cid = cid.rsplit("-E", 1)[0]
+            if parent_cid in primary_ts_by_cid:
+                return primary_ts_by_cid[parent_cid]
+        if cid in overrides:
+            return int(overrides[cid])
+        return int(getattr(o, "ts_init", 0))
+
     sorted_orders = sorted(
-        list(orders),
+        order_list,
         key=lambda o: (
-            int(getattr(o, "ts_init", 0)),
+            _effective_ts_init(o),
             str(getattr(o, "client_order_id", "")),
         ),
     )
@@ -1791,14 +2482,14 @@ def _extract_parity_order_intents(
                 limit_price=(str(px_attr) if px_attr is not None else None),
                 trigger_price=(str(trig_attr) if trig_attr is not None else None),
                 exec_algorithm_id=exec_algo,
-                ts_init_ns=int(getattr(order, "ts_init", 0)),
+                ts_init_ns=_effective_ts_init(order),
                 admitted_by_plan_gate=admitted,
             )
         )
     return tuple(intents)
 
 
-def _capture_pipeline_order_intents(
+def _run_backtest_pipeline_order_intents(
     *,
     plan_item: PlanItemContract,
     bars: Sequence[Bar],
@@ -1809,9 +2500,6 @@ def _capture_pipeline_order_intents(
     submit_protective_stop: bool = True,
     include_telemetry_actor: bool = True,
 ) -> Tuple[ParityOrderIntent, ...]:
-    """Runs the exact `Strategy(StrategyConfig) + PlanGateExecAlgorithm(PostgresPlanGateBackend)` pipeline
-    in `BacktestEngine` and extracts the chronological sequence of `ParityOrderIntent`s.
-    """
     normalized_bars = _normalize_bars_for_parity(bars)
     venue_str = plan_item.strategy_config.instrument_id.split(".", 1)[1].strip().upper()
     equities: List[Equity] = [_create_default_equity(plan_item.symbol, venue_str)]
@@ -1827,6 +2515,7 @@ def _capture_pipeline_order_intents(
     )
     plan_gate: Optional[PlanGateExecAlgorithm] = None
     telemetry_actor: Optional[PostgresTelemetryActor] = None
+    strategy: Optional[BaseArchetypeStrategy] = None
     try:
         engine.add_venue(
             venue=Venue(venue_str),
@@ -1910,12 +2599,59 @@ def _capture_pipeline_order_intents(
             decisions=plan_gate.decisions,
         )
     finally:
+        if strategy is not None:
+            strategy._cached_order_factory = None
+            strategy._cached_clock = None
+            strategy._telemetry_actor_ref = None
+            strategy._plan_gate_ref = None
         if plan_gate is not None:
+            plan_gate._cached_cache = None
+            plan_gate._cached_clock = None
+            plan_gate._cached_msgbus = None
+            plan_gate._telemetry_actor = None
+            plan_gate._oco_monitor = None
+            plan_gate._registered_strategies.clear()
             plan_gate.close()
         if telemetry_actor is not None:
+            telemetry_actor._cached_cache = None
+            telemetry_actor._cached_clock = None
+            if hasattr(telemetry_actor, "_oco_monitor") and telemetry_actor._oco_monitor is not None:
+                telemetry_actor._oco_monitor._on_entry_freeze_callback = None
             telemetry_actor.close()
         engine.dispose()
-        del engine
+        del strategy, plan_gate, telemetry_actor, engine
+
+
+def _capture_pipeline_order_intents(
+    *,
+    plan_item: PlanItemContract,
+    bars: Sequence[Bar],
+    dsn: Optional[str] = None,
+    trading_date: date,
+    environment_label: str = "BACKTEST",
+    use_limit_orders: bool = True,
+    submit_protective_stop: bool = True,
+    include_telemetry_actor: bool = True,
+) -> Tuple[ParityOrderIntent, ...]:
+    """Runs the exact `Strategy(StrategyConfig) + PlanGateExecAlgorithm(PostgresPlanGateBackend)` pipeline
+    in `BacktestEngine` on an isolated worker thread (preserving caller thread's `LiveNode` `msgbus`)
+    and extracts the chronological sequence of `ParityOrderIntent`s.
+    """
+    gc.collect()
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            return pool.submit(
+                _run_backtest_pipeline_order_intents,
+                plan_item=plan_item,
+                bars=bars,
+                dsn=dsn,
+                trading_date=trading_date,
+                environment_label=environment_label,
+                use_limit_orders=use_limit_orders,
+                submit_protective_stop=submit_protective_stop,
+                include_telemetry_actor=include_telemetry_actor,
+            ).result()
+    finally:
         gc.collect()
 
 
@@ -1979,6 +2715,11 @@ def _capture_live_node_order_intents(
         )
     finally:
         if owns_bundle and bundle is not None:
+            for strat in bundle.strategies:
+                strat._cached_order_factory = None
+                strat._cached_clock = None
+                strat._telemetry_actor_ref = None
+                strat._plan_gate_ref = None
             try:
                 if bundle.plan_gate.is_running():
                     bundle.plan_gate.stop()
@@ -1989,10 +2730,24 @@ def _capture_live_node_order_intents(
                     bundle.telemetry_actor.stop()
             except Exception:
                 pass
+            bundle.plan_gate._cached_cache = None
+            bundle.plan_gate._cached_clock = None
+            bundle.plan_gate._cached_msgbus = None
+            bundle.plan_gate._telemetry_actor = None
+            bundle.plan_gate._oco_monitor = None
+            bundle.plan_gate._registered_strategies.clear()
+            bundle.telemetry_actor._cached_cache = None
+            bundle.telemetry_actor._cached_clock = None
+            if (
+                hasattr(bundle.telemetry_actor, "_oco_monitor")
+                and bundle.telemetry_actor._oco_monitor is not None
+            ):
+                bundle.telemetry_actor._oco_monitor._on_entry_freeze_callback = None
             bundle.plan_gate.close()
             bundle.telemetry_actor.close()
             bundle.node.dispose()
             bundle = None  # type: ignore[assignment]
+            gc.collect()
 
 
 def _drive_live_node_bundle_order_intents(
@@ -2001,6 +2756,9 @@ def _drive_live_node_bundle_order_intents(
     plan_item: PlanItemContract,
     bars: Sequence[Bar],
 ) -> Tuple[ParityOrderIntent, ...]:
+    """Drives `bundle`'s registered `Strategy` + `PlanGate` + `TelemetryActor` instances directly over `bars`
+    using real Nautilus `Order` and `Position` domain events.
+    """
     matching_strategies = [
         s
         for s in bundle.strategies
@@ -2019,115 +2777,380 @@ def _drive_live_node_bundle_order_intents(
     live_strat = matching_strategies[0]
     venue_str = plan_item.strategy_config.instrument_id.split(".", 1)[1].strip().upper()
     sorted_bars = _normalize_bars_for_parity(bars)
-    equities: List[Equity] = [_create_default_equity(plan_item.symbol, venue_str)]
 
     items_to_lock = _build_parity_plan_items(plan_item, venue_str)
-    if hasattr(bundle.plan_gate.backend, "upsert_plan_item"):
+    backend = bundle.plan_gate.backend
+    if hasattr(backend, "upsert_plan_item"):
         for item in items_to_lock:
-            bundle.plan_gate.backend.upsert_plan_item(item)
-    elif hasattr(bundle.plan_gate.backend, "lock_plan"):
-        bundle.plan_gate.backend.lock_plan(plan_item.trading_date, items_to_lock)
+            backend.upsert_plan_item(item)
+    elif hasattr(backend, "lock_plan"):
+        backend.lock_plan(bundle.trading_date, items_to_lock)
     if hasattr(bundle.plan_gate, "sync_from_db"):
         bundle.plan_gate.sync_from_db()
 
-    use_limit_orders = bool(getattr(live_strat.archetype_config, "use_limit_orders", True))
-    submit_protective_stop = bool(
-        getattr(live_strat.archetype_config, "submit_protective_stop", True)
-    )
+    if not bundle.telemetry_actor.is_running():
+        bundle.telemetry_actor.start()
+    if not bundle.plan_gate.is_running():
+        bundle.plan_gate.start()
 
-    engine = BacktestEngine(
-        BacktestEngineConfig(bypass_logging=True, run_analysis=False)
-    )
-    exec_gate: Optional[PlanGateExecAlgorithm] = None
-    try:
-        engine.add_venue(
-            venue=Venue(venue_str),
-            oms_type=OmsType.NETTING,
-            account_type=AccountType.MARGIN,
-            starting_balances=[Money.from_str("100000.00 USD")],
-            base_currency=Currency.from_str("USD"),
-            fill_model=BestPriceFillModel(prob_fill_on_limit=1.0, prob_slippage=0.0),
-            fee_model=MakerTakerFeeModel(
-                maker_rate=Decimal("0.0002"),
-                taker_rate=Decimal("0.0005"),
-            ),
-            latency_model=StaticLatencyModel(
-                base_latency_nanos=0,
-                insert_latency_nanos=1,
-                update_latency_nanos=0,
-                cancel_latency_nanos=0,
-            ),
-        )
-        for eq in equities:
-            engine.add_instrument(eq)
+    equity = _create_default_equity(plan_item.symbol, venue_str)
+    account_id = AccountId(f"{venue_str}-001")
+    usd = Currency.from_str("USD")
+    maker_rate = Decimal("0.0002")
+    taker_rate = Decimal("0.0005")
 
-        exec_gate = PlanGateExecAlgorithm(
-            backend=bundle.plan_gate.backend,
-            telemetry_actor=bundle.telemetry_actor,
-            oco_monitor=bundle.plan_gate.oco_monitor,
-            forward_gate=bundle.plan_gate,
-            config=PlanGateExecAlgorithmConfig(
-                exec_algorithm_id=PLAN_GATE_EXEC_ALGORITHM_ID,
-                collar_market_orders=bool(
-                    getattr(bundle.plan_gate, "_collar_market_orders", use_limit_orders)
-                ),
-            ),
-        )
-        engine.add_exec_algorithm(exec_gate)
+    existing_cached = list(live_strat.cache.orders() or [])
+    seen_cids: set[str] = {str(o.client_order_id) for o in existing_cached}
+    submitted_cids: set[str] = set(seen_cids)
+    order_by_cid: Dict[str, Any] = {str(o.client_order_id): o for o in existing_cached}
+    order_bar_ts_by_cid: Dict[str, int] = {}
+    in_flight_submitted: List[Any] = []
+    working_orders: List[Any] = []
+    pending_modifies_by_cid: Dict[str, List[Dict[str, Any]]] = {}
+    processed_mod_count = len(live_strat._modified_orders_audit)
+    processed_cancel_count = len(live_strat._canceled_order_ids_audit)
+    open_pos: Optional[Position] = None
+    venue_seq = 0
+    trade_seq = 0
+    pos_seq = 0
 
-        exec_strategy = instantiate_strategy_from_contract(
-            items_to_lock[0],
-            use_limit_orders=use_limit_orders,
-            submit_protective_stop=submit_protective_stop,
+    def _apply_order_event(o: Any, ev: Any) -> None:
+        cid = str(o.client_order_id)
+        seen_objs = {id(o)}
+        o.apply(ev)
+        try:
+            live_strat.cache.update_order(o)
+        except Exception:
+            pass
+        for store_name in ("_submitted_orders_by_cid", "_stop_orders_by_cid"):
+            store = getattr(live_strat, store_name, None)
+            if isinstance(store, Mapping):
+                alt_o = store.get(cid)
+                if alt_o is not None and id(alt_o) not in seen_objs:
+                    seen_objs.add(id(alt_o))
+                    try:
+                        alt_o.apply(ev)
+                    except Exception:
+                        pass
+
+    def _collect_new_orders(bar_ts: int) -> None:
+        while True:
+            current_orders = list(live_strat.cache.orders() or [])
+            new_batch = [
+                o
+                for o in current_orders
+                if str(o.client_order_id) not in seen_cids
+            ]
+            if not new_batch:
+                break
+            for o in new_batch:
+                cid = str(o.client_order_id)
+                seen_cids.add(cid)
+                order_by_cid[cid] = o
+                order_bar_ts_by_cid[cid] = bar_ts
+                if (
+                    cid not in bundle.plan_gate.decisions
+                    and cid not in bundle.plan_gate._spawn_to_primary_cid
+                ):
+                    bundle.plan_gate.on_order(o)
+
+        for cid, o in list(order_by_cid.items()):
+            if cid in submitted_cids:
+                continue
+            submitted_cids.add(cid)
+            if cid in set(bundle.plan_gate._spawn_to_primary_cid.values()):
+                continue
+            dec = bundle.plan_gate.decisions.get(cid)
+            if dec is not None and dec.allowed:
+                ev_sub = OrderSubmitted(
+                    o.trader_id,
+                    o.strategy_id,
+                    o.instrument_id,
+                    o.client_order_id,
+                    account_id,
+                    UUID4(),
+                    bar_ts,
+                    bar_ts,
+                )
+                _apply_order_event(o, ev_sub)
+                bundle.plan_gate.on_order_event(ev_sub)
+                live_strat.on_order_submitted(ev_sub)
+                in_flight_submitted.append(o)
+
+    def _apply_modify(o: Any, mod: Mapping[str, Any], bar_ts: int) -> None:
+        new_qty = mod.get("quantity") or o.quantity
+        new_px = (
+            mod.get("price")
+            if mod.get("price") is not None
+            else getattr(o, "price", None)
         )
-        for buf_attr in (
-            "_opens",
-            "_highs",
-            "_lows",
-            "_closes",
-            "_volumes",
-            "_timestamps",
+        new_trig = (
+            mod.get("trigger_price")
+            if mod.get("trigger_price") is not None
+            else getattr(o, "trigger_price", None)
+        )
+        ev_upd = OrderUpdated(
+            o.trader_id,
+            o.strategy_id,
+            o.instrument_id,
+            o.client_order_id,
+            new_qty,
+            UUID4(),
+            bar_ts,
+            bar_ts,
+            False,
+            o.venue_order_id,
+            account_id,
+            new_px,
+            new_trig,
+        )
+        _apply_order_event(o, ev_upd)
+        bundle.plan_gate.on_order_event(ev_upd)
+        live_strat.on_order_updated(ev_upd)
+
+    def _process_cancels_and_modifies(bar_ts: int) -> None:
+        nonlocal processed_mod_count, processed_cancel_count
+        while (
+            processed_mod_count < len(live_strat._modified_orders_audit)
+            or processed_cancel_count < len(live_strat._canceled_order_ids_audit)
         ):
-            src_buf = getattr(live_strat, buf_attr, None)
-            dst_buf = getattr(exec_strategy, buf_attr, None)
-            if src_buf is not None and dst_buf is not None:
-                dst_buf.clear()
-                dst_buf.extend(src_buf)
-        exec_strategy.bind_telemetry_actor(bundle.telemetry_actor)
-        if hasattr(exec_strategy, "bind_plan_gate"):
-            exec_strategy.bind_plan_gate(exec_gate)
-        engine.add_strategy(exec_strategy)
+            while processed_mod_count < len(live_strat._modified_orders_audit):
+                mod = live_strat._modified_orders_audit[processed_mod_count]
+                processed_mod_count += 1
+                target_cid = str(mod.get("client_order_id") or "")
+                target_ord = order_by_cid.get(target_cid)
+                if target_ord in working_orders:
+                    _apply_modify(target_ord, mod, bar_ts)
+                elif target_ord in in_flight_submitted:
+                    pending_modifies_by_cid.setdefault(target_cid, []).append(dict(mod))
 
-        engine.add_data(sorted_bars)
-        engine.run()
+            while processed_cancel_count < len(live_strat._canceled_order_ids_audit):
+                cancel_cid = str(
+                    live_strat._canceled_order_ids_audit[processed_cancel_count]
+                )
+                processed_cancel_count += 1
+                target_ord = order_by_cid.get(cancel_cid)
+                if target_ord in working_orders:
+                    working_orders.remove(target_ord)
+                    ev_can = OrderCanceled(
+                        target_ord.trader_id,
+                        target_ord.strategy_id,
+                        target_ord.instrument_id,
+                        target_ord.client_order_id,
+                        UUID4(),
+                        bar_ts,
+                        bar_ts,
+                        False,
+                        target_ord.venue_order_id,
+                        account_id,
+                    )
+                    _apply_order_event(target_ord, ev_can)
+                    bundle.plan_gate.on_order_canceled(ev_can)
+                    live_strat.on_order_canceled(ev_can)
+                    _collect_new_orders(bar_ts)
+                elif target_ord in in_flight_submitted:
+                    ev_crej = OrderCancelRejected(
+                        target_ord.trader_id,
+                        target_ord.strategy_id,
+                        target_ord.instrument_id,
+                        target_ord.client_order_id,
+                        f"Order {cancel_cid} not found at venue",
+                        UUID4(),
+                        bar_ts,
+                        bar_ts,
+                        False,
+                        None,
+                        account_id,
+                    )
+                    bundle.plan_gate.on_order_event(ev_crej)
+                    if hasattr(live_strat, "on_order_cancel_rejected"):
+                        live_strat.on_order_cancel_rejected(ev_crej)
+                    _collect_new_orders(bar_ts)
 
-        for buf_attr in (
-            "_opens",
-            "_highs",
-            "_lows",
-            "_closes",
-            "_volumes",
-            "_timestamps",
-        ):
-            src_buf = getattr(exec_strategy, buf_attr, None)
-            dst_buf = getattr(live_strat, buf_attr, None)
-            if src_buf is not None and dst_buf is not None:
-                dst_buf.clear()
-                dst_buf.extend(src_buf)
-
-        bundle.telemetry_actor._cached_cache = engine.cache
-        bundle.telemetry_actor.sync_from_cache()
-        bundle.telemetry_actor.flush()
-
-        return _extract_parity_order_intents(
-            orders=list(engine.cache.orders() or []),
-            decisions=bundle.plan_gate.decisions,
+    def _fill_order(
+        o: Any,
+        fill_px_float: float,
+        liq_side: LiquiditySide,
+        bar_ts: int,
+    ) -> None:
+        nonlocal trade_seq, pos_seq, open_pos
+        trade_seq += 1
+        qty_dec = Decimal(str(o.quantity.as_decimal()))
+        px_str = f"{fill_px_float:.2f}"
+        px_dec = Decimal(px_str)
+        rate = maker_rate if liq_side == LiquiditySide.MAKER else taker_rate
+        comm_dec = (qty_dec * px_dec * rate).quantize(Decimal("0.01"))
+        if open_pos is None or open_pos.is_closed:
+            pos_seq += 1
+            pos_id = PositionId(f"{o.instrument_id}-{o.strategy_id}-{pos_seq}")
+        else:
+            pos_id = open_pos.id
+        ev_fill = OrderFilled(
+            o.trader_id,
+            o.strategy_id,
+            o.instrument_id,
+            o.client_order_id,
+            o.venue_order_id,
+            account_id,
+            TradeId(f"T-{trade_seq}"),
+            o.side,
+            o.order_type,
+            o.quantity,
+            Price.from_str(px_str),
+            usd,
+            liq_side,
+            UUID4(),
+            bar_ts,
+            bar_ts,
+            False,
+            pos_id,
+            Money.from_str(f"{comm_dec} USD"),
         )
-    finally:
-        bundle.telemetry_actor._cached_cache = None
-        engine.dispose()
-        del engine
-        gc.collect()
+        _apply_order_event(o, ev_fill)
+        bundle.plan_gate.on_order_filled(ev_fill)
+        live_strat.on_order_filled(ev_fill)
+        if open_pos is None or open_pos.is_closed:
+            open_pos = Position(equity, ev_fill)
+            ev_pos = PositionOpened.create(open_pos, ev_fill, UUID4(), bar_ts)
+            bundle.plan_gate.on_position_event(ev_pos)
+            if hasattr(live_strat, "on_position_opened"):
+                live_strat.on_position_opened(ev_pos)
+        else:
+            open_pos.apply(ev_fill)
+            if open_pos.is_closed:
+                ev_pos = PositionClosed.create(open_pos, ev_fill, UUID4(), bar_ts)
+                bundle.plan_gate.on_position_event(ev_pos)
+                if hasattr(live_strat, "on_position_closed"):
+                    live_strat.on_position_closed(ev_pos)
+            else:
+                ev_pos = PositionChanged.create(open_pos, ev_fill, UUID4(), bar_ts)
+                bundle.plan_gate.on_position_event(ev_pos)
+                if hasattr(live_strat, "on_position_changed"):
+                    live_strat.on_position_changed(ev_pos)
+        _collect_new_orders(bar_ts)
+        _process_cancels_and_modifies(bar_ts)
+
+    for bar in sorted_bars:
+        bar_ts = int(bar.ts_init)
+        b_open = float(bar.open.as_double())
+        b_high = float(bar.high.as_double())
+        b_low = float(bar.low.as_double())
+
+        arriving = list(in_flight_submitted)
+        in_flight_submitted.clear()
+        for o in arriving:
+            cid = str(o.client_order_id)
+            if o.order_type == OrderType.STOP_MARKET:
+                trig_px = float(o.trigger_price.as_double())
+                in_market = (o.side == OrderSide.SELL and b_open <= trig_px) or (
+                    o.side == OrderSide.BUY and b_open >= trig_px
+                )
+                if in_market:
+                    pending_modifies_by_cid.pop(cid, None)
+                    ev_rej = OrderRejected(
+                        o.trader_id,
+                        o.strategy_id,
+                        o.instrument_id,
+                        o.client_order_id,
+                        account_id,
+                        (
+                            f"STOP_MARKET {o.side} order stop px of {o.trigger_price} "
+                            f"was in the market: bid={bar.open}, ask={bar.open}, "
+                            "but rejected because of configuration"
+                        ),
+                        UUID4(),
+                        bar_ts,
+                        bar_ts,
+                        False,
+                        False,
+                    )
+                    _apply_order_event(o, ev_rej)
+                    bundle.plan_gate.on_order_rejected(ev_rej)
+                    live_strat.on_order_rejected(ev_rej)
+                    _collect_new_orders(bar_ts)
+                    _process_cancels_and_modifies(bar_ts)
+                    continue
+
+            venue_seq += 1
+            vid = VenueOrderId(f"{venue_str}-1-{venue_seq}")
+            ev_acc = OrderAccepted(
+                o.trader_id,
+                o.strategy_id,
+                o.instrument_id,
+                o.client_order_id,
+                vid,
+                account_id,
+                UUID4(),
+                bar_ts,
+                bar_ts,
+                False,
+            )
+            _apply_order_event(o, ev_acc)
+            working_orders.append(o)
+            bundle.plan_gate.on_order_event(ev_acc)
+            live_strat.on_order_accepted(ev_acc)
+            for queued_mod in pending_modifies_by_cid.pop(cid, ()):
+                _apply_modify(o, queued_mod, bar_ts)
+            _collect_new_orders(bar_ts)
+            _process_cancels_and_modifies(bar_ts)
+
+        for o in list(working_orders):
+            if o not in working_orders:
+                continue
+            if o.order_type == OrderType.MARKET:
+                working_orders.remove(o)
+                _fill_order(o, b_open, LiquiditySide.TAKER, bar_ts)
+            elif o.order_type == OrderType.LIMIT:
+                lim_px = float(o.price.as_double())
+                if o.side == OrderSide.BUY and b_low <= lim_px:
+                    working_orders.remove(o)
+                    _fill_order(
+                        o,
+                        min(b_open, lim_px),
+                        LiquiditySide.MAKER,
+                        bar_ts,
+                    )
+                elif o.side == OrderSide.SELL and b_high >= lim_px:
+                    working_orders.remove(o)
+                    _fill_order(
+                        o,
+                        max(b_open, lim_px),
+                        LiquiditySide.MAKER,
+                        bar_ts,
+                    )
+            elif o.order_type == OrderType.STOP_MARKET:
+                trig_px = float(o.trigger_price.as_double())
+                if o.side == OrderSide.SELL and b_low <= trig_px:
+                    working_orders.remove(o)
+                    _fill_order(
+                        o,
+                        min(b_open, trig_px),
+                        LiquiditySide.TAKER,
+                        bar_ts,
+                    )
+                elif o.side == OrderSide.BUY and b_high >= trig_px:
+                    working_orders.remove(o)
+                    _fill_order(
+                        o,
+                        max(b_open, trig_px),
+                        LiquiditySide.TAKER,
+                        bar_ts,
+                    )
+
+        live_strat.on_bar(bar)
+        _collect_new_orders(bar_ts)
+        _process_cancels_and_modifies(bar_ts)
+
+    bundle.telemetry_actor.sync_from_cache()
+    bundle.telemetry_actor.flush()
+    if hasattr(backend, "flush"):
+        backend.flush()
+
+    return _extract_parity_order_intents(
+        orders=list(order_by_cid.values()),
+        decisions=bundle.plan_gate.decisions,
+        ts_init_overrides=order_bar_ts_by_cid,
+    )
 
 
 def verify_backtest_to_live_parity(
@@ -2141,8 +3164,6 @@ def verify_backtest_to_live_parity(
 ) -> IsomorphicParityReport:
     """Executes the Backtest-to-Live 100% Parity Gate for `plan_item` over `bars`."""
     normalized_bars = _normalize_bars_for_parity(bars)
-    venue_str = plan_item.strategy_config.instrument_id.split(".", 1)[1].strip().upper()
-    items_to_lock = _build_parity_plan_items(plan_item, venue_str)
 
     # 1. Capture BacktestEngine order intents with PostgresPlanGateBackend + ProtectiveOcoMonitor
     bt_intents = _capture_pipeline_order_intents(
@@ -2157,56 +3178,14 @@ def verify_backtest_to_live_parity(
     )
 
     # 2. Drive the assembled LiveNode with identical PostgresPlanGateBackend + ProtectiveOcoMonitor over identical bars
-    can_persist_live = _has_existing_locked_plan_for_parity(
-        dsn, trading_date, items_to_lock
-    )
-    live_pg_backend = PostgresPlanGateBackend(
-        plan_items=items_to_lock,
-        entry_freeze=False,
+    live_intents = _capture_live_node_order_intents(
+        plan_item=plan_item,
+        bars=normalized_bars,
+        dsn=dsn,
         trading_date=trading_date,
-        persist_to_db=False,
-        allow_multi_cycle_reentry=False,
-    )
-    assembler = NautilusLiveNodeAssembler(
-        dsn=dsn or "postgresql://localhost:5432/trading",
-        alpaca_config=AlpacaExecClientConfig(
-            api_key="parity-gate-key",
-            api_secret="parity-gate-secret",
-        ),
-    )
-    bundle = assembler.build_live_node(
-        trading_date=trading_date,
-        plan_items=[items_to_lock[0]],
-        plan_gate_backend=live_pg_backend,
-        persist_telemetry_to_db=can_persist_live,
         use_limit_orders=use_limit_orders,
         submit_protective_stop=submit_protective_stop,
-        warmup_strategies=False,
     )
-    try:
-        live_intents = _capture_live_node_order_intents(
-            bundle=bundle,
-            plan_item=plan_item,
-            bars=normalized_bars,
-            use_limit_orders=use_limit_orders,
-            submit_protective_stop=submit_protective_stop,
-        )
-    finally:
-        if bundle is not None:
-            try:
-                if bundle.plan_gate.is_running():
-                    bundle.plan_gate.stop()
-            except Exception:
-                pass
-            try:
-                if bundle.telemetry_actor.is_running():
-                    bundle.telemetry_actor.stop()
-            except Exception:
-                pass
-            bundle.plan_gate.close()
-            bundle.telemetry_actor.close()
-            bundle.node.dispose()
-            bundle = None  # type: ignore[assignment]
 
     mismatches: List[str] = []
     if len(bt_intents) == 0:

@@ -23,6 +23,7 @@ pub use client::{AlpacaWsClient, AlpacaWsLifecycleObserver, AlpacaWsSessionState
 pub use messages::{
     AlpacaTradeEventKind, AlpacaTradeUpdatePayload, AlpacaWsAuthCredentialsPayload,
     AlpacaWsAuthenticateCommand, AlpacaWsControlSignal, AlpacaWsFrameClassification,
-    AlpacaWsListenCommand, AlpacaWsStreamsPayload, TRADE_UPDATES_STREAM, classify_alpaca_ws_frame,
+    AlpacaWsListenCommand, AlpacaWsOrderPayload, AlpacaWsStreamsPayload, TRADE_UPDATES_STREAM,
+    classify_alpaca_ws_frame,
 };
 pub use parse::{AlpacaExecutionUpdate, parse_trade_update_payload};

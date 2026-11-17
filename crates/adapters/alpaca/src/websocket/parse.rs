@@ -43,6 +43,8 @@ pub struct AlpacaExecutionUpdate {
     pub client_order_id: ClientOrderId,
     /// Venue order ID.
     pub venue_order_id: VenueOrderId,
+    /// Prior venue order ID replaced by this order (`replaces`), when produced by `PATCH /v2/orders/{id}`.
+    pub replaces: Option<VenueOrderId>,
     /// Instrument identifier.
     pub instrument_id: InstrumentId,
     /// Order side (`Buy` or `Sell`).
@@ -138,6 +140,24 @@ pub fn parse_trade_update_payload(
             cid
         }
     };
+    let mut replaces = payload
+        .order
+        .replaces
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(VenueOrderId::new);
+    if payload.event == AlpacaTradeEventKind::Replaced
+        && let Some(replaced_by_str) = payload
+            .order
+            .replaced_by
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    {
+        replaces = Some(order_report.venue_order_id);
+        order_report.venue_order_id = VenueOrderId::new(replaced_by_str);
+    }
     let venue_order_id = order_report.venue_order_id;
     let instrument_id = order_report.instrument_id;
     let order_side = OrderSide::from(payload.order.side);
@@ -243,6 +263,7 @@ pub fn parse_trade_update_payload(
         event_kind: payload.event,
         client_order_id,
         venue_order_id,
+        replaces,
         instrument_id,
         order_side,
         order_type,

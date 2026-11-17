@@ -636,17 +636,51 @@ impl CatalogReader for DataInfraCatalog {
         identifier: Option<&str>,
     ) -> anyhow::Result<Option<u64>> {
         let identifiers = identifier.map(|id| vec![id.to_string()]);
-        let query = CatalogQuery::new(data_type).with_identifiers(identifiers);
-        let batch = self.query_batch(&query)?;
-        let last_ts = match batch {
-            DataBatch::Bar(bars) => bars.as_ref().last().map(|b| b.ts_init.as_u64()),
-            DataBatch::Quote(quotes) => quotes.as_ref().last().map(|q| q.ts_init.as_u64()),
-            DataBatch::InstrumentStatus(statuses) => {
-                statuses.as_ref().last().map(|s| s.ts_init.as_u64())
+        match data_type {
+            NautilusDataType::Bar => {
+                let grouped =
+                    self.parse_bar_identifiers(identifiers.as_deref(), self.default_timeframe)?;
+                let mut max_ts: Option<u64> = None;
+                for ((venue, tf), symbols) in grouped {
+                    let mut req =
+                        BarsQueryRequest::new(symbols, tf, venue, self.default_adjustment)
+                            .with_limit_per_symbol(1);
+                    req.market_session = self.default_market_session.clone();
+                    for b in self.load_bars(&req)? {
+                        let ts = b.ts_init.as_u64();
+                        max_ts = Some(max_ts.map_or(ts, |prev| prev.max(ts)));
+                    }
+                }
+                Ok(max_ts)
             }
-            _ => None,
-        };
-        Ok(last_ts)
+            NautilusDataType::QuoteTick => {
+                let grouped = self.parse_symbol_identifiers(identifiers.as_deref())?;
+                let mut max_ts: Option<u64> = None;
+                for (venue, symbols) in grouped {
+                    let mut req = QuotesQueryRequest::new(symbols, venue);
+                    req.limit = Some(1);
+                    for q in self.load_quotes(&req)? {
+                        let ts = q.ts_init.as_u64();
+                        max_ts = Some(max_ts.map_or(ts, |prev| prev.max(ts)));
+                    }
+                }
+                Ok(max_ts)
+            }
+            NautilusDataType::InstrumentStatus => {
+                let grouped = self.parse_symbol_identifiers(identifiers.as_deref())?;
+                let mut max_ts: Option<u64> = None;
+                for (venue, symbols) in grouped {
+                    let mut req = StatusesQueryRequest::new(symbols, venue);
+                    req.limit = Some(1);
+                    for s in self.load_statuses(&req)? {
+                        let ts = s.ts_init.as_u64();
+                        max_ts = Some(max_ts.map_or(ts, |prev| prev.max(ts)));
+                    }
+                }
+                Ok(max_ts)
+            }
+            _ => Ok(None),
+        }
     }
 
     fn get_missing_intervals_for_request(

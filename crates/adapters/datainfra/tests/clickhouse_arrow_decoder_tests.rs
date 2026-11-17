@@ -798,6 +798,7 @@ fn test_clickhouse_parameterized_query_builders_and_request_validation() {
     let (sql, params) = build_v_quant_bars_query("market_data", &bar_req).expect("build bar query");
     assert!(sql.contains("FROM market_data.v_quant_bars"));
     assert!(sql.contains("raw_open, raw_high, raw_low, raw_close, raw_volume"));
+    assert!(sql.contains("ORDER BY bar_start_time DESC, symbol ASC"));
     assert!(sql.contains("LIMIT {per_symbol_limit:UInt32} BY symbol"));
     assert!(params.contains(&("tf".to_string(), "4h".to_string())));
     assert!(params.contains(&("symbols".to_string(), "['AAPL','NVDA']".to_string())));
@@ -805,6 +806,17 @@ fn test_clickhouse_parameterized_query_builders_and_request_validation() {
     assert!(params.contains(&("start_ts".to_string(), "1700000000".to_string())));
     assert!(params.contains(&("end_ts".to_string(), "1700086400".to_string())));
     assert!(params.contains(&("per_symbol_limit".to_string(), "500".to_string())));
+
+    let unlim_bar_req = BarsQueryRequest::new(
+        vec!["AAPL".to_string()],
+        DataInfraTimeframe::M15,
+        "NASDAQ",
+        PriceAdjustmentMode::Adjusted,
+    );
+    let (unlim_sql, _) =
+        build_v_quant_bars_query("market_data", &unlim_bar_req).expect("build unlimited bar query");
+    assert!(unlim_sql.contains("ORDER BY bar_start_time ASC, symbol ASC"));
+    assert!(!unlim_sql.contains("LIMIT"));
 
     // Validation failures: empty symbols or start > end
     let empty_req = BarsQueryRequest::new(
@@ -837,8 +849,8 @@ fn test_clickhouse_parameterized_query_builders_and_request_validation() {
     quote_req.limit = Some(1_000);
     let (q_sql, q_params) =
         build_sip_quotes_query("market_data", &quote_req).expect("build quotes query");
-    assert!(q_sql.contains("FROM market_data.sip_raw_quotes"));
-    assert!(q_sql.contains("LIMIT {limit_rows:UInt32}"));
+    assert!(q_sql.contains("FROM market_data.sip_raw_quotes FINAL"));
+    assert!(q_sql.contains("ORDER BY event_time DESC, symbol ASC LIMIT {limit_rows:UInt32}"));
     assert!(q_params.contains(&("symbols".to_string(), "['MSFT']".to_string())));
 
     let mut status_req = StatusesQueryRequest::new(vec!["AAPL".to_string()], "NASDAQ");
@@ -847,7 +859,8 @@ fn test_clickhouse_parameterized_query_builders_and_request_validation() {
     status_req.limit = Some(250);
     let (s_sql, s_params) =
         build_sip_statuses_query("market_data", &status_req).expect("build statuses query");
-    assert!(s_sql.contains("FROM market_data.sip_trading_statuses"));
+    assert!(s_sql.contains("FROM market_data.sip_trading_statuses FINAL"));
+    assert!(s_sql.contains("ORDER BY event_time DESC, symbol ASC LIMIT {limit_rows:UInt32}"));
     assert!(s_params.contains(&("limit_rows".to_string(), "250".to_string())));
 }
 

@@ -313,7 +313,27 @@ pub trait ClickHouseArrowTransport: Send + Sync + std::fmt::Debug {
     /// Returns [`DataInfraError`] if validation, HTTP transport, Arrow decoding, or bar sanity fails.
     async fn fetch_bars(&self, req: &BarsQueryRequest) -> DataInfraResult<Vec<Bar>> {
         let batches = self.fetch_bars_batches(req).await?;
-        decode_bars_batches(&batches, &req.decode_options())
+        let mut bars = decode_bars_batches(&batches, &req.decode_options())?;
+        if let Some(end_ns) = req.end_ts_ns {
+            let end_u64 = end_ns.as_u64();
+            let allow_exact_open_point = req.start_ts_ns == Some(end_ns)
+                || (bars.len() == 1
+                    && bars[0]
+                        .ts_event
+                        .as_u64()
+                        .saturating_sub(crate::mapping::timeframe_step_ns(&bars[0].bar_type))
+                        == end_u64);
+            bars.retain(|b| {
+                let close_ns = b.ts_event.as_u64();
+                let open_ns =
+                    close_ns.saturating_sub(crate::mapping::timeframe_step_ns(&b.bar_type));
+                close_ns <= end_u64 || (allow_exact_open_point && open_ns == end_u64)
+            });
+        }
+        if req.limit_per_symbol.is_some() {
+            bars.sort_by_key(|b| b.ts_init);
+        }
+        Ok(bars)
     }
 
     /// Queries `sip_raw_quotes` and decodes the response directly into Nautilus [`QuoteTick`]s.
@@ -326,7 +346,11 @@ pub trait ClickHouseArrowTransport: Send + Sync + std::fmt::Debug {
         let (sql, params) = build_sip_quotes_query(self.database(), req)?;
         let raw_bytes = self.query_arrow_stream(&sql, &params).await?;
         let batches = decode_arrow_ipc_stream(&raw_bytes)?;
-        decode_quotes_batches(&batches, &req.decode_options())
+        let mut quotes = decode_quotes_batches(&batches, &req.decode_options())?;
+        if req.limit.is_some() {
+            quotes.sort_by_key(|q| q.ts_init);
+        }
+        Ok(quotes)
     }
 
     /// Queries `sip_trading_statuses` and decodes the response directly into [`InstrumentStatus`] events.
@@ -342,7 +366,11 @@ pub trait ClickHouseArrowTransport: Send + Sync + std::fmt::Debug {
         let (sql, params) = build_sip_statuses_query(self.database(), req)?;
         let raw_bytes = self.query_arrow_stream(&sql, &params).await?;
         let batches = decode_arrow_ipc_stream(&raw_bytes)?;
-        decode_statuses_batches(&batches, &req.decode_options())
+        let mut statuses = decode_statuses_batches(&batches, &req.decode_options())?;
+        if req.limit.is_some() {
+            statuses.sort_by_key(|s| s.ts_init);
+        }
+        Ok(statuses)
     }
 
     /// Returns the target ClickHouse database name.
@@ -532,11 +560,11 @@ pub fn build_v_quant_bars_query(
         where_clauses.push("toUnixTimestamp(bar_start_time) <= {end_ts:UInt64}".to_string());
     }
 
-    let limit_clause = if let Some(limit) = req.limit_per_symbol {
+    let (order_dir, limit_clause) = if let Some(limit) = req.limit_per_symbol {
         params.push(("per_symbol_limit".to_string(), limit.to_string()));
-        "\nLIMIT {per_symbol_limit:UInt32} BY symbol"
+        ("DESC", "\nLIMIT {per_symbol_limit:UInt32} BY symbol")
     } else {
-        ""
+        ("ASC", "")
     };
 
     let sql = format!(
@@ -553,7 +581,7 @@ pub fn build_v_quant_bars_query(
             is_suspect_spike \
         FROM {database}.v_quant_bars \
         WHERE {where_sql} \
-        ORDER BY bar_start_time ASC, symbol ASC{limit_clause}",
+        ORDER BY bar_start_time {order_dir}, symbol ASC{limit_clause}",
         where_sql = where_clauses.join(" AND "),
     );
 
@@ -585,11 +613,11 @@ pub fn build_sip_quotes_query(
         where_clauses.push("toUnixTimestamp64Nano(event_time) <= {end_ts_ns:UInt64}".to_string());
     }
 
-    let limit_clause = if let Some(limit) = req.limit {
+    let (order_dir, limit_clause) = if let Some(limit) = req.limit {
         params.push(("limit_rows".to_string(), limit.to_string()));
-        " LIMIT {limit_rows:UInt32}"
+        ("DESC", " LIMIT {limit_rows:UInt32}")
     } else {
-        ""
+        ("ASC", "")
     };
 
     let sql = format!(
@@ -600,9 +628,9 @@ pub fn build_sip_quotes_query(
             ask_price, \
             bid_size, \
             ask_size \
-        FROM {database}.sip_raw_quotes \
+        FROM {database}.sip_raw_quotes FINAL \
         WHERE {where_sql} \
-        ORDER BY event_time ASC, symbol ASC{limit_clause}",
+        ORDER BY event_time {order_dir}, symbol ASC{limit_clause}",
         where_sql = where_clauses.join(" AND "),
     );
 
@@ -634,11 +662,11 @@ pub fn build_sip_statuses_query(
         where_clauses.push("toUnixTimestamp64Nano(event_time) <= {end_ts_ns:UInt64}".to_string());
     }
 
-    let limit_clause = if let Some(limit) = req.limit {
+    let (order_dir, limit_clause) = if let Some(limit) = req.limit {
         params.push(("limit_rows".to_string(), limit.to_string()));
-        " LIMIT {limit_rows:UInt32}"
+        ("DESC", " LIMIT {limit_rows:UInt32}")
     } else {
-        ""
+        ("ASC", "")
     };
 
     let sql = format!(
@@ -647,9 +675,9 @@ pub fn build_sip_statuses_query(
             toUnixTimestamp64Nano(event_time) AS ts_event, \
             state, \
             reason_code \
-        FROM {database}.sip_trading_statuses \
+        FROM {database}.sip_trading_statuses FINAL \
         WHERE {where_sql} \
-        ORDER BY event_time ASC, symbol ASC{limit_clause}",
+        ORDER BY event_time {order_dir}, symbol ASC{limit_clause}",
         where_sql = where_clauses.join(" AND "),
     );
 

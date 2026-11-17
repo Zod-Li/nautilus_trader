@@ -27,6 +27,7 @@ import uuid
 import psycopg2
 from psycopg2.extras import Json
 
+from evolution_engine.config_center.envelope import load_envelope
 from evolution_engine.db.dsn import resolve_database_dsn
 from nautilus_trader.model import Bar, BarType, Price, Quantity
 from nautilus_trader.quant.contracts.models import (
@@ -371,79 +372,18 @@ class FrozenRegimeParamRecord:
         }
 
 
-_ENSURE_FROZEN_REGIME_TABLE_SQL = """
-CREATE TABLE IF NOT EXISTS frozen_regime_param_table (
-    vol_bucket VARCHAR(32) NOT NULL CHECK (vol_bucket IN ('LOW_VOL', 'MID_VOL', 'HIGH_VOL')),
-    liq_bucket VARCHAR(32) NOT NULL CHECK (liq_bucket IN ('HIGH_LIQ_TIGHT_SPREAD', 'LOW_LIQ_WIDE_SPREAD')),
-    dominant_style VARCHAR(64) NOT NULL,
-    archetype_id VARCHAR(64) NOT NULL DEFAULT 'TREND_MOMENTUM' CHECK (
-        archetype_id IN ('TREND_MOMENTUM', 'VOLATILITY_BREAKOUT', 'MEAN_REVERSION')
-    ),
-    strategy_archetype VARCHAR(32) NOT NULL DEFAULT 'TREND_MOMENTUM' CHECK (
-        strategy_archetype IN ('TREND_MOMENTUM', 'VOLATILITY_BREAKOUT', 'MEAN_REVERSION')
-    ),
-    bar_timeframe VARCHAR(16) NOT NULL DEFAULT '15m',
-    strategy_config_json JSONB NOT NULL DEFAULT '{}'::jsonb,
-    lookback_window INTEGER NOT NULL CHECK (lookback_window >= 5 AND lookback_window <= 500),
-    fast_window INTEGER NOT NULL CHECK (fast_window >= 2),
-    slow_window INTEGER NOT NULL CHECK (slow_window > fast_window AND slow_window <= lookback_window),
-    entry_quantile_threshold NUMERIC(10, 4) NOT NULL CHECK (
-        entry_quantile_threshold >= 0.7000 AND entry_quantile_threshold <= 0.9950
-    ),
-    exit_quantile_threshold NUMERIC(10, 4) NOT NULL CHECK (
-        exit_quantile_threshold >= 0.0500 AND exit_quantile_threshold < entry_quantile_threshold
-    ),
-    atr_stop_multiplier NUMERIC(10, 4) NOT NULL CHECK (
-        atr_stop_multiplier >= 1.2000 AND atr_stop_multiplier <= 3.5000
-    ),
-    limit_collar_atr_mult NUMERIC(10, 4) NOT NULL CHECK (
-        limit_collar_atr_mult > 0.0000 AND limit_collar_atr_mult <= 0.5000
-    ),
-    limit_collar_pct NUMERIC(10, 4) NOT NULL DEFAULT 0.3500 CHECK (
-        limit_collar_pct > 0.0000 AND limit_collar_pct <= 1.0000
-    ),
-    pooled_sample_trades INTEGER NOT NULL CHECK (pooled_sample_trades >= 100),
-    pooled_expectancy_r DOUBLE PRECISION NOT NULL DEFAULT 0.0,
-    pooled_sharpe DOUBLE PRECISION NOT NULL DEFAULT 0.0,
-    pooled_dsr DOUBLE PRECISION NOT NULL DEFAULT 0.0,
-    stress_passed BOOLEAN NOT NULL DEFAULT TRUE,
-    stress_missed_fill_rate DOUBLE PRECISION NOT NULL DEFAULT 0.0 CHECK (
-        stress_missed_fill_rate >= 0.0000 AND stress_missed_fill_rate <= 0.3500
-    ),
-    stress_report_json JSONB NOT NULL DEFAULT '{}'::jsonb,
-    calibrated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    is_active BOOLEAN NOT NULL DEFAULT TRUE,
-    PRIMARY KEY (vol_bucket, liq_bucket, dominant_style)
-);
-ALTER TABLE frozen_regime_param_table ADD COLUMN IF NOT EXISTS archetype_id VARCHAR(64) NOT NULL DEFAULT 'TREND_MOMENTUM';
-ALTER TABLE frozen_regime_param_table ADD COLUMN IF NOT EXISTS strategy_archetype VARCHAR(32) NOT NULL DEFAULT 'TREND_MOMENTUM';
-ALTER TABLE frozen_regime_param_table ADD COLUMN IF NOT EXISTS bar_timeframe VARCHAR(16) NOT NULL DEFAULT '15m';
-ALTER TABLE frozen_regime_param_table ADD COLUMN IF NOT EXISTS strategy_config_json JSONB NOT NULL DEFAULT '{}'::jsonb;
-ALTER TABLE frozen_regime_param_table ADD COLUMN IF NOT EXISTS limit_collar_pct NUMERIC(10, 4) NOT NULL DEFAULT 0.3500;
-ALTER TABLE frozen_regime_param_table ADD COLUMN IF NOT EXISTS pooled_expectancy_r DOUBLE PRECISION NOT NULL DEFAULT 0.0;
-ALTER TABLE frozen_regime_param_table ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE;
-"""
-
-
 class FrozenRegimeParamTable:
     """PostgreSQL-backed repository for `frozen_regime_param_table` supporting O(1) lookup."""
 
     def __init__(self, dsn: Optional[str] = None) -> None:
         self._dsn = resolve_database_dsn(dsn)
-        self._schema_ensured = False
 
     @property
     def dsn(self) -> str:
         return self._dsn
 
     def _connect(self):
-        conn = psycopg2.connect(self._dsn)
-        if not self._schema_ensured:
-            with conn:
-                with conn.cursor() as cur:
-                    cur.execute(_ENSURE_FROZEN_REGIME_TABLE_SQL)
-            self._schema_ensured = True
-        return conn
+        return psycopg2.connect(self._dsn)
 
     def upsert_record(self, record: FrozenRegimeParamRecord) -> None:
         """Validates and atomically upserts a `FrozenRegimeParamRecord` into `frozen_regime_param_table`."""
@@ -812,12 +752,25 @@ class OfflineRegimePanelCalibrator:
         floor_px = min(lows) if lows else ref_px
         stop_px = max(0.01, floor_px - float(atr_mult) * max(emp_atr, 0.01))
         target_qty = Decimal(str(params.get("target_qty", "20")))
-        target_notional = Decimal(f"{max(5000.0, float(target_qty) * max(highs or [ref_px]) * 1.5):.2f}")
+        env_num = load_envelope().numeric
+        notional_bounds = env_num["risk.max_order_notional_usd"]
+        risk_pct_cap = float(env_num["risk.risk_per_trade_pct"]["max"]) / 100.0
+        single_name_pct_cap = float(env_num["risk.max_single_name_pct"]["max"]) / 100.0
+        starting_equity = float(getattr(self._runner, "_starting_capital_usd", 100_000.0))
+        max_bar_high = max(highs) if highs else ref_px
+        raw_notional = float(target_qty) * (max_bar_high + float(atr_mult) * max(emp_atr, 0.01))
+        bounded_notional = min(
+            float(notional_bounds["max"]),
+            starting_equity * single_name_pct_cap,
+            max(float(notional_bounds["min"]), raw_notional),
+        )
+        target_notional = Decimal(f"{bounded_notional:.2f}")
+        envelope_risk_cap_usd = min(bounded_notional, starting_equity * risk_pct_cap)
         max_risk_budget = Decimal(
             str(
                 params.get(
                     "max_risk_budget_usd",
-                    f"{min(float(target_notional), max(2500.0, float(target_qty) * ref_px * 0.50)):.2f}",
+                    f"{envelope_risk_cap_usd:.2f}",
                 )
             )
         )
@@ -1239,11 +1192,6 @@ class OfflineRegimePanelCalibrator:
                 cell_map[sym] = sym_bar_list
                 raw_low_by_sym[sym] = sym_raw_low_map
 
-        fast_grids: Dict[StrategyArchetypeId, Sequence[Mapping[str, Any]]] = {
-            StrategyArchetypeId.TREND_MOMENTUM: (DEFAULT_REGIME_CANDIDATE_GRIDS[StrategyArchetypeId.TREND_MOMENTUM][-1],),
-            StrategyArchetypeId.VOLATILITY_BREAKOUT: (DEFAULT_REGIME_CANDIDATE_GRIDS[StrategyArchetypeId.VOLATILITY_BREAKOUT][-1],),
-            StrategyArchetypeId.MEAN_REVERSION: (DEFAULT_REGIME_CANDIDATE_GRIDS[StrategyArchetypeId.MEAN_REVERSION][0],),
-        }
         all_vol_buckets = (VolBucket.LOW_VOL, VolBucket.MID_VOL, VolBucket.HIGH_VOL)
         all_liq_buckets = (LiqBucket.HIGH_LIQ_TIGHT_SPREAD, LiqBucket.LOW_LIQ_WIDE_SPREAD)
 
@@ -1258,17 +1206,12 @@ class OfflineRegimePanelCalibrator:
                     StrategyArchetypeId.VOLATILITY_BREAKOUT,
                     StrategyArchetypeId.MEAN_REVERSION,
                 ):
-                    if persist and self._param_table is not None:
-                        existing_rec = self._param_table.get_frozen_params(vb, lb, arch_id)
-                        if existing_rec is not None and existing_rec.stress_passed:
-                            persisted_count += 1
-                            continue
                     res = self.calibrate_regime_cell(
                         vol_bucket=vb,
                         liq_bucket=lb,
                         dominant_style=arch_id,
                         symbol_bars=sym_map,
-                        candidate_param_grid=fast_grids[arch_id],
+                        candidate_param_grid=DEFAULT_REGIME_CANDIDATE_GRIDS[arch_id],
                         raw_low_by_symbol_ts_ns=raw_low_by_sym,
                         persist=persist,
                     )

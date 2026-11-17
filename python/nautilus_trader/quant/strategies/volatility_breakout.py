@@ -107,16 +107,12 @@ class VolatilityBreakoutStrategy(BaseArchetypeStrategy):
 
         signed_pos = self._open_position_signed_qty()
         if signed_pos > Decimal("0"):
-            candidate_stop = high_px - (atr_mult * atr)
-            prev_stop = self._trailing_stop_price
-            ratcheted = False
             if (
-                prev_stop is None
-                or candidate_stop > prev_stop
+                self._trailing_stop_price is None
+                and self._stop_price is not None
+                and self._stop_price > 0.0
             ):
-                self._trailing_stop_price = candidate_stop
-                ratcheted = prev_stop is not None and candidate_stop > prev_stop
-
+                self._trailing_stop_price = float(self._stop_price)
             stop_hit = (
                 self._trailing_stop_price is not None
                 and raw_low_px <= self._trailing_stop_price
@@ -131,7 +127,18 @@ class VolatilityBreakoutStrategy(BaseArchetypeStrategy):
                     reason_tag=reason,
                 )
                 self._entry_reference_price = None
-            elif ratcheted:
+                return
+
+            candidate_stop = high_px - (atr_mult * atr)
+            prev_stop = self._trailing_stop_price
+            ratcheted = False
+            if (
+                prev_stop is None
+                or candidate_stop > prev_stop
+            ):
+                self._trailing_stop_price = candidate_stop
+                ratcheted = prev_stop is not None and candidate_stop > prev_stop
+            if ratcheted:
                 self._replace_protective_stop_price(
                     self._trailing_stop_price,
                     self.config.instrument_id,
@@ -139,16 +146,12 @@ class VolatilityBreakoutStrategy(BaseArchetypeStrategy):
             return
 
         if signed_pos < Decimal("0"):
-            candidate_stop = low_px + (atr_mult * atr)
-            prev_stop = self._trailing_stop_price
-            ratcheted = False
             if (
-                prev_stop is None
-                or candidate_stop < prev_stop
+                self._trailing_stop_price is None
+                and self._stop_price is not None
+                and self._stop_price > 0.0
             ):
-                self._trailing_stop_price = candidate_stop
-                ratcheted = prev_stop is not None and candidate_stop < prev_stop
-
+                self._trailing_stop_price = float(self._stop_price)
             stop_hit = (
                 self._trailing_stop_price is not None
                 and raw_high_px >= self._trailing_stop_price
@@ -163,7 +166,18 @@ class VolatilityBreakoutStrategy(BaseArchetypeStrategy):
                     reason_tag=reason,
                 )
                 self._entry_reference_price = None
-            elif ratcheted:
+                return
+
+            candidate_stop = low_px + (atr_mult * atr)
+            prev_stop = self._trailing_stop_price
+            ratcheted = False
+            if (
+                prev_stop is None
+                or candidate_stop < prev_stop
+            ):
+                self._trailing_stop_price = candidate_stop
+                ratcheted = prev_stop is not None and candidate_stop < prev_stop
+            if ratcheted:
                 self._replace_protective_stop_price(
                     self._trailing_stop_price,
                     self.config.instrument_id,
@@ -185,9 +199,11 @@ class VolatilityBreakoutStrategy(BaseArchetypeStrategy):
                 stop_px = self._resolve_entry_stop_price(
                     close_px, close_px - (atr_mult * atr)
                 )
+                prev_stop = self._trailing_stop_price
+                prev_ref = self._entry_reference_price
                 self._trailing_stop_price = stop_px
                 self._entry_reference_price = close_px
-                self._submit_plan_gated_entry(
+                cid = self._submit_plan_gated_entry(
                     order_side=OrderSide.BUY,
                     reference_price=close_px,
                     atr=atr,
@@ -195,6 +211,9 @@ class VolatilityBreakoutStrategy(BaseArchetypeStrategy):
                     stop_loss_price=stop_px,
                     tags=["VOLATILITY_BREAKOUT_LONG_ENTRY"],
                 )
+                if not cid or self._is_order_denied_or_rejected(cid):
+                    self._trailing_stop_price = prev_stop
+                    self._entry_reference_price = prev_ref
         elif cfg.plan_side == PlanSide.SHORT:
             if (
                 ((1.0 - price_quantile) >= entry_q or close_px <= lower_channel)
@@ -203,9 +222,11 @@ class VolatilityBreakoutStrategy(BaseArchetypeStrategy):
                 stop_px = self._resolve_entry_stop_price(
                     close_px, close_px + (atr_mult * atr)
                 )
+                prev_stop = self._trailing_stop_price
+                prev_ref = self._entry_reference_price
                 self._trailing_stop_price = stop_px
                 self._entry_reference_price = close_px
-                self._submit_plan_gated_entry(
+                cid = self._submit_plan_gated_entry(
                     order_side=OrderSide.SELL,
                     reference_price=close_px,
                     atr=atr,
@@ -213,3 +234,6 @@ class VolatilityBreakoutStrategy(BaseArchetypeStrategy):
                     stop_loss_price=stop_px,
                     tags=["VOLATILITY_BREAKOUT_SHORT_ENTRY"],
                 )
+                if not cid or self._is_order_denied_or_rejected(cid):
+                    self._trailing_stop_price = prev_stop
+                    self._entry_reference_price = prev_ref

@@ -41,8 +41,8 @@ use crate::{
     config::DataInfraConfig,
     error::{DataInfraError, DataInfraResult},
     stream::{
-        CanonicalBarWire, CanonicalQuoteWire, CanonicalStreamDecoder, CanonicalTradingStatusWire,
-        TOPIC_SIP_BARS_1M, TOPIC_SIP_BARS_PREFIX, TOPIC_SIP_QUOTES, TOPIC_SIP_STATUSES,
+        CanonicalBarWire, CanonicalQuoteWire, CanonicalTradingStatusWire, TOPIC_SIP_BARS_1M,
+        TOPIC_SIP_QUOTES, TOPIC_SIP_STATUSES,
     },
 };
 
@@ -50,9 +50,6 @@ pub use crate::stream::{
     BarStreamVersionTracker, DataInfraStreamEvent, KafkaStreamSessionCoordinator,
     StreamDecodeOutcome, StreamLifecycleListener, VersionEvaluation,
 };
-
-/// Canonical alias for the real-time Kafka market stream decoder.
-pub type KafkaMarketStreamDecoder = CanonicalStreamDecoder;
 
 /// Canonical list of SIP real-time Kafka topics consumed by `DataInfraDataClient`.
 pub const DEFAULT_SIP_KAFKA_TOPICS: [&str; 3] =
@@ -91,23 +88,6 @@ pub enum CanonicalWireFrame {
 }
 
 impl CanonicalWireFrame {
-    /// Returns the canonical Kafka topic corresponding to this wire frame.
-    #[must_use]
-    pub fn canonical_topic(&self) -> String {
-        match self {
-            Self::Bar(bar) => {
-                let tf = bar.timeframe.trim();
-                if tf.is_empty() || tf == "1m" {
-                    TOPIC_SIP_BARS_1M.to_string()
-                } else {
-                    format!("{TOPIC_SIP_BARS_PREFIX}{tf}")
-                }
-            }
-            Self::Quote(_) => TOPIC_SIP_QUOTES.to_string(),
-            Self::Status(_) => TOPIC_SIP_STATUSES.to_string(),
-        }
-    }
-
     /// Serializes this wire frame back into canonical JSON bytes.
     ///
     /// # Errors
@@ -157,59 +137,6 @@ pub struct KafkaBrokerEnvelope {
     pub payload: KafkaEnvelopePayload,
 }
 
-/// Parses a single broker wire line or frame into a [`KafkaPayloadFrame`].
-///
-/// Supported wire formats:
-/// 1. Topic-prefixed text frames: `<topic>\t<json>`, `<topic>|<json>`, `<topic> <json>`, or `<topic>:<json>`
-/// 2. Strongly typed JSON envelope: `{"topic": "md.sip.bars.1m", "payload": {...}}`
-/// 3. Direct canonical JSON frame (`CanonicalBarWire`, `CanonicalQuoteWire`, `CanonicalTradingStatusWire`)
-///
-/// # Errors
-///
-/// Returns [`DataInfraError::Transport`] if the wire frame is empty or cannot be parsed.
-pub fn parse_broker_wire_frame(raw: &[u8]) -> DataInfraResult<KafkaPayloadFrame> {
-    let text = std::str::from_utf8(raw).map_err(|e| {
-        DataInfraError::Transport(format!("Kafka broker frame is not valid UTF-8: {e}"))
-    })?;
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return Err(DataInfraError::Transport(
-            "cannot parse empty Kafka broker frame".to_string(),
-        ));
-    }
-
-    if !trimmed.starts_with('{') {
-        if let Some(brace_idx) = trimmed.find('{') {
-            let prefix = trimmed[..brace_idx]
-                .trim_matches(|c: char| c.is_whitespace() || c == '|' || c == ':');
-            let json_part = trimmed[brace_idx..].trim();
-            if !prefix.is_empty() && !json_part.is_empty() {
-                return Ok(KafkaPayloadFrame::new(
-                    prefix.to_string(),
-                    json_part.as_bytes().to_vec(),
-                ));
-            }
-        }
-        return Err(DataInfraError::Transport(format!(
-            "unrecognized non-JSON Kafka broker frame: '{trimmed}'"
-        )));
-    }
-
-    if let Ok(envelope) = serde_json::from_str::<KafkaBrokerEnvelope>(trimmed) {
-        let payload_bytes = envelope.payload.into_payload_bytes()?;
-        return Ok(KafkaPayloadFrame::new(
-            envelope.topic.trim().to_string(),
-            payload_bytes,
-        ));
-    }
-
-    let wire: CanonicalWireFrame = serde_json::from_str(trimmed).map_err(|e| {
-        DataInfraError::Transport(format!("failed to parse Kafka broker JSON frame: {e}"))
-    })?;
-    let topic = wire.canonical_topic();
-    Ok(KafkaPayloadFrame::new(topic, trimmed.as_bytes().to_vec()))
-}
-
 /// Asynchronous stream transport port for reading `(topic, payload)` frames from `DataInfra` Kafka brokers.
 #[async_trait]
 pub trait KafkaPayloadSource: Send + Sync + std::fmt::Debug {
@@ -243,8 +170,50 @@ struct PartitionCursor {
 struct ActiveKafkaSession {
     _client: Arc<Client>,
     cursors: Vec<PartitionCursor>,
-    buffered: VecDeque<KafkaPayloadFrame>,
     cursor_idx: usize,
+}
+
+fn decode_kafka_record_value(
+    topic: &str,
+    partition: i32,
+    raw_bytes: &[u8],
+) -> DataInfraResult<KafkaPayloadFrame> {
+    let text = std::str::from_utf8(raw_bytes).map_err(|e| {
+        DataInfraError::Transport(format!(
+            "Kafka record on {topic}[{partition}] is not valid UTF-8: {e}"
+        ))
+    })?;
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return Err(DataInfraError::Transport(format!(
+            "Kafka record on {topic}[{partition}] is empty"
+        )));
+    }
+    let parsed: serde_json::Value = serde_json::from_str(trimmed).map_err(|e| {
+        DataInfraError::Transport(format!(
+            "Kafka record on {topic}[{partition}] is not valid JSON: {e}"
+        ))
+    })?;
+    if parsed
+        .as_object()
+        .is_some_and(|obj| obj.contains_key("topic") && obj.contains_key("payload"))
+    {
+        let envelope: KafkaBrokerEnvelope = serde_json::from_value(parsed).map_err(|e| {
+            DataInfraError::Transport(format!(
+                "Kafka envelope on {topic}[{partition}] failed validation: {e}"
+            ))
+        })?;
+        let payload_bytes = envelope.payload.into_payload_bytes()?;
+        Ok(KafkaPayloadFrame::new(
+            envelope.topic.trim().to_string(),
+            payload_bytes,
+        ))
+    } else {
+        Ok(KafkaPayloadFrame::new(
+            topic.to_string(),
+            trimmed.as_bytes().to_vec(),
+        ))
+    }
 }
 
 /// Production Kafka broker partition consumer connecting to `config.kafka_brokers` via `rskafka`.
@@ -256,6 +225,7 @@ pub struct TcpKafkaPayloadSource {
     connect_timeout: Duration,
     has_established_session: AtomicBool,
     session: AsyncMutex<Option<ActiveKafkaSession>>,
+    buffered: AsyncMutex<VecDeque<KafkaPayloadFrame>>,
     offsets: AsyncMutex<HashMap<(String, i32), i64>>,
 }
 
@@ -293,6 +263,7 @@ impl TcpKafkaPayloadSource {
             connect_timeout: Duration::from_millis(connect_timeout_ms),
             has_established_session: AtomicBool::new(false),
             session: AsyncMutex::new(None),
+            buffered: AsyncMutex::new(VecDeque::new()),
             offsets: AsyncMutex::new(HashMap::new()),
         })
     }
@@ -408,11 +379,11 @@ impl TcpKafkaPayloadSource {
                 });
             }
         }
+        cursors.sort_by_key(|c| (topic_poll_priority(&c.topic), c.partition));
 
         Ok(ActiveKafkaSession {
             _client: client,
             cursors,
-            buffered: VecDeque::new(),
             cursor_idx: 0,
         })
     }
@@ -422,7 +393,7 @@ impl TcpKafkaPayloadSource {
         session: &mut ActiveKafkaSession,
         fetch_timeout: Duration,
     ) -> DataInfraResult<Option<KafkaPayloadFrame>> {
-        if let Some(frame) = session.buffered.pop_front() {
+        if let Some(frame) = self.buffered.lock().await.pop_front() {
             return Ok(Some(frame));
         }
         let num_cursors = session.cursors.len();
@@ -430,16 +401,17 @@ impl TcpKafkaPayloadSource {
             return Ok(None);
         }
 
-        for _ in 0..num_cursors {
+        for step in 0..num_cursors {
             let idx = session.cursor_idx % num_cursors;
             session.cursor_idx = session.cursor_idx.wrapping_add(1);
             let cursor = &mut session.cursors[idx];
+            let max_wait_ms = if step == 0 { 15 } else { 1 };
 
             let fetch_res = tokio::time::timeout(
                 fetch_timeout,
                 cursor
                     .client
-                    .fetch_records(cursor.next_offset, 1..1_048_576, 15),
+                    .fetch_records(cursor.next_offset, 1..1_048_576, max_wait_ms),
             )
             .await
             .map_err(|_| {
@@ -456,53 +428,30 @@ impl TcpKafkaPayloadSource {
             })?;
 
             let (records, _high_watermark) = fetch_res;
-            for rec_and_off in records {
-                cursor.next_offset = rec_and_off.offset.saturating_add(1);
+            let mut buffered_guard = self.buffered.lock().await;
+            for rec_and_off in records.into_iter().take(MAX_RECORDS_PER_PARTITION_POLL) {
+                let next_offset = rec_and_off.offset.saturating_add(1);
+                cursor.next_offset = next_offset;
                 self.offsets
                     .lock()
                     .await
-                    .insert((cursor.topic.clone(), cursor.partition), cursor.next_offset);
+                    .insert((cursor.topic.clone(), cursor.partition), next_offset);
                 if let Some(raw_bytes) = rec_and_off.record.value {
-                    let text = std::str::from_utf8(&raw_bytes).map_err(|e| {
-                        DataInfraError::Transport(format!(
-                            "Kafka record on {}[{}] is not valid UTF-8: {e}",
-                            cursor.topic, cursor.partition
-                        ))
-                    })?;
-                    let trimmed = text.trim();
-                    if trimmed.is_empty() {
-                        return Err(DataInfraError::Transport(format!(
-                            "Kafka record on {}[{}] is empty",
-                            cursor.topic, cursor.partition
-                        )));
+                    match decode_kafka_record_value(&cursor.topic, cursor.partition, &raw_bytes) {
+                        Ok(frame) => {
+                            buffered_guard.push_back(frame);
+                        }
+                        Err(err) => {
+                            if let Some(first_valid) = buffered_guard.pop_front() {
+                                return Ok(Some(first_valid));
+                            }
+                            return Err(err);
+                        }
                     }
-                    let parsed: serde_json::Value = serde_json::from_str(trimmed).map_err(|e| {
-                        DataInfraError::Transport(format!(
-                            "Kafka record on {}[{}] is not valid JSON: {e}",
-                            cursor.topic, cursor.partition
-                        ))
-                    })?;
-                    let frame = if parsed
-                        .as_object()
-                        .is_some_and(|obj| obj.contains_key("topic") && obj.contains_key("payload"))
-                    {
-                        let envelope: KafkaBrokerEnvelope =
-                            serde_json::from_value(parsed).map_err(|e| {
-                                DataInfraError::Transport(format!(
-                                    "Kafka envelope on {}[{}] failed validation: {e}",
-                                    cursor.topic, cursor.partition
-                                ))
-                            })?;
-                        let payload_bytes = envelope.payload.into_payload_bytes()?;
-                        KafkaPayloadFrame::new(envelope.topic.trim().to_string(), payload_bytes)
-                    } else {
-                        KafkaPayloadFrame::new(cursor.topic.clone(), trimmed.as_bytes().to_vec())
-                    };
-                    session.buffered.push_back(frame);
                 }
             }
 
-            if let Some(frame) = session.buffered.pop_front() {
+            if let Some(frame) = buffered_guard.pop_front() {
                 return Ok(Some(frame));
             }
         }
@@ -511,9 +460,28 @@ impl TcpKafkaPayloadSource {
     }
 }
 
+const MAX_RECORDS_PER_PARTITION_POLL: usize = 64;
+
+fn topic_poll_priority(topic: &str) -> u8 {
+    let trimmed = topic.trim();
+    if trimmed == TOPIC_SIP_STATUSES {
+        0
+    } else if trimmed == TOPIC_SIP_BARS_1M || trimmed.starts_with("md.sip.bars.") {
+        1
+    } else if trimmed == TOPIC_SIP_QUOTES {
+        2
+    } else {
+        3
+    }
+}
+
 #[async_trait]
 impl KafkaPayloadSource for TcpKafkaPayloadSource {
     async fn next_frame(&self) -> DataInfraResult<Option<KafkaPayloadFrame>> {
+        if let Some(frame) = self.buffered.lock().await.pop_front() {
+            return Ok(Some(frame));
+        }
+
         let mut guard = self.session.lock().await;
 
         if guard.is_none() {
@@ -543,7 +511,109 @@ impl KafkaPayloadSource for TcpKafkaPayloadSource {
     async fn close(&self) -> DataInfraResult<()> {
         let mut guard = self.session.lock().await;
         *guard = None;
+        self.buffered.lock().await.clear();
         self.has_established_session.store(false, Ordering::Release);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_decode_kafka_record_value_validates_raw_and_envelope_frames() {
+        let raw_bar = br#"{"symbol":"AAPL","timeframe":"1m","bar_ts":1700000000,"open":150.0,"high":151.0,"low":149.5,"close":150.5,"volume":1000,"trade_count":10,"vwap":150.25,"bar_version":1,"is_synthetic":false,"is_suspect_spike":false}"#;
+        let frame = decode_kafka_record_value(TOPIC_SIP_BARS_1M, 0, raw_bar)
+            .expect("valid raw bar JSON should decode");
+        assert_eq!(frame.topic, TOPIC_SIP_BARS_1M);
+        assert_eq!(frame.payload, raw_bar);
+
+        let envelope = br#"{"topic":"md.sip.quotes","payload":{"symbol":"AAPL","quote_ts_ms":1700000000000,"bid_price":150.0,"bid_size":100,"ask_price":150.1,"ask_size":200}}"#;
+        let env_frame = decode_kafka_record_value(TOPIC_SIP_BARS_1M, 1, envelope)
+            .expect("valid envelope JSON should decode");
+        assert_eq!(env_frame.topic, TOPIC_SIP_QUOTES);
+        assert!(std::str::from_utf8(&env_frame.payload)
+            .expect("utf8")
+            .contains("\"quote_ts_ms\""));
+
+        assert!(decode_kafka_record_value(TOPIC_SIP_BARS_1M, 0, b"   ").is_err());
+        assert!(decode_kafka_record_value(TOPIC_SIP_BARS_1M, 0, &[0xff, 0xfe]).is_err());
+        assert!(decode_kafka_record_value(TOPIC_SIP_BARS_1M, 0, br#"{"symbol":"AAPL""#).is_err());
+        assert!(
+            decode_kafka_record_value(
+                TOPIC_SIP_BARS_1M,
+                0,
+                br#"{"topic":"md.sip.bars.1m","payload":12345}"#,
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tcp_kafka_payload_source_preserves_buffered_frames_across_session_drop() {
+        let mut cfg = DataInfraConfig::default();
+        cfg.kafka_brokers = vec!["127.0.0.1:1".to_string()];
+        cfg.request_timeout_ms = 100;
+
+        let source = TcpKafkaPayloadSource::from_config(&cfg).expect("valid config");
+        let f1 = KafkaPayloadFrame::new(TOPIC_SIP_BARS_1M, br#"{"symbol":"AAPL"}"#.to_vec());
+        let f2 = KafkaPayloadFrame::new(TOPIC_SIP_QUOTES, br#"{"symbol":"NVDA"}"#.to_vec());
+
+        {
+            let mut buf = source.buffered.lock().await;
+            buf.push_back(f1.clone());
+            buf.push_back(f2.clone());
+        }
+
+        // Even with session = None and an unreachable broker endpoint, buffered frames are drained first
+        let out1 = source
+            .next_frame()
+            .await
+            .expect("first buffered frame should succeed")
+            .expect("frame 1 present");
+        assert_eq!(out1, f1);
+
+        let out2 = source
+            .next_frame()
+            .await
+            .expect("second buffered frame should succeed")
+            .expect("frame 2 present");
+        assert_eq!(out2, f2);
+
+        // Once the buffer is empty, next_frame attempts to connect to 127.0.0.1:1 and returns Err
+        assert!(source.next_frame().await.is_err());
+
+        // Re-buffering and calling close() clears the buffer
+        source.buffered.lock().await.push_back(f1);
+        source.close().await.expect("close succeeds");
+        assert!(source.buffered.lock().await.is_empty());
+    }
+
+    #[test]
+    fn test_topic_poll_priority_and_max_records_per_partition_poll_fairness_invariants() {
+        assert_eq!(MAX_RECORDS_PER_PARTITION_POLL, 64);
+        assert_eq!(topic_poll_priority(TOPIC_SIP_STATUSES), 0);
+        assert_eq!(topic_poll_priority(TOPIC_SIP_BARS_1M), 1);
+        assert_eq!(topic_poll_priority("md.sip.bars.15m"), 1);
+        assert_eq!(topic_poll_priority(TOPIC_SIP_QUOTES), 2);
+        assert_eq!(topic_poll_priority("md.sip.unknown"), 3);
+
+        let mut topics = vec![
+            (TOPIC_SIP_QUOTES.to_string(), 0_i32),
+            (TOPIC_SIP_BARS_1M.to_string(), 1_i32),
+            (TOPIC_SIP_STATUSES.to_string(), 0_i32),
+            (TOPIC_SIP_BARS_1M.to_string(), 0_i32),
+        ];
+        topics.sort_by_key(|(t, p)| (topic_poll_priority(t), *p));
+        assert_eq!(
+            topics,
+            vec![
+                (TOPIC_SIP_STATUSES.to_string(), 0),
+                (TOPIC_SIP_BARS_1M.to_string(), 0),
+                (TOPIC_SIP_BARS_1M.to_string(), 1),
+                (TOPIC_SIP_QUOTES.to_string(), 0),
+            ]
+        );
     }
 }

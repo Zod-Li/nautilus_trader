@@ -253,6 +253,17 @@ impl AlpacaHttpClient {
         self.list_orders(Some("open")).await
     }
 
+    /// Queries `GET /v2/orders/{venue_order_id}`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AlpacaError`] if the order is not found (`404`) or request fails.
+    pub async fn get_order(&self, venue_order_id: &str) -> AlpacaResult<AlpacaOrderResponse> {
+        let path = format!("/v2/orders/{}", venue_order_id.trim());
+        self.request_json::<(), AlpacaOrderResponse>(Method::GET, &path, None, None)
+            .await
+    }
+
     /// Queries `GET /v2/orders:by_client_order_id?client_order_id={client_order_id}`.
     ///
     /// # Errors

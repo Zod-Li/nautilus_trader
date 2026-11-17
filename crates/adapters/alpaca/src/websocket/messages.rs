@@ -150,6 +150,12 @@ impl AlpacaTradeEventKind {
     }
 }
 
+/// Strongly typed nested order snapshot inside a `stream = "trade_updates"` frame.
+///
+/// Includes `replaces: Option<String>` and `replaced_by: Option<String>` for
+/// `PATCH /v2/orders/{id}` atomic replace lineage tracking.
+pub type AlpacaWsOrderPayload = AlpacaOrderResponse;
+
 /// Strongly typed `data` payload of a `stream = "trade_updates"` frame.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AlpacaTradeUpdatePayload {
@@ -171,7 +177,7 @@ pub struct AlpacaTradeUpdatePayload {
     #[serde(default)]
     pub timestamp: Option<String>,
     /// Nested Alpaca order snapshot (`order`).
-    pub order: AlpacaOrderResponse,
+    pub order: AlpacaWsOrderPayload,
 }
 
 /// Session-internal control signal parsed from non-business WebSocket frames.

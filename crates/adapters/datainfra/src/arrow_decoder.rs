@@ -47,7 +47,7 @@ use ustr::Ustr;
 use crate::{
     error::{DataInfraError, DataInfraResult},
     mapping::{
-        DataInfraTimeframe, parse_datainfra_bar_type, timeframe_step_ns, to_bar_type,
+        DataInfraTimeframe, compute_rth_bar_close_ns, parse_datainfra_bar_type, to_bar_type,
         to_instrument_id,
     },
 };
@@ -257,11 +257,10 @@ pub fn decode_bars_batches(
             };
 
             let bar_open_ns = extract_unix_nanos_at(ts_col, row, "ts_event")?;
-            let ts_event = UnixNanos::from(
-                bar_open_ns
-                    .as_u64()
-                    .saturating_add(timeframe_step_ns(&bar_type)),
-            );
+            let ts_event = UnixNanos::from(compute_rth_bar_close_ns(
+                &bar_type,
+                bar_open_ns.as_u64(),
+            ));
             let ts_init = if let Some(idx) = ts_init_idx {
                 let candidate = extract_unix_nanos_at(batch.column(idx), row, "ts_init")?;
                 ts_event.max(candidate)
@@ -536,10 +535,14 @@ pub fn map_trading_status_state(
     state_raw: &str,
 ) -> DataInfraResult<(MarketStatusAction, bool, bool)> {
     match state_raw.trim().to_uppercase().as_str() {
-        "TRADING" | "T" | "Q" => Ok((MarketStatusAction::Trading, true, false)),
-        "HALTED" | "HALT" | "H" | "M" => Ok((MarketStatusAction::Halt, false, false)),
-        "LULD_PAUSE" | "PAUSE" | "P" | "LULD" => Ok((MarketStatusAction::Pause, false, false)),
-        "SHORT_SALE_RESTRICTED" | "SSR" => Ok((MarketStatusAction::Trading, true, true)),
+        "TRADING" | "T" | "Q" | "3" | "D" => Ok((MarketStatusAction::Trading, true, false)),
+        "HALTED" | "HALT" | "H" | "I" | "Z" | "X" | "1" | "2" => {
+            Ok((MarketStatusAction::Halt, false, false))
+        }
+        "LULD_PAUSE" | "PAUSE" | "P" | "LULD" | "M" => {
+            Ok((MarketStatusAction::Pause, false, false))
+        }
+        "SHORT_SALE_RESTRICTED" | "SSR" | "E" => Ok((MarketStatusAction::Trading, true, true)),
         "PRE_OPEN" | "PREOPEN" => Ok((MarketStatusAction::PreOpen, false, false)),
         "CLOSE" | "CLOSED" => Ok((MarketStatusAction::Close, false, false)),
         other => Err(DataInfraError::ProvenanceViolation(format!(

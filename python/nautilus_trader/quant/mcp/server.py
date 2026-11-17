@@ -64,7 +64,9 @@ from nautilus_trader.quant.nodes.backtest_runner import (
     IsomorphicBacktestRunner,
     StressFalsificationReport,
     StressFalsifier,
+    build_datainfra_config_from_env,
 )
+from nautilus_trader.quant.nodes.live_node import SipFeederSubscriptionClient
 from nautilus_trader.quant.strategies.empirical import rolling_atr
 from nautilus_trader.quant.strategies.registry import list_strategy_archetype_schemas
 from nautilus_trader.adapters.datainfra import DataInfraCatalog, DataInfraConfig
@@ -193,6 +195,8 @@ class NautilusMcpServer:
         equity_provider: Optional[Callable[[str], Equity]] = None,
         auth_token: Optional[str] = None,
         portfolio_state_provider: Optional[Callable[..., Any]] = None,
+        sip_feeder_url: Optional[str] = None,
+        sip_feeder_client: Optional[SipFeederSubscriptionClient] = None,
     ) -> None:
         self._dsn = resolve_database_dsn(dsn) if dsn is not None else None
         self._datainfra_config = datainfra_config
@@ -207,6 +211,9 @@ class NautilusMcpServer:
         self._equity_provider = equity_provider
         self._auth_token = str(auth_token).strip() if auth_token is not None else None
         self._portfolio_state_provider = portfolio_state_provider
+        self._sip_feeder_client = sip_feeder_client or SipFeederSubscriptionClient(
+            base_url=sip_feeder_url
+        )
 
         self._lock = threading.Lock()
         self._runner_lock = threading.RLock()
@@ -552,6 +559,7 @@ class NautilusMcpServer:
             bars=bars,
             bar_timeframe=strat_cfg.bar_timeframe,
             archetype_id=strat_cfg.archetype_id,
+            atr_stop_multiplier=float(strat_cfg.atr_stop_multiplier),
         )
         plan_item = self._make_plan_item_contract(
             symbol=sym,
@@ -643,6 +651,7 @@ class NautilusMcpServer:
             bars=bars,
             bar_timeframe=strat_cfg.bar_timeframe,
             archetype_id=strat_cfg.archetype_id,
+            atr_stop_multiplier=float(strat_cfg.atr_stop_multiplier),
         )
         plan_item = self._make_plan_item_contract(
             symbol=sym,
@@ -768,10 +777,20 @@ class NautilusMcpServer:
             trading_date=resolved_date,
             market=market,
         )
-        equity_usd = float(existing_exposure.get("equity_usd") or cap_float)
-        cash_usd = float(existing_exposure.get("cash_usd") or equity_usd)
+        raw_eq_val = existing_exposure.get("equity_usd")
+        equity_usd = (
+            float(raw_eq_val)
+            if (raw_eq_val is not None and float(raw_eq_val) > 0.0)
+            else cap_float
+        )
         open_buy_usd = float(existing_exposure.get("open_buy_usd") or 0.0)
         gross_exposure_usd = float(existing_exposure.get("gross_exposure_usd") or 0.0)
+        raw_cash_val = existing_exposure.get("cash_usd")
+        cash_usd = (
+            max(0.0, float(raw_cash_val))
+            if raw_cash_val is not None
+            else max(0.0, equity_usd - gross_exposure_usd)
+        )
         symbol_exposure_usd: Dict[str, float] = dict(
             existing_exposure.get("symbol_exposure_usd") or {}
         )
@@ -785,6 +804,7 @@ class NautilusMcpServer:
 
         locked_items: List[PlanItemContract] = []
         sizing_decisions: Dict[str, Dict[str, Any]] = {}
+        scaled_to_zero_items: int = 0
 
         for raw_item in validated_items:
             sym = str(raw_item["symbol"]).strip().upper()
@@ -813,6 +833,7 @@ class NautilusMcpServer:
                 trading_date=resolved_date,
                 bar_timeframe=strat_cfg.bar_timeframe,
                 archetype_id=strat_cfg.archetype_id,
+                atr_stop_multiplier=float(strat_cfg.atr_stop_multiplier),
             )
             fp = compute_strategy_fingerprint(sym, strat_cfg, risk_envelope=req_env)
             base_fp = compute_strategy_fingerprint(sym, strat_cfg)
@@ -846,6 +867,13 @@ class NautilusMcpServer:
             eff_m_regime = float(raw_m_regime if raw_m_regime is not None else 1.0)
             if eff_m_regime < 0.0 or eff_m_regime > 1.0:
                 raise McpPlanLockRejectedError(f"m_regime must be in [0.0, 1.0], got {raw_m_regime}")
+            raw_circuit_mult = raw_item.get("circuit_multiplier")
+            circuit_mult = float(raw_circuit_mult if raw_circuit_mult is not None else 1.0)
+            if circuit_mult < 0.0 or circuit_mult > 1.0:
+                raise McpPlanLockRejectedError(
+                    f"circuit_multiplier must be in [0.0, 1.0], got {raw_circuit_mult}"
+                )
+            eff_scale = eff_m_regime * circuit_mult
 
             if falsified_env is not None:
                 falsified_env_fp = compute_strategy_fingerprint(
@@ -854,7 +882,7 @@ class NautilusMcpServer:
                 if fp != falsified_env_fp:
                     is_valid_regime_downscale = (
                         bool(raw_item.get("_env_already_scaled_by_m_regime", False))
-                        and 0.0 < eff_m_regime < 1.0
+                        and 0.0 < eff_scale < 1.0
                         and req_env.side == falsified_env.side
                         and req_env.initial_stop_price == falsified_env.initial_stop_price
                         and req_env.take_profit_price == falsified_env.take_profit_price
@@ -917,13 +945,14 @@ class NautilusMcpServer:
                     f"{decision.reject_reason or 'ZERO_QTY'}"
                 )
 
-            if eff_m_regime == 0.0:
+            if eff_scale == 0.0:
+                scaled_to_zero_items += 1
                 continue
             scaled_decision_qty = max(
                 1,
-                int(math.floor(float(decision.qty) * eff_m_regime + 1e-9)),
+                int(math.floor(float(decision.qty) * eff_scale + 1e-9)),
             )
-            should_scale_env = eff_m_regime < 1.0 and not bool(
+            should_scale_env = eff_scale < 1.0 and not bool(
                 raw_item.get("_env_already_scaled_by_m_regime", False)
             )
             scaled_env_target_qty = (
@@ -931,7 +960,7 @@ class NautilusMcpServer:
                     str(
                         max(
                             1,
-                            int(math.floor(float(req_env.target_qty) * eff_m_regime + 1e-9)),
+                            int(math.floor(float(req_env.target_qty) * eff_scale + 1e-9)),
                         )
                     )
                 )
@@ -943,7 +972,7 @@ class NautilusMcpServer:
                     str(
                         max(
                             1,
-                            int(math.floor(float(req_env.approved_qty_cap) * eff_m_regime + 1e-9)),
+                            int(math.floor(float(req_env.approved_qty_cap) * eff_scale + 1e-9)),
                         )
                     )
                 )
@@ -962,20 +991,54 @@ class NautilusMcpServer:
             target_qty = min(scaled_env_target_qty, approved_qty_cap)
             raw_sized_notional = min(
                 float(req_env.target_notional_usd),
-                float(decision.notional_usd) * eff_m_regime,
+                float(decision.notional_usd) * eff_scale,
                 float(target_qty) * entry_ref,
             )
-            approved_notional = max(
-                Decimal("100.00"),
-                Decimal(f"{raw_sized_notional:.2f}"),
-            )
+            approved_notional = Decimal(f"{raw_sized_notional:.2f}")
+            if approved_notional < Decimal("100.00"):
+                sizing_decisions[sym] = {
+                    "target_qty": "0",
+                    "approved_qty_cap": "0",
+                    "target_notional_usd": str(approved_notional),
+                    "max_risk_budget_usd": "0.00",
+                    "binding_constraint": "REJECTED_DUST_NOTIONAL",
+                    "sizing_trace": dict(decision.trace or {}),
+                }
+                continue
             approved_risk_budget = min(
                 req_env.max_risk_budget_usd,
                 approved_notional,
                 Decimal(
-                    f"{max(decision.risk_budget_usd * eff_m_regime, decision.risk_usd * eff_m_regime, 1.0):.2f}"
+                    f"{max(decision.risk_budget_usd * eff_scale, decision.risk_usd * eff_scale, 1.0):.2f}"
                 ),
             )
+
+            co_dec_map = {
+                str(d.get("symbol", "")).strip().upper(): d
+                for d in (committee_attestation.get("carry_over_decisions") or [])
+                if isinstance(d, Mapping) and str(d.get("symbol", "")).strip()
+            }
+            matched_co = co_dec_map.get(sym)
+            effective_stop_px = req_env.initial_stop_price
+            co_filled_qty = Decimal("0")
+            if matched_co is not None:
+                raw_co_stop = matched_co.get("current_stop_price")
+                if raw_co_stop is not None and str(raw_co_stop).strip() != "":
+                    try:
+                        co_stop_dec = Decimal(str(raw_co_stop))
+                        if co_stop_dec > Decimal("0"):
+                            if req_env.side == PlanSide.LONG:
+                                effective_stop_px = max(effective_stop_px, co_stop_dec)
+                            else:
+                                effective_stop_px = min(effective_stop_px, co_stop_dec)
+                    except Exception:
+                        pass
+                raw_co_qty = matched_co.get("qty")
+                if raw_co_qty is not None and str(raw_co_qty).strip() != "":
+                    try:
+                        co_filled_qty = abs(Decimal(str(raw_co_qty)))
+                    except Exception:
+                        co_filled_qty = Decimal("0")
 
             sized_envelope = PlanRiskEnvelope(
                 side=req_env.side,
@@ -983,7 +1046,7 @@ class NautilusMcpServer:
                 approved_qty_cap=approved_qty_cap,
                 target_notional_usd=approved_notional,
                 max_risk_budget_usd=approved_risk_budget,
-                initial_stop_price=req_env.initial_stop_price,
+                initial_stop_price=effective_stop_px,
                 take_profit_price=req_env.take_profit_price,
                 collar=req_env.collar,
                 valid_until=req_env.valid_until,
@@ -1013,6 +1076,16 @@ class NautilusMcpServer:
                     "committee_attestation": dict(committee_attestation),
                 }
             )
+            if matched_co is not None:
+                enriched_trace["carry_over_status"] = str(
+                    matched_co.get("lifecycle_state") or "RENEWED_ACTIVE"
+                )
+                if matched_co.get("qty") is not None:
+                    enriched_trace["carry_over_position_qty"] = str(matched_co.get("qty"))
+                if matched_co.get("avg_entry_price") is not None:
+                    enriched_trace["carry_over_avg_entry_price"] = str(
+                        matched_co.get("avg_entry_price")
+                    )
             item_contract = self._make_plan_item_contract(
                 symbol=sym,
                 strategy_config=strat_cfg,
@@ -1020,6 +1093,8 @@ class NautilusMcpServer:
                 plan_id=resolved_plan_uuid,
                 sizing_trace=enriched_trace,
             )
+            if co_filled_qty > Decimal("0"):
+                item_contract = replace(item_contract, filled_qty=co_filled_qty)
             locked_items.append(item_contract)
             sizing_decisions[sym] = {
                 "target_qty": str(target_qty),
@@ -1035,12 +1110,22 @@ class NautilusMcpServer:
             committed_by_venue["alpaca"] = committed_by_venue.get("alpaca", 0.0) + float(approved_notional)
             new_risk_used_today += float(approved_risk_budget)
 
+        all_scaled_to_zero = bool(validated_items) and scaled_to_zero_items == len(validated_items)
+        if not locked_items and not (all_candidates_vetoed or l0_zero_quota or all_scaled_to_zero):
+            raise McpPlanLockRejectedError(
+                "All validated_items were rejected due to sub-$100.00 dust notional"
+            )
+
         resolved_equity_dec = Decimal(f"{equity_usd:.2f}")
         carry_over_decisions = list(committee_attestation.get("carry_over_decisions") or [])
         zero_item_reason_code = (
             str(
                 committee_attestation.get("zero_item_reason_code")
-                or ("ALL_CANDIDATES_VETOED" if all_candidates_vetoed else "")
+                or (
+                    "ALL_CANDIDATES_VETOED"
+                    if (all_candidates_vetoed or all_scaled_to_zero)
+                    else ""
+                )
             ).strip()
             or None
         )
@@ -1059,12 +1144,46 @@ class NautilusMcpServer:
                 zero_item_reason_code=zero_item_reason_code,
             )
 
+        plan_symbols = [item.symbol for item in locked_items]
+        carry_over_symbols = [
+            str(d.get("symbol", "")).strip().upper()
+            for d in carry_over_decisions
+            if isinstance(d, dict) and str(d.get("symbol", "")).strip()
+        ]
+        open_pos_symbols = [
+            sym
+            for sym, mv in symbol_exposure_usd.items()
+            if float(mv or 0.0) > 0.0
+        ]
+        active_sub_symbols = [
+            *plan_symbols,
+            *carry_over_symbols,
+            *open_pos_symbols,
+        ]
+        try:
+            sip_feeder_subscriptions = self._sip_feeder_client.sync_plan_subscriptions(
+                active_symbols=active_sub_symbols,
+            )
+        except Exception as exc:
+            logger.error(
+                "Failed to synchronize pre-market sip-feeder subscriptions for plan %s: %s",
+                resolved_plan_uuid,
+                exc,
+            )
+            sip_feeder_subscriptions = {
+                "status": "ERROR",
+                "error": str(exc),
+                "added": SipFeederSubscriptionClient.normalize_symbols(active_sub_symbols),
+                "removed": [],
+            }
+
         return {
             "status": "LOCKED",
             "plan_status": "LOCKED_NO_TRADE" if not locked_items else "LOCKED",
             "all_candidates_vetoed": all_candidates_vetoed,
             "zero_item_reason_code": zero_item_reason_code,
             "carry_over_decisions": carry_over_decisions,
+            "sip_feeder_subscriptions": sip_feeder_subscriptions,
             "plan_id": str(resolved_plan_uuid),
             "market": str(market or "US_EQUITY").strip().upper(),
             "trading_date": resolved_date.isoformat(),
@@ -1326,6 +1445,7 @@ class NautilusMcpServer:
         trading_date: Optional[date] = None,
         bar_timeframe: str = "15m",
         archetype_id: Optional[StrategyArchetypeId | str] = None,
+        atr_stop_multiplier: Optional[float] = None,
     ) -> PlanRiskEnvelope:
         risk_cfg = self._system_config.risk
         exec_cfg = self._system_config.execution
@@ -1425,10 +1545,13 @@ class NautilusMcpServer:
                     raise ValueError(
                         f"risk_envelope for {symbol} missing 'initial_stop_price' and no empirical ATR available"
                     )
-                emp_floor_px = min(bar_lows) if bar_lows else emp_last_px
-                emp_ceil_px = max(bar_highs) if bar_highs else emp_last_px
+                eff_atr_mult = max(float(atr_stop_multiplier or 2.0), 2.0)
+                emp_stop_dist = max(
+                    emp_atr * eff_atr_mult,
+                    emp_last_px * float(risk_per_trade_frac),
+                )
                 initial_stop = Decimal(
-                    f"{max(0.01, emp_floor_px - emp_atr if side == PlanSide.LONG else emp_ceil_px + emp_atr):.2f}"
+                    f"{max(0.01, emp_last_px - emp_stop_dist if side == PlanSide.LONG else emp_last_px + emp_stop_dist):.2f}"
                 )
             else:
                 initial_stop = Decimal(str(raw_stop))
@@ -1482,7 +1605,8 @@ class NautilusMcpServer:
                 f"Cannot derive empirical PlanRiskEnvelope for {symbol} without raw_envelope or historical bars"
             )
 
-        stop_dist = max(emp_atr, emp_last_px * float(risk_per_trade_frac))
+        eff_atr_mult = max(float(atr_stop_multiplier or 2.0), 2.0)
+        stop_dist = max(emp_atr * eff_atr_mult, emp_last_px * float(risk_per_trade_frac))
         stop_px = max(0.01, emp_last_px - stop_dist)
         tp_px = emp_last_px + stop_dist
         max_risk_usd = float(self._capital_basis_usd * risk_per_trade_frac)
@@ -1665,18 +1789,33 @@ class NautilusMcpServer:
                 provided = self._portfolio_state_provider()
 
             if isinstance(provided, PortfolioState):
+                raw_eq = (
+                    float(provided.equity_usd)
+                    if (provided.equity_usd is not None and float(provided.equity_usd) > 0.0)
+                    else cap_float
+                )
+                gross_exp = float(provided.gross_exposure_usd)
+                raw_venue_cash = provided.venue_cash_usd.get("alpaca")
                 return {
-                    "equity_usd": float(provided.equity_usd or cap_float),
-                    "cash_usd": float(
-                        provided.venue_cash_usd.get("alpaca", provided.equity_usd or cap_float)
+                    "equity_usd": raw_eq,
+                    "cash_usd": (
+                        max(0.0, float(raw_venue_cash))
+                        if raw_venue_cash is not None
+                        else max(0.0, raw_eq - gross_exp)
                     ),
                     "open_buy_usd": float(provided.venue_open_buy_usd.get("alpaca", 0.0)),
-                    "gross_exposure_usd": float(provided.gross_exposure_usd),
+                    "gross_exposure_usd": gross_exp,
                     "symbol_exposure_usd": dict(provided.symbol_exposure_usd),
                     "sector_exposure_usd": dict(provided.sector_exposure_usd),
                 }
             if isinstance(provided, dict):
                 exposure.update(provided)
+                if provided.get("cash_usd") is not None:
+                    exposure["cash_usd"] = max(0.0, float(provided["cash_usd"]))
+                else:
+                    eff_eq = float(exposure.get("equity_usd") or cap_float)
+                    eff_gross = float(exposure.get("gross_exposure_usd") or 0.0)
+                    exposure["cash_usd"] = max(0.0, eff_eq - eff_gross)
                 return exposure
 
         if not self._dsn:
@@ -1693,6 +1832,7 @@ class NautilusMcpServer:
             open_buy_usd = 0.0
             equity_usd = cap_float
             cash_usd = cap_float
+            has_explicit_cash = False
 
             with psycopg2.connect(self._dsn) as conn:
                 with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -1713,15 +1853,29 @@ class NautilusMcpServer:
                         cur.execute("SELECT * FROM trading_accounts ORDER BY updated_at DESC NULLS LAST LIMIT 1")
                         acct_row = cur.fetchone()
                         if acct_row:
-                            eq_val = acct_row.get("equity") or acct_row.get("equity_usd")
-                            cash_val = (
-                                acct_row.get("cash_balance")
-                                or acct_row.get("cash")
-                                or acct_row.get("cash_usd")
+                            eq_val = next(
+                                (
+                                    acct_row.get(k)
+                                    for k in ("equity", "equity_usd")
+                                    if acct_row.get(k) is not None
+                                ),
+                                None,
+                            )
+                            cash_val = next(
+                                (
+                                    acct_row.get(k)
+                                    for k in ("cash_balance", "cash", "cash_usd")
+                                    if acct_row.get(k) is not None
+                                ),
+                                None,
                             )
                             if eq_val is not None and float(eq_val) > 0.0:
                                 equity_usd = float(eq_val)
-                                cash_usd = float(cash_val) if (cash_val is not None and float(cash_val) > 0.0) else equity_usd
+                            if cash_val is not None:
+                                cash_usd = max(0.0, float(cash_val))
+                                has_explicit_cash = True
+                            else:
+                                cash_usd = equity_usd
 
                     position_rows: List[Dict[str, Any]] = []
                     if reg.get("tp_reg") is not None:
@@ -1884,6 +2038,10 @@ class NautilusMcpServer:
                 sector_exposure[sec] = sector_exposure.get(sec, 0.0) + sym_mv
 
             gross_exposure_usd = sum(symbol_exposure.values())
+            if not has_explicit_cash:
+                cash_usd = max(0.0, equity_usd - gross_exposure_usd)
+            elif gross_exposure_usd > 0.0 and (cash_usd + gross_exposure_usd) > (equity_usd + 1.0):
+                cash_usd = max(0.0, min(cash_usd, equity_usd - gross_exposure_usd))
             exposure.update(
                 {
                     "equity_usd": equity_usd,
@@ -1987,37 +2145,7 @@ class NautilusMcpServer:
         return entry_price - dist
 
 
-def build_datainfra_config_from_env() -> DataInfraConfig:
-    """Constructs `DataInfraConfig` from container environment variables."""
-    from urllib.parse import quote
 
-    ch_url = os.environ.get("CLICKHOUSE_URL", "").strip()
-    if not ch_url:
-        ch_host = os.environ.get("CH_HOST", "127.0.0.1").strip()
-        ch_port = (os.environ.get("CH_HTTP_PORT") or os.environ.get("CH_PORT") or "8123").strip()
-        ch_user = os.environ.get("CH_USER", "").strip()
-        ch_pw = os.environ.get("CH_PASSWORD", "").strip()
-        if ch_user:
-            ch_url = f"http://{ch_host}:{ch_port}/?user={quote(ch_user)}&password={quote(ch_pw)}"
-        else:
-            ch_url = f"http://{ch_host}:{ch_port}"
-    ch_db = (
-        os.environ.get("CLICKHOUSE_DATABASE")
-        or os.environ.get("CH_DB")
-        or "market_data"
-    ).strip()
-    brokers_raw = os.environ.get("KAFKA_BROKERS", "127.0.0.1:9092")
-    brokers = [b.strip() for b in brokers_raw.split(",") if b.strip()]
-    cal_url = os.environ.get("CALENDAR_SERVICE_URL", "http://127.0.0.1:8012").strip()
-    venue = os.environ.get("DEFAULT_VENUE", "ALPACA").strip().upper()
-    return DataInfraConfig(
-        clickhouse_url=ch_url,
-        clickhouse_database=ch_db,
-        kafka_brokers=brokers,
-        kafka_group_id=os.environ.get("KAFKA_GROUP_ID", "nautilus-mcp-service"),
-        calendar_service_url=cal_url,
-        default_venue=venue,
-    )
 
 
 def create_production_mcp_server(dsn: Optional[str] = None) -> NautilusMcpServer:

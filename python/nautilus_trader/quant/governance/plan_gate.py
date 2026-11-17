@@ -14,6 +14,7 @@ import threading
 import time
 from typing import Any, Callable, Dict, List, Mapping, Optional, Protocol, Sequence, Tuple
 from uuid import NAMESPACE_URL, UUID, uuid5
+import weakref
 
 import psycopg2
 from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
@@ -41,6 +42,7 @@ from nautilus_trader.quant.contracts.models import (
     StrategyArchetypeId,
     _to_decimal,
 )
+from nautilus_trader.quant.contracts.repository import PlanContractRepository
 
 register_uuid()
 
@@ -62,84 +64,14 @@ EXIT_INTENT_TAGS = frozenset(
         "CARRY_OVER_EXIT",
     }
 )
+from nautilus_trader.quant.governance.bounded_collections import (
+    MAX_TRACKED_ORDER_HISTORY,
+    _BoundedFifoDict,
+    _BoundedFifoList,
+    _BoundedFifoSet,
+)
+
 NOTIFY_CHANNEL = "nautilus_plan_gate_sync"
-MAX_TRACKED_ORDER_HISTORY: int = 4096
-
-
-class _BoundedFifoList(list):
-    """FIFO-bounded list that evicts oldest entries when capacity exceeds `max_size`."""
-
-    def __init__(self, max_size: int = MAX_TRACKED_ORDER_HISTORY) -> None:
-        super().__init__()
-        self._max_size = max(1, int(max_size))
-
-    def append(self, item: Any) -> None:
-        super().append(item)
-        overflow = len(self) - self._max_size
-        if overflow > 0:
-            del self[:overflow]
-
-    def extend(self, items: Any) -> None:
-        super().extend(items)
-        overflow = len(self) - self._max_size
-        if overflow > 0:
-            del self[:overflow]
-
-
-class _BoundedFifoSet(set):
-    """FIFO-bounded set that evicts oldest entries when capacity exceeds `max_size`."""
-
-    def __init__(self, max_size: int = MAX_TRACKED_ORDER_HISTORY) -> None:
-        super().__init__()
-        self._max_size = max(1, int(max_size))
-        self._order: OrderedDict[Any, None] = OrderedDict()
-
-    def add(self, item: Any) -> None:
-        if item in self._order:
-            self._order.move_to_end(item)
-            super().add(item)
-            return
-        while len(self._order) >= self._max_size:
-            oldest, _ = self._order.popitem(last=False)
-            super().discard(oldest)
-        self._order[item] = None
-        super().add(item)
-
-    def discard(self, item: Any) -> None:
-        self._order.pop(item, None)
-        super().discard(item)
-
-    def remove(self, item: Any) -> None:
-        self._order.pop(item, None)
-        super().remove(item)
-
-    def clear(self) -> None:
-        self._order.clear()
-        super().clear()
-
-
-class _BoundedFifoDict(OrderedDict):
-    """FIFO-bounded dictionary that evicts oldest entries when capacity exceeds `max_size`."""
-
-    def __init__(self, max_size: int = MAX_TRACKED_ORDER_HISTORY) -> None:
-        super().__init__()
-        self._max_size = max(1, int(max_size))
-
-    def __setitem__(self, key: Any, value: Any) -> None:
-        if key in self:
-            super().__setitem__(key, value)
-            self.move_to_end(key)
-            return
-        while len(self) >= self._max_size:
-            self.popitem(last=False)
-        super().__setitem__(key, value)
-
-    def setdefault(self, key: Any, default: Any = None) -> Any:
-        if key in self:
-            self.move_to_end(key)
-            return self[key]
-        self[key] = default
-        return default
 
 
 @dataclass(frozen=True)
@@ -706,7 +638,10 @@ class _AsyncPlanGateDbWorker:
                     """
                     UPDATE trading_plan_items i
                     SET filled_qty = GREATEST(0, COALESCE(i.filled_qty, 0) - %s),
-                        reserved_notional_usd = GREATEST(0, COALESCE(i.reserved_notional_usd, 0) - %s),
+                        reserved_notional_usd = CASE
+                            WHEN GREATEST(0, COALESCE(i.filled_qty, 0) - %s) = 0 OR %s = 0 THEN 0
+                            ELSE GREATEST(0, COALESCE(i.reserved_notional_usd, 0) - %s)
+                        END,
                         status = CASE
                             WHEN GREATEST(0, COALESCE(i.filled_qty, 0) - %s) = 0 AND i.status = 'TRIGGERED' THEN 'ARMED'
                             ELSE i.status
@@ -721,6 +656,8 @@ class _AsyncPlanGateDbWorker:
                     """,
                     (
                         qty_dec,
+                        qty_dec,
+                        new_reserved,
                         released_notional,
                         qty_dec,
                         self._trading_date,
@@ -803,9 +740,11 @@ class PostgresPlanGateBackend:
         entry_freeze_reason: str = "",
         persist_to_db: bool = True,
         allow_multi_cycle_reentry: bool = False,
+        oco_monitor: Optional[Any] = None,
     ) -> None:
         self._persist_to_db = bool(persist_to_db)
         self._allow_multi_cycle_reentry = bool(allow_multi_cycle_reentry)
+        self._oco_monitor: Optional[Any] = oco_monitor
         self._dsn = (
             resolve_database_dsn(dsn)
             if (self._persist_to_db or dsn is not None)
@@ -869,6 +808,25 @@ class PostgresPlanGateBackend:
     @property
     def alerts(self) -> List[Dict[str, Any]]:
         return list(self._alerts)
+
+    @property
+    def oco_monitor(self) -> Optional[Any]:
+        return self._oco_monitor
+
+    def register_oco_monitor(self, monitor: Optional[Any]) -> None:
+        """Attaches a `ProtectiveOcoMonitor` so `sync_from_db` refreshes protective stop coverage."""
+        self._oco_monitor = monitor
+
+    attach_oco_monitor = register_oco_monitor
+
+    def _drain_rust_mutations(self, limit: int = 64) -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        for raw in self._rust_engine.drain_pending_mutations(limit) or []:
+            if isinstance(raw, Mapping):
+                out.append(dict(raw))
+            elif isinstance(raw, str):
+                out.append(json.loads(raw))
+        return out
 
     def upsert_plan_item(self, item: PlanItemContract) -> None:
         self.upsert_runtime_plan_item(item, reserved_qty=item.filled_qty)
@@ -1079,7 +1037,7 @@ class PostgresPlanGateBackend:
 
     def flush(self, timeout_secs: float = 5.0) -> None:
         """Waits for all queued asynchronous DB writes to complete."""
-        pending = list(self._rust_engine.drain_pending_mutations(1024) or [])
+        pending = self._drain_rust_mutations(1024)
         if self._async_writer is not None:
             if pending:
                 self._async_writer.enqueue_mutations(pending)
@@ -1346,7 +1304,9 @@ class PostgresPlanGateBackend:
                                 prev_reserved[row_sym] = Decimal(
                                     self._rust_engine.reserved_qty(row_sym)
                                 )
-                    self._rust_engine.clear_plan_items()
+                    prior_known_symbols = set(self._known_symbols)
+                    if not effective_preserve:
+                        self._rust_engine.clear_plan_items()
                     self._known_symbols.clear()
                     self._symbol_by_item_id.clear()
                     self._items_by_symbol.clear()
@@ -1355,6 +1315,8 @@ class PostgresPlanGateBackend:
                         try:
                             plan_item = PlanItemContract.from_db_row(row)
                             norm_sym = plan_item.symbol
+                            if norm_sym in self._removed_runtime_symbols:
+                                continue
                             released_cap = self._released_cap_by_symbol.get(norm_sym)
                             if released_cap is not None:
                                 capped_qty = min(plan_item.filled_qty, released_cap)
@@ -1476,6 +1438,101 @@ class PostgresPlanGateBackend:
                         self._known_symbols.add(norm_sym)
                         self._symbol_by_item_id[str(overlaid_item.item_id)] = norm_sym
                         self._items_by_symbol[norm_sym] = overlaid_item
+
+                    if effective_preserve:
+                        for stale_sym in prior_known_symbols - self._known_symbols:
+                            self._rust_engine.remove_plan_item(stale_sym)
+
+                    if self._oco_monitor is not None:
+                        try:
+                            refresh_fn = getattr(
+                                self._oco_monitor, "refresh_coverage_from_db", None
+                            ) or getattr(
+                                self._oco_monitor, "_hydrate_coverage_from_db", None
+                            )
+                            if callable(refresh_fn):
+                                refresh_fn()
+                            else:
+                                refresh_sym_fn = getattr(
+                                    self._oco_monitor,
+                                    "refresh_symbol_coverage_from_db",
+                                    None,
+                                )
+                                if callable(refresh_sym_fn):
+                                    for sym_k in list(self._known_symbols):
+                                        refresh_sym_fn(sym_k)
+                            get_cov = getattr(self._oco_monitor, "get_coverage", None)
+                            if callable(get_cov):
+                                for sym_k, cur_item in list(
+                                    self._items_by_symbol.items()
+                                ):
+                                    cov = get_cov(sym_k)
+                                    cov_stop = getattr(
+                                        cov, "stop_price", Decimal("0")
+                                    )
+                                    if (
+                                        cov is not None
+                                        and isinstance(cov_stop, Decimal)
+                                        and cov_stop > Decimal("0")
+                                    ):
+                                        cur_stop = (
+                                            cur_item.risk_envelope.initial_stop_price
+                                        )
+                                        tighter_stop = (
+                                            max(cur_stop, cov_stop)
+                                            if cur_item.risk_envelope.side
+                                            == PlanSide.LONG
+                                            else (
+                                                min(cur_stop, cov_stop)
+                                                if cur_stop > Decimal("0")
+                                                else cov_stop
+                                            )
+                                        )
+                                        if tighter_stop != cur_stop:
+                                            tp_px = (
+                                                cur_item.risk_envelope.take_profit_price
+                                            )
+                                            if tp_px is not None:
+                                                if (
+                                                    cur_item.risk_envelope.side
+                                                    == PlanSide.LONG
+                                                    and tp_px <= tighter_stop
+                                                ) or (
+                                                    cur_item.risk_envelope.side
+                                                    == PlanSide.SHORT
+                                                    and tp_px >= tighter_stop
+                                                ):
+                                                    tp_px = None
+                                            updated_env = replace(
+                                                cur_item.risk_envelope,
+                                                initial_stop_price=tighter_stop,
+                                                take_profit_price=tp_px,
+                                            )
+                                            updated_item = replace(
+                                                cur_item, risk_envelope=updated_env
+                                            )
+                                            self._items_by_symbol[sym_k] = updated_item
+                                            if sym_k in self._runtime_items_by_symbol:
+                                                _, rt_res = (
+                                                    self._runtime_items_by_symbol[sym_k]
+                                                )
+                                                self._runtime_items_by_symbol[sym_k] = (
+                                                    updated_item,
+                                                    rt_res,
+                                                )
+                                            self._rust_engine.upsert_plan_item(
+                                                _plan_item_to_rust_envelope(
+                                                    updated_item
+                                                ),
+                                                True,
+                                            )
+                        except Exception as oco_exc:
+                            logger.error(
+                                "Failed to refresh ProtectiveOcoMonitor during sync_from_db: %s",
+                                oco_exc,
+                                exc_info=True,
+                            )
+                            raise
             except Exception as exc:
                 self._rust_engine.set_backend_unavailable(
                     True, f"PostgreSQL sync failed ({exc})"
@@ -1490,10 +1547,51 @@ class PostgresPlanGateBackend:
             )
 
         self._poll_notifications_nonblocking()
+        norm_sym = str(request.symbol or "").strip().upper()
+        req_for_rust = request
+        override_stop_reason: str | None = None
+        if (
+            not self._allow_multi_cycle_reentry
+            and request.stop_loss_price is not None
+            and norm_sym in self._items_by_symbol
+        ):
+            cur_item = self._items_by_symbol[norm_sym]
+            init_stop = cur_item.risk_envelope.initial_stop_price
+            entry_ref = request.limit_price or request.reference_price or Decimal("0")
+            if init_stop > Decimal("0") and entry_ref > Decimal("0") and request.stop_loss_price > Decimal("0"):
+                if (
+                    cur_item.risk_envelope.side == PlanSide.LONG
+                    and entry_ref > init_stop
+                    and request.stop_loss_price < entry_ref
+                    and request.stop_loss_price < init_stop
+                ):
+                    req_for_rust = replace(request, stop_loss_price=Decimal("0.0001"))
+                    override_stop_reason = (
+                        f"STOP_LOSS_FLOOR_VIOLATION (STOP_LOSS_BELOW_PLAN_FLOOR): "
+                        f"LONG stop_loss_price ({request.stop_loss_price}) < effective_stop_floor ({init_stop}, plan initial_stop={init_stop})"
+                    )
+                elif (
+                    cur_item.risk_envelope.side == PlanSide.SHORT
+                    and entry_ref < init_stop
+                    and request.stop_loss_price > entry_ref
+                    and request.stop_loss_price > init_stop
+                ):
+                    req_for_rust = replace(request, stop_loss_price=init_stop + entry_ref + Decimal("1000000"))
+                    override_stop_reason = (
+                        f"STOP_LOSS_FLOOR_VIOLATION (STOP_LOSS_ABOVE_PLAN_CEILING): "
+                        f"SHORT stop_loss_price ({request.stop_loss_price}) > effective_stop_ceiling ({init_stop}, plan initial_stop={init_stop})"
+                    )
         rust_decision = self._rust_engine.evaluate_and_reserve(
-            request.to_rust_request()
+            req_for_rust.to_rust_request()
         )
         decision = PlanGateDecision.from_rust_decision(rust_decision)
+        if (
+            not decision.allowed
+            and override_stop_reason is not None
+            and decision.reason is not None
+            and "STOP_LOSS_FLOOR_VIOLATION" in decision.reason
+        ):
+            decision = replace(decision, reason=override_stop_reason)
         if decision.allowed and not decision.is_exit_bypass:
             norm_sym = str(request.symbol or "").strip().upper()
             self._released_cap_by_symbol.pop(norm_sym, None)
@@ -1521,7 +1619,7 @@ class PostgresPlanGateBackend:
                         replace(rt_item, filled_qty=new_res_dec, status=new_status),
                         new_res_dec,
                     )
-        pending = list(self._rust_engine.drain_pending_mutations(64) or [])
+        pending = self._drain_rust_mutations(64)
 
         if not decision.allowed and not pending:
             reason_str = decision.reason or "PLAN_GATE_DENIED"
@@ -1586,6 +1684,20 @@ class PostgresPlanGateBackend:
             resolved_symbol = self._symbol_by_item_id.get(str(item_id), "")
         if not resolved_symbol:
             return
+        locked_syms: set[str] = getattr(self, "_closed_cycle_locked_symbols", set())
+        was_cycle_locked = resolved_symbol in locked_syms
+        prior_locked_qty = Decimal("0")
+        if was_cycle_locked and resolved_symbol in self._items_by_symbol:
+            cur_item_pre = self._items_by_symbol[resolved_symbol]
+            prior_locked_qty = max(
+                self.reserved_qty(resolved_symbol),
+                cur_item_pre.risk_envelope.approved_qty_cap,
+            )
+            self._rust_engine.upsert_plan_item(
+                _plan_item_to_rust_envelope(cur_item_pre),
+                False,
+            )
+            self._rust_engine.drain_pending_mutations(64)
         new_res = Decimal(
             str(self._rust_engine.release_reservation(resolved_symbol, str(qty_dec)))
         )
@@ -1609,9 +1721,23 @@ class PostgresPlanGateBackend:
             )
             self._runtime_items_by_symbol[resolved_symbol] = (
                 replace(rt_item, filled_qty=new_res, status=reverted_status),
-                new_res,
+                prior_locked_qty if was_cycle_locked else new_res,
             )
-        pending = list(self._rust_engine.drain_pending_mutations(64) or [])
+        pending = self._drain_rust_mutations(64)
+        if was_cycle_locked and resolved_symbol in self._items_by_symbol:
+            cur_item_post = self._items_by_symbol[resolved_symbol]
+            relock_qty = max(
+                prior_locked_qty,
+                new_res,
+                cur_item_post.risk_envelope.approved_qty_cap,
+            )
+            self._rust_engine.upsert_plan_item(
+                _plan_item_to_rust_envelope(
+                    replace(cur_item_post, filled_qty=relock_qty)
+                ),
+                True,
+            )
+            self._rust_engine.drain_pending_mutations(64)
         if pending:
             self._alerts.extend(pending)
             if self._async_writer is not None:
@@ -1625,9 +1751,7 @@ class PostgresPlanGateBackend:
         *,
         item_id: Optional[UUID | str] = None,
     ) -> None:
-        """Releases closed-cycle entry reservation in multi-cycle backtest mode; no-op in live single-plan mode."""
-        if not self._allow_multi_cycle_reentry:
-            return
+        """Releases closed-cycle entry reservation in multi-cycle backtest mode; locks single-cycle quota in live mode."""
         raw_sym = str(symbol or "").strip()
         norm_sym = raw_sym.upper()
         if norm_sym not in self._items_by_symbol and item_id is not None:
@@ -1636,6 +1760,23 @@ class PostgresPlanGateBackend:
             norm_sym = self._symbol_by_item_id.get(raw_sym, norm_sym)
         item = self._items_by_symbol.get(norm_sym)
         if item is None:
+            return
+        if not self._allow_multi_cycle_reentry:
+            if not hasattr(self, "_closed_cycle_locked_symbols"):
+                self._closed_cycle_locked_symbols: set[str] = set()
+            self._closed_cycle_locked_symbols.add(norm_sym)
+            locked_qty = max(
+                self.reserved_qty(norm_sym),
+                item.filled_qty,
+                item.risk_envelope.approved_qty_cap,
+            )
+            self.upsert_runtime_plan_item(
+                item,
+                reserved_qty=locked_qty,
+                preserve_higher_reservation=True,
+            )
+            self._items_by_symbol[norm_sym] = item
+            self._rust_engine.drain_pending_mutations(64)
             return
         reset_item = replace(item, filled_qty=Decimal("0"))
         self.upsert_runtime_plan_item(
@@ -1729,14 +1870,12 @@ class PlanGateExecAlgorithm(ExecutionAlgorithm):
         *,
         telemetry_actor: Optional[Any] = None,
         oco_monitor: Optional[Any] = None,
-        forward_gate: Optional[PlanGateExecAlgorithm] = None,
     ) -> None:
         resolved_cfg = config or PlanGateExecAlgorithmConfig(
             exec_algorithm_id=PLAN_GATE_EXEC_ALGORITHM_ID,
         )
         super().__init__(resolved_cfg)
         self._backend = backend
-        self._forward_gate: Optional[PlanGateExecAlgorithm] = forward_gate
         self._collar_market_orders = bool(
             getattr(resolved_cfg, "collar_market_orders", True)
         )
@@ -1755,6 +1894,7 @@ class PlanGateExecAlgorithm(ExecutionAlgorithm):
         self._released_order_ids: set[str] = _BoundedFifoSet(MAX_TRACKED_ORDER_HISTORY)
         self._closed_cycle_entry_order_ids: set[str] = _BoundedFifoSet(MAX_TRACKED_ORDER_HISTORY)
         self._registered_strategies: List[Any] = []
+        self._close_callbacks: List[Callable[[], None]] = []
         self._telemetry_actor: Optional[Any] = None
         self._is_started: bool = False
         self._cached_trader_id: Optional[Any] = None
@@ -1779,9 +1919,8 @@ class PlanGateExecAlgorithm(ExecutionAlgorithm):
         *,
         telemetry_actor: Optional[Any] = None,
         oco_monitor: Optional[Any] = None,
-        forward_gate: Optional[PlanGateExecAlgorithm] = None,
     ) -> PlanGateExecAlgorithm:
-        _ = (backend, telemetry_actor, oco_monitor, forward_gate)
+        _ = (backend, telemetry_actor, oco_monitor)
         resolved_cfg = config or PlanGateExecAlgorithmConfig(
             exec_algorithm_id=PLAN_GATE_EXEC_ALGORITHM_ID,
         )
@@ -1904,7 +2043,8 @@ class PlanGateExecAlgorithm(ExecutionAlgorithm):
             tid = getattr(self, "trader_id", None)
             if tid is not None:
                 self._cached_trader_id = tid
-            return tid
+                return tid
+            return self._cached_trader_id
         except RuntimeError:
             return self._cached_trader_id
         except Exception:
@@ -1915,7 +2055,8 @@ class PlanGateExecAlgorithm(ExecutionAlgorithm):
             c = getattr(self, "cache", None)
             if c is not None:
                 self._cached_cache = c
-            return c
+                return c
+            return self._cached_cache
         except RuntimeError:
             return self._cached_cache
         except Exception:
@@ -1926,7 +2067,8 @@ class PlanGateExecAlgorithm(ExecutionAlgorithm):
             clk = getattr(self, "clock", None)
             if clk is not None:
                 self._cached_clock = clk
-            return clk
+                return clk
+            return self._cached_clock
         except RuntimeError:
             return self._cached_clock
         except Exception:
@@ -1942,11 +2084,24 @@ class PlanGateExecAlgorithm(ExecutionAlgorithm):
                 self._wire_oco_monitor_callback(oco)
 
     def _wire_oco_monitor_callback(self, oco_monitor: Any) -> None:
+        weak_self = weakref.ref(self)
+
+        def _weak_oco_freeze(symbol: str, reason: str) -> None:
+            gate = weak_self()
+            if gate is not None:
+                gate._on_protective_oco_freeze(symbol, reason)
+
         add_cb = getattr(oco_monitor, "add_entry_freeze_callback", None)
         if callable(add_cb):
-            add_cb(self._on_protective_oco_freeze)
+            add_cb(_weak_oco_freeze)
         elif getattr(oco_monitor, "_on_entry_freeze_callback", None) is None:
-            oco_monitor._on_entry_freeze_callback = self._on_protective_oco_freeze
+            oco_monitor._on_entry_freeze_callback = _weak_oco_freeze
+        reg_oco = getattr(self._backend, "register_oco_monitor", None)
+        if callable(reg_oco):
+            try:
+                reg_oco(oco_monitor)
+            except Exception:
+                pass
 
     def _on_protective_oco_freeze(self, symbol: str, reason: str) -> None:
         trigger_fn = getattr(self._backend, "trigger_protective_oco_freeze", None)
@@ -2071,8 +2226,194 @@ class PlanGateExecAlgorithm(ExecutionAlgorithm):
                 telemetry.on_start()
             except Exception:
                 pass
+        self._hydrate_open_entry_reservations()
+
+    def _hydrate_open_entry_reservations(self, target_event: Any = None) -> int:
+        """Hydrates `self._reservations` from reconciled open cache orders and active DB `orders` on startup."""
+        hydrated = 0
+        items_by_sym = getattr(self._backend, "_items_by_symbol", {}) or {}
+        cache = self._safe_cache()
+        if cache is not None:
+            try:
+                open_orders = list(cache.orders_open() or [])
+            except Exception:
+                open_orders = []
+            if target_event is not None:
+                try:
+                    ev_cid_obj = getattr(target_event, "client_order_id", None)
+                    if ev_cid_obj is not None:
+                        ev_order = cache.order(ev_cid_obj)
+                        if ev_order is not None and ev_order not in open_orders:
+                            open_orders.append(ev_order)
+                except Exception:
+                    pass
+            for order in open_orders:
+                cid = str(getattr(order, "client_order_id", "") or "").strip()
+                primary_cid = self._spawn_to_primary_cid.get(cid, cid)
+                if (
+                    not cid
+                    or cid in self._reservations
+                    or primary_cid in self._reservations
+                    or cid in self._released_order_ids
+                    or primary_cid in self._released_order_ids
+                    or cid in self._decisions
+                    or primary_cid in self._decisions
+                    or cid in self._closed_cycle_entry_order_ids
+                    or primary_cid in self._closed_cycle_entry_order_ids
+                    or cid in self._spawn_to_primary_cid
+                    or self._is_standalone_exit_order(order)
+                ):
+                    continue
+                cid_lower = cid.lower()
+                ord_type_str = str(getattr(order, "order_type", "") or "").upper()
+                if (
+                    cid_lower.startswith("prot_")
+                    or "exit" in cid_lower
+                    or "stop" in cid_lower
+                    or "flatten" in cid_lower
+                    or "close" in cid_lower
+                    or "STOP" in ord_type_str
+                ):
+                    continue
+                inst_id = getattr(order, "instrument_id", None)
+                sym = (
+                    str(inst_id.symbol).strip().upper()
+                    if hasattr(inst_id, "symbol")
+                    else str(inst_id or "").split(".", 1)[0].strip().upper()
+                )
+                qty_dec = self._extract_qty_decimal(getattr(order, "quantity", 0))
+                filled_dec = self._extract_qty_decimal(getattr(order, "filled_qty", 0))
+                leaves_dec = max(Decimal("0"), Decimal(int(round(float(qty_dec - filled_dec)))))
+                if not sym or qty_dec <= Decimal("0") or qty_dec <= filled_dec or leaves_dec <= Decimal("0"):
+                    continue
+                plan_item = items_by_sym.get(sym)
+                if plan_item is None:
+                    continue
+                ord_side_str = str(getattr(order, "side", "") or "").upper()
+                expected_side = (
+                    "BUY"
+                    if plan_item.risk_envelope.side == PlanSide.LONG
+                    else "SELL"
+                )
+                if not ord_side_str or expected_side not in ord_side_str:
+                    continue
+                self._reservations[cid] = _TrackedEntryReservation(
+                    client_order_id=cid,
+                    plan_id=plan_item.plan_id,
+                    item_id=plan_item.item_id,
+                    symbol=sym,
+                    reserved_qty=qty_dec,
+                    filled_qty=filled_dec,
+                )
+                hydrated += 1
+
+        dsn = getattr(self._backend, "_dsn", None)
+        td = getattr(self._backend, "_trading_date", None)
+        if dsn and td is not None:
+            try:
+                conn = psycopg2.connect(str(dsn), cursor_factory=RealDictCursor, connect_timeout=2)
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            SELECT order_id, symbol, action, order_type, qty, filled_qty, status
+                            FROM orders
+                            WHERE UPPER(COALESCE(status, '')) IN ('NEW', 'SUBMITTED', 'ACCEPTED', 'PARTIALLY_FILLED', 'PENDING_NEW', 'HELD')
+                              AND COALESCE((created_at AT TIME ZONE 'America/New_York')::date, %s) = %s
+                            """,
+                            (td, td),
+                        )
+                        rows = cur.fetchall() or []
+                finally:
+                    conn.close()
+                for row in rows:
+                    cid = str(row.get("order_id") or "").strip()
+                    sym = str(row.get("symbol") or "").strip().upper()
+                    primary_cid = self._spawn_to_primary_cid.get(cid, cid)
+                    if (
+                        not cid
+                        or not sym
+                        or cid in self._reservations
+                        or primary_cid in self._reservations
+                        or cid in self._released_order_ids
+                        or primary_cid in self._released_order_ids
+                        or cid in self._decisions
+                        or primary_cid in self._decisions
+                        or cid in self._closed_cycle_entry_order_ids
+                        or primary_cid in self._closed_cycle_entry_order_ids
+                        or cid in self._spawn_to_primary_cid
+                    ):
+                        continue
+                    cid_lower = cid.lower()
+                    ord_type_str = str(row.get("order_type") or "").strip().upper()
+                    if (
+                        cid_lower.startswith("prot_")
+                        or "exit" in cid_lower
+                        or "stop" in cid_lower
+                        or "flatten" in cid_lower
+                        or "close" in cid_lower
+                        or "STOP" in ord_type_str
+                    ):
+                        continue
+                    plan_item = items_by_sym.get(sym)
+                    if plan_item is None:
+                        continue
+                    act = str(row.get("action") or "").strip().upper()
+                    expected_act = "BUY" if plan_item.risk_envelope.side == PlanSide.LONG else "SELL"
+                    if act != expected_act:
+                        continue
+                    qty_dec = _to_decimal(row.get("qty") or 0, "qty")
+                    filled_dec = _to_decimal(row.get("filled_qty") or 0, "filled_qty")
+                    leaves_dec = max(Decimal("0"), Decimal(int(round(float(qty_dec - filled_dec)))))
+                    if qty_dec <= Decimal("0") or qty_dec <= filled_dec or leaves_dec <= Decimal("0"):
+                        continue
+                    self._reservations[cid] = _TrackedEntryReservation(
+                        client_order_id=cid,
+                        plan_id=plan_item.plan_id,
+                        item_id=plan_item.item_id,
+                        symbol=sym,
+                        reserved_qty=qty_dec,
+                        filled_qty=filled_dec,
+                    )
+                    hydrated += 1
+            except Exception as exc:
+                logger.error(
+                    "Failed to hydrate open entry reservations from PostgreSQL orders: %s",
+                    exc,
+                )
+                if getattr(self._backend, "_persist_to_db", False):
+                    try:
+                        self._backend.set_entry_freeze(
+                            True,
+                            f"ORDER_RESERVATION_HYDRATION_DB_ERROR:{exc}",
+                        )
+                    except Exception as freeze_exc:
+                        logger.error(
+                            "Failed to latch ENTRY_FREEZE after reservation hydration DB error: %s",
+                            freeze_exc,
+                        )
+        return hydrated
 
     def on_stop(self) -> None:
+        if self._safe_is_registered():
+            try:
+                self.unsubscribe_topic("events.order.*", self._on_order_event)
+            except Exception:
+                pass
+            try:
+                self.unsubscribe_topic("events.position.*", self._on_position_event)
+            except Exception:
+                pass
+        msgbus = self._cached_msgbus
+        if msgbus is not None and hasattr(msgbus, "unsubscribe"):
+            try:
+                msgbus.unsubscribe("events.order.*", self._on_order_event)
+            except Exception:
+                pass
+            try:
+                msgbus.unsubscribe("events.position.*", self._on_position_event)
+            except Exception:
+                pass
         flush_backend = getattr(self._backend, "flush", None)
         if callable(flush_backend):
             try:
@@ -2094,7 +2435,28 @@ class PlanGateExecAlgorithm(ExecutionAlgorithm):
                 pass
 
     def close(self) -> None:
+        for cb in list(self._close_callbacks):
+            try:
+                cb()
+            except Exception:
+                pass
+        self._close_callbacks.clear()
+        for strat in list(self._registered_strategies):
+            try:
+                strat._cached_order_factory = None
+                strat._cached_clock = None
+                strat._telemetry_actor_ref = None
+                strat._plan_gate_ref = None
+                strat._warmup_loader = None
+            except Exception:
+                pass
+        self._registered_strategies.clear()
+        self._cached_cache = None
+        self._cached_clock = None
+        self._cached_msgbus = None
         telemetry = self._telemetry_actor
+        self._telemetry_actor = None
+        self._oco_monitor = None
         if telemetry is not None:
             close_tel = getattr(telemetry, "close", None)
             if callable(close_tel):
@@ -2193,17 +2555,7 @@ class PlanGateExecAlgorithm(ExecutionAlgorithm):
                     collar_market_order=effective_collar_market,
                     allow_uncollared_market_order=False,
                 )
-            if self._forward_gate is not None:
-                self._sync_forward_gate_runtime()
-                decision = self._forward_gate.evaluate_order(
-                    entry_order,
-                    inferred_stop_loss_price=inferred_list_stop_px,
-                    collar_market_order=(
-                        effective_collar_market if has_contingency_children else None
-                    ),
-                )
-            else:
-                decision = self._backend.evaluate_and_reserve(request)
+            decision = self._backend.evaluate_and_reserve(request)
             entry_cid = str(entry_order.client_order_id)
             self._record_decision_audit(
                 entry_cid,
@@ -2216,8 +2568,6 @@ class PlanGateExecAlgorithm(ExecutionAlgorithm):
                 for prev_order, prev_req, prev_dec in admitted_entries:
                     prev_cid = str(prev_order.client_order_id)
                     self._reservations.pop(prev_cid, None)
-                    if self._forward_gate is not None:
-                        self._forward_gate._reservations.pop(prev_cid, None)
                     self._backend.release_reservation(
                         prev_req.symbol,
                         prev_req.quantity,
@@ -2238,15 +2588,6 @@ class PlanGateExecAlgorithm(ExecutionAlgorithm):
                     cid = str(child_order.client_order_id)
                     if cid not in self._decisions or self._decisions[cid].allowed:
                         self._record_decision_audit(
-                            cid,
-                            deny_decision,
-                            order=child_order,
-                        )
-                    if self._forward_gate is not None and (
-                        cid not in self._forward_gate._decisions
-                        or self._forward_gate._decisions[cid].allowed
-                    ):
-                        self._forward_gate._record_decision_audit(
                             cid,
                             deny_decision,
                             order=child_order,
@@ -2273,13 +2614,6 @@ class PlanGateExecAlgorithm(ExecutionAlgorithm):
                 prot_dec,
                 order=prot_order,
             )
-            if self._forward_gate is not None:
-                self._forward_gate._record_decision_audit(
-                    prot_cid,
-                    prot_dec,
-                    order=prot_order,
-                )
-                self._forward_gate._cache_telemetry_order(prot_order)
 
         for child_order in resolved_orders:
             cid = str(child_order.client_order_id)
@@ -2302,27 +2636,11 @@ class PlanGateExecAlgorithm(ExecutionAlgorithm):
                 spawn_cid = str(spawned.client_order_id)
                 self._spawn_to_primary_cid[spawn_cid] = cid
                 self._decisions[spawn_cid] = child_decision
-                if self._forward_gate is not None:
-                    self._forward_gate._spawn_to_primary_cid[spawn_cid] = cid
-                    self._forward_gate._decisions[spawn_cid] = child_decision
-                    self._forward_gate._cache_telemetry_order(spawned)
                 self._cache_telemetry_order(spawned)
                 self._safe_submit_order(spawned)
             else:
-                if self._forward_gate is not None:
-                    self._forward_gate._cache_telemetry_order(child_order)
                 self._cache_telemetry_order(child_order)
                 self._safe_submit_order(child_order)
-
-    def _sync_forward_gate_runtime(self) -> None:
-        if self._forward_gate is None:
-            return
-        c = self._safe_cache()
-        clk = self._safe_clock()
-        if c is not None:
-            self._forward_gate._cached_cache = c
-        if clk is not None:
-            self._forward_gate._cached_clock = clk
 
     def evaluate_order(
         self,
@@ -2494,17 +2812,73 @@ class PlanGateExecAlgorithm(ExecutionAlgorithm):
             if "not registered" not in msg and "already borrowed" not in msg:
                 raise
 
+    def _check_exit_position_bounds(
+        self,
+        instrument_id: Any,
+        order_side: OrderSide,
+        order_qty: Decimal,
+    ) -> Optional[str]:
+        cache = self._safe_cache()
+        if cache is None:
+            return None
+        try:
+            positions_open = list(cache.positions_open(instrument_id=instrument_id) or [])
+            if positions_open:
+                net_signed = Decimal("0")
+                for pos in positions_open:
+                    net_signed += Decimal(str(pos.signed_qty))
+                if order_side == OrderSide.SELL and (
+                    net_signed <= Decimal("0") or order_qty > net_signed
+                ):
+                    return "EXIT_POSITION_MISMATCH: exit order exceeds or opposes open position"
+                if order_side == OrderSide.BUY and (
+                    net_signed >= Decimal("0") or order_qty > abs(net_signed)
+                ):
+                    return "EXIT_POSITION_MISMATCH: exit order exceeds or opposes open position"
+                return None
+            positions_closed_fn = getattr(cache, "positions_closed", None)
+            if callable(positions_closed_fn):
+                closed = list(positions_closed_fn(instrument_id=instrument_id) or [])
+                if closed:
+                    return "EXIT_POSITION_ALREADY_CLOSED: position already closed before exit submission"
+        except Exception:
+            return None
+        return None
+
     def _evaluate_and_route_single_order(self, order: Any) -> PlanGateDecision:
         self._refresh_runtime_handles()
         self._resolve_telemetry_actor()
         self._cache_telemetry_order(order)
         request = self._build_order_request(order)
-        if self._forward_gate is not None:
-            self._sync_forward_gate_runtime()
-            decision = self._forward_gate.evaluate_order(order)
-        else:
-            decision = self._backend.evaluate_and_reserve(request)
         cid = str(order.client_order_id)
+        if request.is_exit_intent and getattr(order, "order_type", None) in (
+            OrderType.MARKET,
+            OrderType.LIMIT,
+            OrderType.MARKET_TO_LIMIT,
+        ):
+            exit_violation = self._check_exit_position_bounds(
+                order.instrument_id,
+                order.side,
+                request.quantity,
+            )
+            if exit_violation is not None:
+                denied_decision = PlanGateDecision(
+                    allowed=False,
+                    reason=exit_violation,
+                    is_exit_bypass=False,
+                    derived_limit_price=None,
+                    item_id=None,
+                    plan_id=None,
+                )
+                self._record_decision_audit(
+                    cid,
+                    denied_decision,
+                    order=order,
+                    request=request,
+                )
+                self._safe_deny_order(order, exit_violation)
+                return denied_decision
+        decision = self._backend.evaluate_and_reserve(request)
         self._record_decision_audit(
             cid,
             decision,
@@ -2534,15 +2908,9 @@ class PlanGateExecAlgorithm(ExecutionAlgorithm):
             spawn_cid = str(spawned.client_order_id)
             self._spawn_to_primary_cid[spawn_cid] = cid
             self._decisions[spawn_cid] = decision
-            if self._forward_gate is not None:
-                self._forward_gate._spawn_to_primary_cid[spawn_cid] = cid
-                self._forward_gate._decisions[spawn_cid] = decision
-                self._forward_gate._cache_telemetry_order(spawned)
             self._cache_telemetry_order(spawned)
             self._safe_submit_order(spawned)
         else:
-            if self._forward_gate is not None:
-                self._forward_gate._cache_telemetry_order(order)
             self._cache_telemetry_order(order)
             self._safe_submit_order(order)
         return decision
@@ -2554,13 +2922,11 @@ class PlanGateExecAlgorithm(ExecutionAlgorithm):
     def _on_order_event(self, event: Any) -> None:
         if event is None:
             return
-        if self._forward_gate is not None:
-            self._sync_forward_gate_runtime()
-            self._forward_gate.on_order_event(event)
-            return
         cls_name = type(event).__name__
         if cls_name == "OrderFilled":
             self.on_order_filled(event)
+        elif cls_name == "OrderUpdated":
+            self.on_order_updated(event)
         elif cls_name in ("OrderCanceled", "OrderCancelled"):
             self.on_order_canceled(event)
         elif cls_name == "OrderRejected":
@@ -2574,6 +2940,41 @@ class PlanGateExecAlgorithm(ExecutionAlgorithm):
             if telemetry is not None:
                 telemetry.on_order_event(event)
 
+    def on_order_updated(self, event: Any) -> None:
+        """Adjust active entry reservation when an open entry order quantity is modified."""
+        self._modified_orders.append(event)
+        telemetry = self._resolve_telemetry_actor()
+        if telemetry is not None:
+            if hasattr(telemetry, "on_order_updated"):
+                telemetry.on_order_updated(event)
+            else:
+                telemetry.on_order_event(event)
+        cid = self._resolve_event_client_order_id(event)
+        if not cid:
+            return
+        primary_cid = self._spawn_to_primary_cid.get(cid, cid)
+        reservation = self._reservations.get(primary_cid)
+        if reservation is None:
+            return
+        qty_obj = getattr(event, "quantity", None)
+        if qty_obj is None:
+            return
+        new_qty = self._extract_qty_decimal(qty_obj)
+        if new_qty <= Decimal("0") or new_qty >= reservation.reserved_qty:
+            return
+        eff_new_qty = max(reservation.filled_qty, new_qty)
+        release_delta = max(Decimal("0"), reservation.reserved_qty - eff_new_qty)
+        reservation.reserved_qty = eff_new_qty
+        if release_delta > Decimal("0"):
+            self._backend.release_reservation(
+                reservation.symbol,
+                release_delta,
+                plan_id=reservation.plan_id,
+                item_id=reservation.item_id,
+                release_qty=release_delta,
+                reason="ORDER_UPDATED_QTY_REDUCED",
+            )
+
     def on_position_event(self, event: Any) -> None:
         """Handle generic position lifecycle events forwarded to `PlanGateExecAlgorithm`."""
         self._on_position_event(event)
@@ -2581,14 +2982,18 @@ class PlanGateExecAlgorithm(ExecutionAlgorithm):
     def _on_position_event(self, event: Any) -> None:
         if event is None:
             return
-        if self._forward_gate is not None:
-            self._sync_forward_gate_runtime()
-            self._forward_gate.on_position_event(event)
-            return
+        cls_name = type(event).__name__
         telemetry = self._resolve_telemetry_actor()
         if telemetry is not None:
-            telemetry.on_position_event(event)
-        if type(event).__name__ == "PositionClosed":
+            if cls_name == "PositionOpened" and hasattr(telemetry, "on_position_opened"):
+                telemetry.on_position_opened(event)
+            elif cls_name == "PositionChanged" and hasattr(telemetry, "on_position_changed"):
+                telemetry.on_position_changed(event)
+            elif cls_name == "PositionClosed" and hasattr(telemetry, "on_position_closed"):
+                telemetry.on_position_closed(event)
+            else:
+                telemetry.on_position_event(event)
+        if cls_name == "PositionClosed":
             inst_id = getattr(event, "instrument_id", None)
             sym = (
                 str(inst_id.symbol)
@@ -2604,9 +3009,9 @@ class PlanGateExecAlgorithm(ExecutionAlgorithm):
         instrument_id: Optional[Any] = None,
         item_id: Optional[UUID | str] = None,
     ) -> None:
-        """Releases closed-cycle entry reservations when a position closes flat on a multi-cycle snapshot backend."""
-        if not bool(getattr(self._backend, "_allow_multi_cycle_reentry", False)):
-            return
+        """Releases closed-cycle entry reservations when a position closes flat on a multi-cycle snapshot backend,
+        or locks out residual single-cycle entry quota when `_allow_multi_cycle_reentry` is False.
+        """
         release_fn = getattr(self._backend, "release_closed_position_capacity", None)
         if not callable(release_fn):
             return
@@ -2642,6 +3047,9 @@ class PlanGateExecAlgorithm(ExecutionAlgorithm):
                     return
             except Exception:
                 pass
+        if not bool(getattr(self._backend, "_allow_multi_cycle_reentry", False)):
+            release_fn(norm_sym, item_id=item_id)
+            return
         if cache is not None:
             try:
                 orders_iter = (
@@ -2707,7 +3115,6 @@ class PlanGateExecAlgorithm(ExecutionAlgorithm):
             )
         if reservation.filled_qty >= reservation.reserved_qty:
             self._reservations.pop(primary_cid, None)
-            self._spawn_to_primary_cid.pop(cid, None)
 
     def on_order_canceled(self, event: Any) -> None:
         """Release unfilled reserved entry capacity when an admitted order is canceled."""
@@ -2747,7 +3154,20 @@ class PlanGateExecAlgorithm(ExecutionAlgorithm):
         cid = self._resolve_event_client_order_id(event)
         if not cid:
             return
-        primary_cid = self._spawn_to_primary_cid.pop(cid, cid)
+        cid_lower = cid.lower()
+        primary_cid = self._spawn_to_primary_cid.get(cid, cid)
+        if (
+            primary_cid not in self._reservations
+            and primary_cid not in self._released_order_ids
+            and primary_cid not in self._decisions
+            and primary_cid not in self._closed_cycle_entry_order_ids
+            and not cid_lower.startswith("prot_")
+            and "exit" not in cid_lower
+            and "stop" not in cid_lower
+            and "flatten" not in cid_lower
+            and "close" not in cid_lower
+        ):
+            self._hydrate_open_entry_reservations(target_event=event)
         self._released_order_ids.add(cid)
         self._released_order_ids.add(primary_cid)
         reservation = self._reservations.pop(primary_cid, None)
@@ -3066,21 +3486,36 @@ class PlanGateExecAlgorithm(ExecutionAlgorithm):
             else 0
         )
         try:
-            for cached_order in cache.orders(instrument_id=instrument_id):
+            cached_orders = list(cache.orders(instrument_id=instrument_id) or [])
+            replaced_primaries: set[str] = set(self._spawn_to_primary_cid.values())
+            for ord_obj in cached_orders:
+                ord_cid = str(getattr(ord_obj, "client_order_id", "") or "")
+                exec_spawn_id = str(getattr(ord_obj, "exec_spawn_id", "") or "")
+                if exec_spawn_id and exec_spawn_id != ord_cid:
+                    replaced_primaries.add(exec_spawn_id)
+
+            for cached_order in cached_orders:
                 cid = str(cached_order.client_order_id)
-                if cid == current_client_order_id or cid in self._closed_cycle_entry_order_ids:
+                spawn_parent = self._spawn_to_primary_cid.get(cid) or str(
+                    getattr(cached_order, "exec_spawn_id", "") or ""
+                )
+                if spawn_parent == cid:
+                    spawn_parent = ""
+                if (
+                    cid == current_client_order_id
+                    or (spawn_parent and spawn_parent == current_client_order_id)
+                    or cid in self._closed_cycle_entry_order_ids
+                    or (spawn_parent and spawn_parent in self._closed_cycle_entry_order_ids)
+                    or cid in replaced_primaries
+                ):
                     continue
                 if getattr(cached_order, "is_reduce_only", False):
                     continue
                 if cached_order.side != order_side:
                     continue
-                if (
-                    getattr(cached_order, "is_spawned", False)
-                    or cid in self._spawn_to_primary_cid
-                    or bool(getattr(cached_order, "exec_spawn_id", None))
-                ):
-                    continue
-                prior_decision = self._decisions.get(cid)
+                prior_decision = self._decisions.get(cid) or (
+                    self._decisions.get(spawn_parent) if spawn_parent else None
+                )
                 if prior_decision is not None and prior_decision.is_exit_bypass:
                     continue
                 order_params: Mapping[str, Any] = (
@@ -3149,7 +3584,10 @@ class PlanGateExecAlgorithm(ExecutionAlgorithm):
                             continue
                 f_qty = Decimal(str(cached_order.filled_qty.as_decimal()))
                 filled_qty += f_qty
-                if cached_order.is_open and cid not in self._released_order_ids:
+                is_released = cid in self._released_order_ids or (
+                    bool(spawn_parent) and spawn_parent in self._released_order_ids
+                )
+                if cached_order.is_open and not is_released:
                     l_qty = Decimal(str(cached_order.leaves_qty.as_decimal()))
                     open_qty += l_qty
         except Exception:

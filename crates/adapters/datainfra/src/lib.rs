@@ -70,8 +70,7 @@ pub use mapping::{
 };
 pub use kafka::{
     CanonicalWireFrame, DEFAULT_SIP_KAFKA_TOPICS, KafkaBrokerEnvelope, KafkaEnvelopePayload,
-    KafkaMarketStreamDecoder, KafkaPayloadFrame, KafkaPayloadSource, TcpKafkaPayloadSource,
-    parse_broker_wire_frame,
+    KafkaPayloadFrame, KafkaPayloadSource, TcpKafkaPayloadSource,
 };
 pub use stream::{
     BarStreamVersionTracker, CanonicalBarWire, CanonicalQuoteWire, CanonicalStreamDecoder,

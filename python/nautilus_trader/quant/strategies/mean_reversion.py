@@ -163,9 +163,11 @@ class MeanReversionStrategy(BaseArchetypeStrategy):
                 stop_px = self._resolve_entry_stop_price(
                     close_px, close_px - (atr_mult * atr)
                 )
+                prev_stop = self._trailing_stop_price
+                prev_anchor = self._anchor_target
                 self._trailing_stop_price = stop_px
                 self._anchor_target = vwap_anchor
-                self._submit_plan_gated_entry(
+                cid = self._submit_plan_gated_entry(
                     order_side=OrderSide.BUY,
                     reference_price=close_px,
                     atr=atr,
@@ -173,14 +175,19 @@ class MeanReversionStrategy(BaseArchetypeStrategy):
                     stop_loss_price=stop_px,
                     tags=["MEAN_REVERSION_LONG_ENTRY"],
                 )
+                if not cid or self._is_order_denied_or_rejected(cid):
+                    self._trailing_stop_price = prev_stop
+                    self._anchor_target = prev_anchor
         elif cfg.plan_side == PlanSide.SHORT:
             if z_quantile >= entry_q and mad_z > 0.0:
                 stop_px = self._resolve_entry_stop_price(
                     close_px, close_px + (atr_mult * atr)
                 )
+                prev_stop = self._trailing_stop_price
+                prev_anchor = self._anchor_target
                 self._trailing_stop_price = stop_px
                 self._anchor_target = vwap_anchor
-                self._submit_plan_gated_entry(
+                cid = self._submit_plan_gated_entry(
                     order_side=OrderSide.SELL,
                     reference_price=close_px,
                     atr=atr,
@@ -188,3 +195,6 @@ class MeanReversionStrategy(BaseArchetypeStrategy):
                     stop_loss_price=stop_px,
                     tags=["MEAN_REVERSION_SHORT_ENTRY"],
                 )
+                if not cid or self._is_order_denied_or_rejected(cid):
+                    self._trailing_stop_price = prev_stop
+                    self._anchor_target = prev_anchor

@@ -270,3 +270,56 @@ pub fn timeframe_step_ns(bar_type: &BarType) -> u64 {
 pub fn bar_type_step_ns(bar_type: &BarType) -> u64 {
     timeframe_step_ns(bar_type)
 }
+
+/// Returns `true` if `date` is a scheduled NYSE 13:00 ET early-close half-day
+/// (Day after Thanksgiving, July 3 when Mon-Fri, or Dec 24 when Mon-Fri).
+#[must_use]
+pub fn is_nyse_early_close_date(date: jiff::civil::Date) -> bool {
+    let is_weekday = !matches!(
+        date.weekday(),
+        jiff::civil::Weekday::Saturday | jiff::civil::Weekday::Sunday
+    );
+    let is_black_friday = date.month() == 11
+        && date.weekday() == jiff::civil::Weekday::Friday
+        && (23..=29).contains(&date.day());
+    let is_july_3_early = date.month() == 7 && date.day() == 3 && is_weekday;
+    let is_dec_24_early = date.month() == 12 && date.day() == 24 && is_weekday;
+    is_black_friday || is_july_3_early || is_dec_24_early
+}
+
+/// Returns `(rth_open_ns, rth_close_ns)` in `America/New_York` for the date containing `bar_open_ns`.
+#[must_use]
+pub fn rth_day_bounds_ns(bar_open_ns: u64) -> Option<(u64, u64)> {
+    let ts = jiff::Timestamp::from_nanosecond(i128::from(bar_open_ns)).ok()?;
+    let ny = ts.in_tz("America/New_York").ok()?;
+    let date = ny.date();
+    let close_hour = if is_nyse_early_close_date(date) {
+        13
+    } else {
+        16
+    };
+    let open_zoned = date.at(9, 30, 0, 0).in_tz("America/New_York").ok()?;
+    let close_zoned = date
+        .at(close_hour, 0, 0, 0)
+        .in_tz("America/New_York")
+        .ok()?;
+    let open_ns = u64::try_from(open_zoned.timestamp().as_nanosecond()).ok()?;
+    let close_ns = u64::try_from(close_zoned.timestamp().as_nanosecond()).ok()?;
+    Some((open_ns, close_ns))
+}
+
+/// Computes the canonical bar-close timestamp (`ts_event`) in nanoseconds for `bar_open_ns`,
+/// clamping RTH `1h`/`4h`/`1d` buckets to the NYSE RTH session close (`16:00 ET` or `13:00 ET` on half-days).
+#[must_use]
+pub fn compute_rth_bar_close_ns(bar_type: &BarType, bar_open_ns: u64) -> u64 {
+    let step_ns = timeframe_step_ns(bar_type);
+    let natural_close_ns = bar_open_ns.saturating_add(step_ns);
+    if (3_600_000_000_000..=86_400_000_000_000).contains(&step_ns)
+        && let Some((rth_open_ns, rth_close_ns)) = rth_day_bounds_ns(bar_open_ns)
+        && bar_open_ns >= rth_open_ns
+        && bar_open_ns < rth_close_ns
+    {
+        return natural_close_ns.min(rth_close_ns);
+    }
+    natural_close_ns
+}

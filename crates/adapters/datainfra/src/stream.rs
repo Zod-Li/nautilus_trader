@@ -63,6 +63,9 @@ pub const DEFAULT_VERSION_TRACKER_CAPACITY: usize = 4_096;
 /// Strongly typed wire representation of `sip-feeder` `CanonicalBar` JSON frames.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CanonicalBarWire {
+    /// Market identifier (e.g. `"US"`).
+    #[serde(default = "default_market")]
+    pub market: String,
     /// Ticker symbol (e.g. `"AAPL"`).
     pub symbol: String,
     /// Timeframe string (e.g. `"1m"`, `"15m"`).
@@ -100,6 +103,9 @@ pub struct CanonicalBarWire {
     /// Market session (`"PRE_MARKET"`, `"REGULAR"`, `"POST_MARKET"`).
     #[serde(default)]
     pub session: String,
+    /// Ingestion origin (`"REALTIME"` or `"EOD_SYNC"`).
+    #[serde(default = "default_origin")]
+    pub origin: String,
     /// Upstream data provider identifier.
     #[serde(default)]
     pub provider: String,
@@ -113,6 +119,14 @@ pub struct CanonicalBarWire {
 
 const fn default_bar_version() -> u32 {
     1
+}
+
+fn default_market() -> String {
+    "US".to_string()
+}
+
+fn default_origin() -> String {
+    "REALTIME".to_string()
 }
 
 impl CanonicalBarWire {
@@ -163,6 +177,9 @@ impl CanonicalBarWire {
 /// Strongly typed wire representation of `sip-feeder` `CanonicalQuote` JSON frames.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CanonicalQuoteWire {
+    /// Market identifier (e.g. `"US"`).
+    #[serde(default = "default_market")]
+    pub market: String,
     /// Ticker symbol (e.g. `"AAPL"`).
     pub symbol: String,
     /// Quote event timestamp in milliseconds (`quote_ts_ms`).
@@ -248,6 +265,9 @@ impl CanonicalQuoteWire {
 /// Strongly typed wire representation of `sip-feeder` `CanonicalTradingStatus` JSON frames.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CanonicalTradingStatusWire {
+    /// Market identifier (e.g. `"US"`).
+    #[serde(default = "default_market")]
+    pub market: String,
     /// Ticker symbol (e.g. `"AAPL"`).
     pub symbol: String,
     /// Status event timestamp in milliseconds (`status_ts_ms`).
@@ -714,9 +734,3 @@ impl KafkaStreamSessionCoordinator {
         self.decoder.decode_topic_payload(topic, payload)
     }
 }
-
-pub use crate::kafka::{
-    CanonicalWireFrame, DEFAULT_SIP_KAFKA_TOPICS, KafkaBrokerEnvelope, KafkaEnvelopePayload,
-    KafkaMarketStreamDecoder, KafkaPayloadFrame, KafkaPayloadSource, TcpKafkaPayloadSource,
-    parse_broker_wire_frame,
-};

@@ -66,8 +66,8 @@ use nautilus_datainfra::{
     DATAINFRA, DATAINFRA_CATALOG_FACTORY_NAME, DEFAULT_CALENDAR_MARKET, DataInfraCatalog,
     DataInfraConfig, DataInfraDataClient, DataInfraDataClientFactory, DataInfraEquityMetadata,
     DataInfraError, DataInfraResult, HttpCalendarTransport, HttpClickHouseArrowTransport,
-    KafkaPayloadFrame, KafkaPayloadSource, StreamDecodeOutcome, StreamLifecycleListener,
-    TOPIC_SIP_BARS_1M, TOPIC_SIP_QUOTES, TOPIC_SIP_STATUSES, parse_broker_wire_frame,
+    KafkaBrokerEnvelope, KafkaPayloadFrame, KafkaPayloadSource, StreamDecodeOutcome,
+    StreamLifecycleListener, TOPIC_SIP_BARS_1M, TOPIC_SIP_QUOTES, TOPIC_SIP_STATUSES,
     parse_datainfra_bar_type, to_instrument_id,
 };
 use nautilus_model::{
@@ -564,7 +564,26 @@ async fn test_datainfra_catalog_reader_query_batch_session_missing_intervals_and
     let mut catalog = DataInfraCatalog::from_config(cfg).expect("create DataInfraCatalog");
 
     let start_ns = UnixNanos::from(1_699_999_000_000_000_000_u64);
-    let end_ns = UnixNanos::from(1_700_003_000_000_000_000_u64);
+    let mid_bucket_end_ns = UnixNanos::from(1_700_003_000_000_000_000_u64);
+    let end_ns = UnixNanos::from(1_700_003_600_000_000_000_u64);
+
+    // 0. Mid-bucket query (`mid_bucket_end_ns = 1_700_003_000s`) must filter out the unclosed 4th 15m bar
+    //    whose open is `1_700_002_700s` and close is `1_700_003_600s > mid_bucket_end_ns`.
+    let mid_bucket_query = CatalogQuery::new(NautilusDataType::Bar)
+        .with_identifiers(Some(vec!["AAPL.ALPACA-15-MINUTE-LAST-EXTERNAL".to_string()]))
+        .with_range(Some(start_ns), Some(mid_bucket_end_ns));
+    let mid_batch = catalog
+        .query_batch(&mid_bucket_query)
+        .expect("query_batch mid-bucket bars");
+    let mid_bars_vec: Vec<Bar> = match mid_batch {
+        DataBatch::Bar(bars) => bars.to_vec(),
+        other => panic!("expected DataBatch::Bar, got {other:?}"),
+    };
+    assert_eq!(
+        mid_bars_vec.len(),
+        3,
+        "unclosed in-progress 15m bar (close_ns > end_ns) must be filtered out"
+    );
 
     // 1. `query_batch` for Bars with full BarType identifier `"AAPL.ALPACA-15-MINUTE-LAST-EXTERNAL"`
     let bar_query = CatalogQuery::new(NautilusDataType::Bar)
@@ -1128,7 +1147,7 @@ async fn test_datainfra_data_client_connect_fail_closed_subscriptions_requests_a
         observer.clone(),
     )
     .expect("create DataInfraDataClient")
-    .with_payload_source(Arc::new(IdleKafkaPayloadSource));
+    .with_kafka_source(Arc::new(IdleKafkaPayloadSource));
 
     // A. First `connect()` must fail closed because calendar-service returned HTTP 500
     let err_connect = client
@@ -1496,9 +1515,22 @@ impl KafkaPayloadSource for EphemeralTcpWireKafkaSource {
                 let trimmed = line.trim();
                 if trimmed.is_empty() {
                     Ok(None)
+                } else if let Some((topic, json_part)) = trimmed.split_once('\t') {
+                    Ok(Some(KafkaPayloadFrame::new(
+                        topic.trim(),
+                        json_part.trim().as_bytes().to_vec(),
+                    )))
+                } else if let Ok(envelope) = serde_json::from_str::<KafkaBrokerEnvelope>(trimmed) {
+                    let payload_bytes = envelope.payload.into_payload_bytes()?;
+                    Ok(Some(KafkaPayloadFrame::new(
+                        envelope.topic.trim(),
+                        payload_bytes,
+                    )))
                 } else {
-                    let frame = parse_broker_wire_frame(trimmed.as_bytes())?;
-                    Ok(Some(frame))
+                    Ok(Some(KafkaPayloadFrame::new(
+                        TOPIC_SIP_BARS_1M,
+                        trimmed.as_bytes().to_vec(),
+                    )))
                 }
             }
             Ok(Err(e)) => {
@@ -1814,7 +1846,7 @@ async fn test_datainfra_data_client_ephemeral_tcp_kafka_broker_e2e_async_streami
         observer.clone(),
     )
     .expect("create DataInfraDataClient")
-    .with_payload_source(Arc::new(EphemeralTcpWireKafkaSource::new(
+    .with_kafka_source(Arc::new(EphemeralTcpWireKafkaSource::new(
         kafka_addr.to_string(),
     )));
 
@@ -1973,4 +2005,496 @@ async fn test_datainfra_data_client_ephemeral_tcp_kafka_broker_e2e_async_streami
     let _ = broker_done_tx.send(());
     kafka_broker_task.await.expect("kafka broker task finished");
     cal_server.await.expect("calendar server finished");
+}
+
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_finding14_query_last_timestamp_bounded_and_request_bars_quotes_tail_limit() {
+    // Build DESC-ordered batches (newest first, as ClickHouse returns when `ORDER BY ... DESC` is used)
+    let bars_batch_desc = build_v_quant_bars_record_batch(
+        &["AAPL", "AAPL", "AAPL"],
+        &["15m", "15m", "15m"],
+        &[1_700_001_800, 1_700_000_900, 1_700_000_000],
+        &[
+            (187.00, 188.00, 186.50, 187.50, 160_000.0),
+            (185.75, 186.80, 185.50, 186.50, 140_000.0),
+            (185.00, 186.00, 184.50, 185.75, 120_000.0),
+        ],
+        &[
+            (187.00, 188.00, 186.50, 187.50, 160_000.0),
+            (185.75, 186.80, 185.50, 186.50, 140_000.0),
+            (185.00, 186.00, 184.50, 185.75, 120_000.0),
+        ],
+        &[false, false, false],
+        &[false, false, false],
+        None,
+    );
+    let bars_ipc = encode_batches_to_arrow_ipc_stream(&[bars_batch_desc]);
+
+    let quotes_batch_desc = build_quotes_record_batch(
+        &["AAPL", "AAPL", "AAPL"],
+        &[
+            1_700_000_300_000_000_000,
+            1_700_000_200_000_000_000,
+            1_700_000_100_000_000_000,
+        ],
+        &[187.40, 186.40, 185.40],
+        &[187.50, 186.50, 185.50],
+        &[300.0, 200.0, 100.0],
+        &[400.0, 300.0, 200.0],
+    );
+    let quotes_ipc = encode_batches_to_arrow_ipc_stream(&[quotes_batch_desc]);
+
+    let statuses_batch_desc = build_statuses_record_batch(
+        &["AAPL", "AAPL"],
+        &[1_700_000_500_000_000_000, 1_700_000_100_000_000_000],
+        &["TRADING", "HALTED"],
+        &[None, Some("LULD_T5")],
+    );
+    let statuses_ipc = encode_batches_to_arrow_ipc_stream(&[statuses_batch_desc]);
+
+    let captured_requests: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let captured_srv = Arc::clone(&captured_requests);
+
+    let ch_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ClickHouse listener");
+    let ch_addr = ch_listener.local_addr().unwrap();
+
+    let ch_server = tokio::spawn(async move {
+        while let Ok((mut socket, _)) = ch_listener.accept().await {
+            let raw_req = read_http_request(&mut socket).await;
+            captured_srv.lock().push(raw_req.clone());
+            if raw_req.contains("v_quant_bars") {
+                write_http_response(
+                    &mut socket,
+                    "200 OK",
+                    "application/vnd.apache.arrow.stream",
+                    &bars_ipc,
+                )
+                .await;
+            } else if raw_req.contains("sip_raw_quotes") {
+                write_http_response(
+                    &mut socket,
+                    "200 OK",
+                    "application/vnd.apache.arrow.stream",
+                    &quotes_ipc,
+                )
+                .await;
+            } else if raw_req.contains("sip_trading_statuses") {
+                write_http_response(
+                    &mut socket,
+                    "200 OK",
+                    "application/vnd.apache.arrow.stream",
+                    &statuses_ipc,
+                )
+                .await;
+            } else {
+                write_http_response(&mut socket, "400 Bad Request", "text/plain", b"Bad SQL")
+                    .await;
+            }
+        }
+    });
+
+    let cfg = make_test_config(
+        &format!("http://{ch_addr}"),
+        "http://127.0.0.1:8012",
+        "ALPACA",
+    );
+
+    // 1. Verify `DataInfraCatalog::query_last_timestamp` sends bounded `LIMIT 1` / `per_symbol_limit=1` queries
+    let mut catalog = DataInfraCatalog::from_config(cfg.clone()).expect("create DataInfraCatalog");
+    let last_bar_ts = catalog
+        .query_last_timestamp(
+            NautilusDataType::Bar,
+            Some("AAPL.ALPACA-15-MINUTE-LAST-EXTERNAL"),
+        )
+        .expect("query_last_timestamp Bar");
+    assert_eq!(last_bar_ts, Some(1_700_002_700_000_000_000_u64));
+
+    let last_quote_ts = catalog
+        .query_last_timestamp(NautilusDataType::QuoteTick, Some("AAPL.ALPACA"))
+        .expect("query_last_timestamp QuoteTick");
+    assert_eq!(last_quote_ts, Some(1_700_000_300_000_000_000_u64));
+
+    let last_status_ts = catalog
+        .query_last_timestamp(NautilusDataType::InstrumentStatus, Some("AAPL.ALPACA"))
+        .expect("query_last_timestamp InstrumentStatus");
+    assert_eq!(last_status_ts, Some(1_700_000_500_000_000_000_u64));
+
+    {
+        let reqs = captured_requests.lock();
+        assert_eq!(reqs.len(), 3);
+        assert!(reqs[0].contains("param_per_symbol_limit=1"));
+        assert!(reqs[0].contains("ORDER BY bar_start_time DESC, symbol ASC"));
+        assert!(reqs[0].contains("LIMIT {per_symbol_limit:UInt32} BY symbol"));
+
+        assert!(reqs[1].contains("param_limit_rows=1"));
+        assert!(reqs[1].contains("ORDER BY event_time DESC, symbol ASC LIMIT {limit_rows:UInt32}"));
+
+        assert!(reqs[2].contains("param_limit_rows=1"));
+        assert!(reqs[2].contains("ORDER BY event_time DESC, symbol ASC LIMIT {limit_rows:UInt32}"));
+    }
+
+    // 2. Verify `DataInfraDataClient::request_bars` and `request_quotes` with `limit = 2`
+    //    sort ascending and retain the tail 2 items (newest 2 in chronological order)
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    let sender = EventSender::from(tx);
+    let ch_transport = Arc::new(HttpClickHouseArrowTransport::new(cfg.clone()).unwrap());
+    let cal_gate = CalendarSessionGate::from_config(&cfg).unwrap();
+    let observer = Arc::new(RecordingLifecycleObserver::default());
+
+    let client = DataInfraDataClient::with_transports_and_listener(
+        ClientId::from(DATAINFRA),
+        cfg,
+        ch_transport,
+        cal_gate,
+        Some(sender),
+        observer,
+    )
+    .expect("create DataInfraDataClient")
+    .with_kafka_source(Arc::new(IdleKafkaPayloadSource));
+
+    let aapl_id = to_instrument_id("AAPL", "ALPACA").unwrap();
+    let aapl_15m_bar_type = parse_datainfra_bar_type("AAPL", "ALPACA", "15m").unwrap();
+
+    client
+        .request_bars(RequestBars::new(
+            vec![aapl_15m_bar_type],
+            None,
+            None,
+            NonZeroUsize::new(2),
+            Some(ClientId::from(DATAINFRA)),
+            UUID4::new(),
+            UnixNanos::from(100_u64),
+            None,
+        ))
+        .expect("request_bars limit=2");
+
+    client
+        .request_quotes(RequestQuotes::new(
+            vec![aapl_id],
+            None,
+            None,
+            NonZeroUsize::new(2),
+            Some(ClientId::from(DATAINFRA)),
+            UUID4::new(),
+            UnixNanos::from(101_u64),
+            None,
+        ))
+        .expect("request_quotes limit=2");
+
+    let evt_bars = rx.try_recv().expect("expected BarsResponse");
+    match evt_bars {
+        DataEvent::Response(DataResponse::Bars(resp)) => {
+            assert_eq!(resp.data.len(), 2);
+            // Must be the 2 newest bars in ascending order: 1_700_000_900 (+900s) and 1_700_001_800 (+900s)
+            assert_eq!(
+                resp.data[0].ts_init,
+                UnixNanos::from(1_700_001_800_000_000_000_u64)
+            );
+            assert_eq!(
+                resp.data[1].ts_init,
+                UnixNanos::from(1_700_002_700_000_000_000_u64)
+            );
+            assert_eq!(resp.data[0].close, Price::new(186.50, 2));
+            assert_eq!(resp.data[1].close, Price::new(187.50, 2));
+        }
+        other => panic!("expected DataResponse::Bars, got {other:?}"),
+    }
+
+    let evt_quotes = rx.try_recv().expect("expected QuotesResponse");
+    match evt_quotes {
+        DataEvent::Response(DataResponse::Quotes(resp)) => {
+            assert_eq!(resp.data.len(), 2);
+            // Must be the 2 newest quotes in ascending order: 1_700_000_200s and 1_700_000_300s
+            assert_eq!(
+                resp.data[0].ts_init,
+                UnixNanos::from(1_700_000_200_000_000_000_u64)
+            );
+            assert_eq!(
+                resp.data[1].ts_init,
+                UnixNanos::from(1_700_000_300_000_000_000_u64)
+            );
+            assert_eq!(resp.data[0].bid_price, Price::new(186.40, 2));
+            assert_eq!(resp.data[1].bid_price, Price::new(187.40, 2));
+        }
+        other => panic!("expected DataResponse::Quotes, got {other:?}"),
+    }
+
+    ch_server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_ticket02_warmup_filters_unclosed_15m_1h_1d_bars_and_sql_views_guard_future_ex_date() {
+    // 1. Verify ClickHouse SQL DDL contracts for Ticket 02:
+    //    - `03_adjusted_views.sql` enforces `ex_date <= toDate(now('America/New_York'))` in both `corp_dedup` and `corp_daily`
+    //    - `02_multi_tf_mv.sql` normalizes `ny_trading_date` in subquery `(B)` via `if(ny_trading_date = toDate('1970-01-01'), ...)`
+    let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .ancestors()
+        .nth(5)
+        .expect("locate repo root");
+    let sql_03 = std::fs::read_to_string(
+        repo_root.join("quant-datainfra-ingest/clickhouse/initdb/03_adjusted_views.sql"),
+    )
+    .expect("read 03_adjusted_views.sql");
+    let ex_date_guard_matches = sql_03
+        .matches("ex_date <= toDate(now('America/New_York'))")
+        .count();
+    assert_eq!(
+        ex_date_guard_matches, 2,
+        "03_adjusted_views.sql must guard both corp_dedup and corp_daily with `ex_date <= toDate(now('America/New_York'))`, found {ex_date_guard_matches}"
+    );
+
+    let sql_02 = std::fs::read_to_string(
+        repo_root.join("quant-datainfra-ingest/clickhouse/initdb/02_multi_tf_mv.sql"),
+    )
+    .expect("read 02_multi_tf_mv.sql");
+    assert!(
+        sql_02.contains(
+            "toDate(toTimeZone(if(toYear(bar_start_utc) > 1970, bar_start_utc, bar_start_time), 'America/New_York'))"
+        ),
+        "02_multi_tf_mv.sql must normalize ny_trading_date in subquery (B)"
+    );
+
+    // 2. Verify unclosed in-progress rollup bar filter on warmup (`DataInfraCatalog::query_batch` & `DataInfraDataClient::request_bars`)
+    //    2026-05-04 (EDT = UTC-4):
+    //    - 09:30 ET = 1_777_901_400
+    //    - 09:45 ET = 1_777_902_300
+    //    - 10:00 ET = 1_777_903_200
+    //    - 10:07 ET = 1_777_903_620 (mid-bucket warmup cutoff `end_ns`)
+    //    - 10:15 ET = 1_777_904_100
+    //    - 10:30 ET = 1_777_905_000
+    let bars_15m_batch = build_v_quant_bars_record_batch(
+        &["AAPL", "AAPL", "AAPL"],
+        &["15m", "15m", "15m"],
+        &[
+            1_777_901_400, // 09:30-09:45 ET (close = 09:45 <= 10:07) -> KEEP
+            1_777_902_300, // 09:45-10:00 ET (close = 10:00 <= 10:07) -> KEEP
+            1_777_903_200, // 10:00-10:15 ET (close = 10:15 > 10:07)  -> FILTER OUT
+        ],
+        &[
+            (185.0, 186.0, 184.5, 185.5, 100_000.0),
+            (185.5, 186.5, 185.0, 186.0, 110_000.0),
+            (186.0, 187.0, 185.8, 186.8, 45_000.0),
+        ],
+        &[
+            (185.0, 186.0, 184.5, 185.5, 100_000.0),
+            (185.5, 186.5, 185.0, 186.0, 110_000.0),
+            (186.0, 187.0, 185.8, 186.8, 45_000.0),
+        ],
+        &[false, false, false],
+        &[false, false, false],
+        None,
+    );
+    let bars_15m_ipc = encode_batches_to_arrow_ipc_stream(&[bars_15m_batch]);
+
+    // 1h bars:
+    // - 2026-05-01 14:30-15:30 ET (open = 1_777_660_200, close = 1_777_663_800 <= 10:07 ET on 2026-05-04) -> KEEP
+    // - 2026-05-04 09:30-10:30 ET (open = 1_777_901_400, close = 1_777_905_000 > 10:07 ET on 2026-05-04)  -> FILTER OUT
+    let bars_1h_batch = build_v_quant_bars_record_batch(
+        &["AAPL", "AAPL"],
+        &["1h", "1h"],
+        &[
+            1_777_660_200,
+            1_777_901_400,
+        ],
+        &[
+            (184.0, 185.2, 183.8, 185.0, 320_000.0),
+            (185.0, 187.0, 184.5, 186.8, 255_000.0),
+        ],
+        &[
+            (184.0, 185.2, 183.8, 185.0, 320_000.0),
+            (185.0, 187.0, 184.5, 186.8, 255_000.0),
+        ],
+        &[false, false],
+        &[false, false],
+        None,
+    );
+    let bars_1h_ipc = encode_batches_to_arrow_ipc_stream(&[bars_1h_batch]);
+
+    // 1d bars:
+    // - 2026-05-01 09:30-16:00 ET (open = 1_777_642_200, close = 1_777_665_600 <= 10:07 ET on 2026-05-04) -> KEEP
+    // - 2026-05-04 09:30-16:00 ET (open = 1_777_901_400, close = 1_777_924_800 > 10:07 ET on 2026-05-04)  -> FILTER OUT
+    let bars_1d_batch = build_v_quant_bars_record_batch(
+        &["AAPL", "AAPL"],
+        &["1d", "1d"],
+        &[
+            1_777_642_200,
+            1_777_901_400,
+        ],
+        &[
+            (182.0, 185.5, 181.5, 185.0, 1_800_000.0),
+            (185.0, 187.0, 184.5, 186.8, 255_000.0),
+        ],
+        &[
+            (182.0, 185.5, 181.5, 185.0, 1_800_000.0),
+            (185.0, 187.0, 184.5, 186.8, 255_000.0),
+        ],
+        &[false, false],
+        &[false, false],
+        None,
+    );
+    let bars_1d_ipc = encode_batches_to_arrow_ipc_stream(&[bars_1d_batch]);
+
+    let ch_listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ClickHouse listener");
+    let ch_addr = ch_listener.local_addr().unwrap();
+
+    let ch_server = tokio::spawn(async move {
+        while let Ok((mut socket, _)) = ch_listener.accept().await {
+            let raw_req = read_http_request(&mut socket).await;
+            if raw_req.contains("param_tf=15m") {
+                write_http_response(
+                    &mut socket,
+                    "200 OK",
+                    "application/vnd.apache.arrow.stream",
+                    &bars_15m_ipc,
+                )
+                .await;
+            } else if raw_req.contains("param_tf=1h") {
+                write_http_response(
+                    &mut socket,
+                    "200 OK",
+                    "application/vnd.apache.arrow.stream",
+                    &bars_1h_ipc,
+                )
+                .await;
+            } else if raw_req.contains("param_tf=1d") {
+                write_http_response(
+                    &mut socket,
+                    "200 OK",
+                    "application/vnd.apache.arrow.stream",
+                    &bars_1d_ipc,
+                )
+                .await;
+            } else {
+                write_http_response(&mut socket, "400 Bad Request", "text/plain", b"Bad SQL")
+                    .await;
+            }
+        }
+    });
+
+    let cfg = make_test_config(
+        &format!("http://{ch_addr}"),
+        "http://127.0.0.1:8012",
+        "ALPACA",
+    );
+    let ch_transport = Arc::new(HttpClickHouseArrowTransport::new(cfg.clone()).unwrap());
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<DataEvent>();
+    let sender = EventSender::from(tx);
+    let cal_gate = CalendarSessionGate::from_config(&cfg).unwrap();
+    let observer = Arc::new(RecordingLifecycleObserver::default());
+
+    let client = DataInfraDataClient::with_transports_and_listener(
+        ClientId::from(DATAINFRA),
+        cfg,
+        ch_transport,
+        cal_gate,
+        Some(sender),
+        observer,
+    )
+    .expect("create DataInfraDataClient")
+    .with_kafka_source(Arc::new(IdleKafkaPayloadSource));
+
+    // Query at 10:07 ET (`1_777_903_620_000_000_000`)
+    let start_dt = UnixNanos::from(1_777_600_000_000_000_000_u64).to_datetime_utc();
+    let end_dt_1007_et = UnixNanos::from(1_777_903_620_000_000_000_u64).to_datetime_utc();
+
+    // 15m warmup via DataInfraDataClient::request_bars: must keep 09:30-09:45 and 09:45-10:00, and drop 10:00-10:15
+    let bar_type_15m = parse_datainfra_bar_type("AAPL", "ALPACA", "15m").unwrap();
+    client
+        .request_bars(RequestBars::new(
+            vec![bar_type_15m],
+            Some(start_dt),
+            Some(end_dt_1007_et),
+            None,
+            Some(ClientId::from(DATAINFRA)),
+            UUID4::new(),
+            UnixNanos::from(100_u64),
+            None,
+        ))
+        .expect("request 15m bars at 10:07 ET");
+
+    match rx.try_recv().expect("expected 15m BarsResponse") {
+        DataEvent::Response(DataResponse::Bars(resp)) => {
+            assert_eq!(
+                resp.data.len(),
+                2,
+                "unclosed 10:00-10:15 ET 15m bar must be filtered out at 10:07 ET"
+            );
+            assert_eq!(
+                resp.data[0].ts_event,
+                UnixNanos::from(1_777_902_300_000_000_000_u64)
+            );
+            assert_eq!(
+                resp.data[1].ts_event,
+                UnixNanos::from(1_777_903_200_000_000_000_u64)
+            );
+        }
+        other => panic!("expected DataResponse::Bars for 15m, got {other:?}"),
+    }
+
+    // 1h warmup via DataInfraDataClient::request_bars: must keep prior completed 1h bar and drop 09:30-10:30 ET bar
+    let bar_type_1h = parse_datainfra_bar_type("AAPL", "ALPACA", "1h").unwrap();
+    client
+        .request_bars(RequestBars::new(
+            vec![bar_type_1h],
+            Some(start_dt),
+            Some(end_dt_1007_et),
+            None,
+            Some(ClientId::from(DATAINFRA)),
+            UUID4::new(),
+            UnixNanos::from(101_u64),
+            None,
+        ))
+        .expect("request 1h bars at 10:07 ET");
+
+    match rx.try_recv().expect("expected 1h BarsResponse") {
+        DataEvent::Response(DataResponse::Bars(resp)) => {
+            assert_eq!(
+                resp.data.len(),
+                1,
+                "unclosed 09:30-10:30 ET 1h bar must be filtered out at 10:07 ET"
+            );
+            assert_eq!(
+                resp.data[0].ts_event,
+                UnixNanos::from(1_777_663_800_000_000_000_u64)
+            );
+        }
+        other => panic!("expected DataResponse::Bars for 1h, got {other:?}"),
+    }
+
+    // 1d warmup via DataInfraDataClient::request_bars: must keep prior completed 1d bar and drop today's unclosed 1d bar
+    let bar_type_1d = parse_datainfra_bar_type("AAPL", "ALPACA", "1d").unwrap();
+    client
+        .request_bars(RequestBars::new(
+            vec![bar_type_1d],
+            Some(start_dt),
+            Some(end_dt_1007_et),
+            None,
+            Some(ClientId::from(DATAINFRA)),
+            UUID4::new(),
+            UnixNanos::from(102_u64),
+            None,
+        ))
+        .expect("request 1d bars at 10:07 ET");
+
+    match rx.try_recv().expect("expected 1d BarsResponse") {
+        DataEvent::Response(DataResponse::Bars(resp)) => {
+            assert_eq!(
+                resp.data.len(),
+                1,
+                "unclosed 09:30-16:00 ET 1d bar must be filtered out at 10:07 ET"
+            );
+            assert_eq!(
+                resp.data[0].ts_event,
+                UnixNanos::from(1_777_665_600_000_000_000_u64)
+            );
+        }
+        other => panic!("expected DataResponse::Bars for 1d, got {other:?}"),
+    }
+
+    ch_server.abort();
 }

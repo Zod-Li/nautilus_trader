@@ -28,6 +28,7 @@ struct PlanGateMemoryState {
     backend_unavailable_reason: String,
     items_by_symbol: AHashMap<String, RustPlanItemEnvelope>,
     reserved_qty_by_symbol: AHashMap<String, Decimal>,
+    reserved_notional_by_symbol: AHashMap<String, Decimal>,
     pending_mutations: VecDeque<String>,
 }
 
@@ -92,19 +93,38 @@ impl RustPlanGateEngine {
         let mut guard = self.state.write();
         let sym = item.symbol.clone();
         let db_filled = item.filled_qty;
+        let prev_reserved = guard
+            .reserved_qty_by_symbol
+            .get(&sym)
+            .copied()
+            .unwrap_or(Decimal::ZERO);
+        let prev_notional = guard
+            .reserved_notional_by_symbol
+            .get(&sym)
+            .copied()
+            .unwrap_or(Decimal::ZERO);
         let next_reserved = if preserve_higher_reservation {
-            guard
-                .reserved_qty_by_symbol
-                .get(&sym)
-                .copied()
-                .unwrap_or(Decimal::ZERO)
-                .max(db_filled)
+            prev_reserved.max(db_filled)
         } else {
             db_filled
         };
         if preserve_higher_reservation {
             item.filled_qty = next_reserved;
         }
+        let next_notional = if next_reserved <= Decimal::ZERO {
+            Decimal::ZERO
+        } else if prev_notional > Decimal::ZERO && prev_reserved > Decimal::ZERO {
+            if next_reserved == prev_reserved {
+                prev_notional
+            } else {
+                prev_notional * (next_reserved / prev_reserved)
+            }
+        } else if item.target_qty > Decimal::ZERO && item.target_notional_usd > Decimal::ZERO {
+            (item.target_notional_usd / item.target_qty) * next_reserved
+        } else {
+            Decimal::ZERO
+        };
+        guard.reserved_notional_by_symbol.insert(sym.clone(), next_notional);
         guard.reserved_qty_by_symbol.insert(sym.clone(), next_reserved);
         guard.items_by_symbol.insert(sym, item);
     }
@@ -114,6 +134,7 @@ impl RustPlanGateEngine {
         let mut guard = self.state.write();
         guard.items_by_symbol.remove(symbol);
         guard.reserved_qty_by_symbol.remove(symbol);
+        guard.reserved_notional_by_symbol.remove(symbol);
     }
 
     /// Clears all cached plan items.
@@ -121,6 +142,7 @@ impl RustPlanGateEngine {
         let mut guard = self.state.write();
         guard.items_by_symbol.clear();
         guard.reserved_qty_by_symbol.clear();
+        guard.reserved_notional_by_symbol.clear();
     }
 
     /// Returns the currently reserved/filled quantity for `symbol`.
@@ -542,12 +564,20 @@ impl RustPlanGateEngine {
                         added_notional_usd: None,
                     };
                 }
+                let effective_stop_floor = if implied_plan_ref_price > plan_item.initial_stop_price
+                    && entry_ref_price > Decimal::ZERO
+                    && entry_ref_price <= plan_item.initial_stop_price
+                {
+                    let max_plan_stop_dist = implied_plan_ref_price - plan_item.initial_stop_price;
+                    (entry_ref_price - max_plan_stop_dist).max(Decimal::new(1, 2))
+                } else {
+                    plan_item.initial_stop_price
+                };
                 if plan_item.initial_stop_price > Decimal::ZERO
-                    && stop_px < plan_item.initial_stop_price
+                    && stop_px < effective_stop_floor
                 {
                     let reason = format!(
-                        "STOP_LOSS_FLOOR_VIOLATION (STOP_LOSS_BELOW_PLAN_FLOOR): LONG stop_loss_price ({stop_px}) < initial_stop_price ({})",
-                        plan_item.initial_stop_price
+                        "STOP_LOSS_FLOOR_VIOLATION (STOP_LOSS_BELOW_PLAN_FLOOR): LONG stop_loss_price ({stop_px}) < initial_stop_price ({effective_stop_floor})"
                     );
                     Self::enqueue_denied_mutation(
                         &mut guard,
@@ -592,12 +622,20 @@ impl RustPlanGateEngine {
                         added_notional_usd: None,
                     };
                 }
+                let effective_stop_ceiling = if implied_plan_ref_price > Decimal::ZERO
+                    && implied_plan_ref_price < plan_item.initial_stop_price
+                    && entry_ref_price >= plan_item.initial_stop_price
+                {
+                    let max_plan_stop_dist = plan_item.initial_stop_price - implied_plan_ref_price;
+                    entry_ref_price + max_plan_stop_dist
+                } else {
+                    plan_item.initial_stop_price
+                };
                 if plan_item.initial_stop_price > Decimal::ZERO
-                    && stop_px > plan_item.initial_stop_price
+                    && stop_px > effective_stop_ceiling
                 {
                     let reason = format!(
-                        "STOP_LOSS_FLOOR_VIOLATION (STOP_LOSS_ABOVE_PLAN_CEILING): SHORT stop_loss_price ({stop_px}) > initial_stop_price ({})",
-                        plan_item.initial_stop_price
+                        "STOP_LOSS_FLOOR_VIOLATION (STOP_LOSS_ABOVE_PLAN_CEILING): SHORT stop_loss_price ({stop_px}) > initial_stop_price ({effective_stop_ceiling})"
                     );
                     Self::enqueue_denied_mutation(
                         &mut guard,
@@ -682,6 +720,14 @@ impl RustPlanGateEngine {
 
         let added_notional = (request.quantity * ref_price)
             .round_dp_with_strategy(2, RoundingStrategy::MidpointNearestEven);
+        let prev_notional = guard
+            .reserved_notional_by_symbol
+            .get(&request.symbol)
+            .copied()
+            .unwrap_or(Decimal::ZERO);
+        guard
+            .reserved_notional_by_symbol
+            .insert(request.symbol.clone(), prev_notional + added_notional);
 
         let mutation = json!({
             "kind": "ORDER_ADMITTED",
@@ -724,18 +770,36 @@ impl RustPlanGateEngine {
         guard
             .reserved_qty_by_symbol
             .insert(symbol.to_string(), updated);
+        let tracked_notional = guard
+            .reserved_notional_by_symbol
+            .get(symbol)
+            .copied()
+            .unwrap_or(Decimal::ZERO);
         let mut released_notional = Decimal::ZERO;
         if let Some(item) = guard.items_by_symbol.get_mut(symbol) {
             item.filled_qty = updated;
             if updated == Decimal::ZERO && item.status == "TRIGGERED" {
                 item.status = "ARMED".to_string();
             }
-            if item.target_qty > Decimal::ZERO && item.target_notional_usd > Decimal::ZERO {
+            if updated == Decimal::ZERO && tracked_notional > Decimal::ZERO {
+                released_notional = tracked_notional;
+            } else if current > Decimal::ZERO && tracked_notional > Decimal::ZERO {
+                released_notional = ((tracked_notional * actual_released_qty) / current)
+                    .round_dp_with_strategy(2, RoundingStrategy::MidpointNearestEven);
+            } else if item.target_qty > Decimal::ZERO && item.target_notional_usd > Decimal::ZERO {
                 let implied_ref_price = item.target_notional_usd / item.target_qty;
                 released_notional = (actual_released_qty * implied_ref_price)
                     .round_dp_with_strategy(2, RoundingStrategy::MidpointNearestEven);
             }
         }
+        let next_notional = if updated == Decimal::ZERO {
+            Decimal::ZERO
+        } else {
+            (tracked_notional - released_notional).max(Decimal::ZERO)
+        };
+        guard
+            .reserved_notional_by_symbol
+            .insert(symbol.to_string(), next_notional);
         let item_id = guard
             .items_by_symbol
             .get(symbol)
@@ -873,5 +937,163 @@ mod tests {
         let decision = engine.evaluate_and_reserve(&req);
         assert!(decision.allowed);
         assert!(decision.is_exit_bypass);
+    }
+
+    #[test]
+    fn test_long_effective_stop_floor_scales_below_implied_ref_and_enforces_strict_above() {
+        let engine = RustPlanGateEngine::new(false, String::new());
+        // implied_plan_ref_price = 10000 / 100 = 100.00, initial_stop_price = 95.00 => max_plan_stop_dist = 5.00
+        engine.upsert_plan_item(sample_envelope(), false);
+
+        // 1. Entry below implied_plan_ref_price (e.g. earlier backtest bar at 80.00):
+        // effective_stop_floor = max(0.01, 80.00 - 5.00) = 75.00
+        let mut req_below_ok = sample_request(dec!(20));
+        req_below_ok.reference_price = Some(dec!(80.00));
+        req_below_ok.limit_price = Some(dec!(80.20));
+        req_below_ok.stop_loss_price = Some(dec!(76.00));
+        let d_below_ok = engine.evaluate_and_reserve(&req_below_ok);
+        assert!(
+            d_below_ok.allowed,
+            "expected stop 76.00 >= effective_stop_floor 75.00 to be admitted, got {:?}",
+            d_below_ok.reason
+        );
+
+        // 2. Entry at 80.00 with stop_loss_price = 74.50 (< 75.00 effective_stop_floor) must be denied
+        let mut req_below_bad = sample_request(dec!(20));
+        req_below_bad.reference_price = Some(dec!(80.00));
+        req_below_bad.limit_price = Some(dec!(80.20));
+        req_below_bad.stop_loss_price = Some(dec!(74.50));
+        let d_below_bad = engine.evaluate_and_reserve(&req_below_bad);
+        assert!(!d_below_bad.allowed);
+        let reason_below_bad = d_below_bad.reason.unwrap_or_default();
+        assert!(reason_below_bad.contains("STOP_LOSS_BELOW_PLAN_FLOOR"));
+        assert!(reason_below_bad.contains("75"));
+
+        // 3. Entry >= implied_plan_ref_price (100.20 >= 100.00):
+        // effective_stop_floor remains strictly plan_item.initial_stop_price (95.00)
+        let mut req_above_bad = sample_request(dec!(20));
+        req_above_bad.reference_price = Some(dec!(100.20));
+        req_above_bad.limit_price = Some(dec!(100.40));
+        req_above_bad.stop_loss_price = Some(dec!(94.80));
+        let d_above_bad = engine.evaluate_and_reserve(&req_above_bad);
+        assert!(!d_above_bad.allowed);
+        let reason_above_bad = d_above_bad.reason.unwrap_or_default();
+        assert!(reason_above_bad.contains("STOP_LOSS_BELOW_PLAN_FLOOR"));
+        assert!(reason_above_bad.contains("95.00"));
+    }
+
+    #[test]
+    fn test_short_effective_stop_ceiling_scales_above_implied_ref_and_enforces_strict_below() {
+        let engine = RustPlanGateEngine::new(false, String::new());
+        let mut env = sample_envelope();
+        env.side = "SHORT".to_string();
+        // implied_plan_ref_price = 100.00, initial_stop_price = 105.00 => max_plan_stop_dist = 5.00
+        env.initial_stop_price = dec!(105.00);
+        engine.upsert_plan_item(env, false);
+
+        // 1. Entry above implied_plan_ref_price (120.00 > 100.00):
+        // effective_stop_ceiling = 120.00 + 5.00 = 125.00
+        let mut req_above_ok = sample_request(dec!(20));
+        req_above_ok.order_side = "SELL".to_string();
+        req_above_ok.reference_price = Some(dec!(120.00));
+        req_above_ok.limit_price = Some(dec!(119.80));
+        req_above_ok.stop_loss_price = Some(dec!(124.00));
+        let d_above_ok = engine.evaluate_and_reserve(&req_above_ok);
+        assert!(
+            d_above_ok.allowed,
+            "expected SHORT stop 124.00 <= effective_stop_ceiling 125.00 to be admitted, got {:?}",
+            d_above_ok.reason
+        );
+
+        // 2. Entry at 120.00 with stop_loss_price = 125.50 (> 125.00 effective_stop_ceiling) must be denied
+        let mut req_above_bad = sample_request(dec!(20));
+        req_above_bad.order_side = "SELL".to_string();
+        req_above_bad.reference_price = Some(dec!(120.00));
+        req_above_bad.limit_price = Some(dec!(119.80));
+        req_above_bad.stop_loss_price = Some(dec!(125.50));
+        let d_above_bad = engine.evaluate_and_reserve(&req_above_bad);
+        assert!(!d_above_bad.allowed);
+        let reason_above_bad = d_above_bad.reason.unwrap_or_default();
+        assert!(reason_above_bad.contains("STOP_LOSS_ABOVE_PLAN_CEILING"));
+        assert!(reason_above_bad.contains("125"));
+
+        // 3. Entry <= implied_plan_ref_price (99.80 <= 100.00):
+        // effective_stop_ceiling remains strictly plan_item.initial_stop_price (105.00)
+        let mut req_below_bad = sample_request(dec!(20));
+        req_below_bad.order_side = "SELL".to_string();
+        req_below_bad.reference_price = Some(dec!(99.80));
+        req_below_bad.limit_price = Some(dec!(99.60));
+        req_below_bad.stop_loss_price = Some(dec!(105.20));
+        let d_below_bad = engine.evaluate_and_reserve(&req_below_bad);
+        assert!(!d_below_bad.allowed);
+        let reason_below_bad = d_below_bad.reason.unwrap_or_default();
+        assert!(reason_below_bad.contains("STOP_LOSS_ABOVE_PLAN_CEILING"));
+        assert!(reason_below_bad.contains("105.00"));
+    }
+
+    #[test]
+    fn test_release_reservation_tracks_notional_and_zeros_when_ref_price_differs() {
+        let engine = RustPlanGateEngine::new(false, String::new());
+        // Plan item implied ref price = 10000 / 100 = 100.00
+        engine.upsert_plan_item(sample_envelope(), false);
+
+        // Admit 60 shares at entry ref_price = 100.40 (added_notional = 6024.00 != 6000.00)
+        let mut req = sample_request(dec!(60));
+        req.reference_price = Some(dec!(100.40));
+        req.limit_price = Some(dec!(100.50));
+        let d1 = engine.evaluate_and_reserve(&req);
+        assert!(d1.allowed);
+        assert_eq!(d1.added_notional_usd.as_deref(), Some("6024.00"));
+        assert_eq!(engine.reserved_qty("NVDA"), dec!(60));
+        let _ = engine.drain_pending_mutations(10);
+
+        // Simulate sync_from_db / upsert_plan_item with preserve_higher_reservation=true
+        // where DB filled_qty is still 0 (or 60): reserved_notional_by_symbol must stay 6024.00
+        engine.upsert_plan_item(sample_envelope(), true);
+        {
+            let guard = engine.state.read();
+            assert_eq!(
+                guard.reserved_notional_by_symbol.get("NVDA").copied(),
+                Some(dec!(6024.00))
+            );
+        }
+
+        // Partial release of 20 shares: proportional notional 6024.00 * (20/60) = 2008.00 released, 4016.00 remaining
+        let rem_partial = engine.release_reservation("NVDA", dec!(20));
+        assert_eq!(rem_partial, dec!(40));
+        let mut_partial = engine.drain_pending_mutations(10);
+        assert_eq!(mut_partial.len(), 1);
+        let parsed_partial: serde_json::Value = serde_json::from_str(&mut_partial[0]).unwrap();
+        assert_eq!(parsed_partial["kind"], "RELEASE_RESERVATION");
+        assert_eq!(parsed_partial["new_reserved_qty"], "40");
+        assert_eq!(parsed_partial["released_notional_usd"], "2008.00");
+
+        // Full release of remaining 40 shares: releases remaining 4016.00 and resets reserved_notional_by_symbol to exact 0
+        let rem_full = engine.release_reservation("NVDA", dec!(40));
+        assert_eq!(rem_full, dec!(0));
+        let mut_full = engine.drain_pending_mutations(10);
+        assert_eq!(mut_full.len(), 1);
+        let parsed_full: serde_json::Value = serde_json::from_str(&mut_full[0]).unwrap();
+        assert_eq!(parsed_full["kind"], "RELEASE_RESERVATION");
+        assert_eq!(parsed_full["new_reserved_qty"], "0");
+        assert_eq!(parsed_full["released_notional_usd"], "4016.00");
+
+        // Verify internal reserved_notional_by_symbol is exact 0 and item status reverted to ARMED
+        {
+            let guard = engine.state.read();
+            assert_eq!(
+                guard.reserved_notional_by_symbol.get("NVDA").copied(),
+                Some(Decimal::ZERO)
+            );
+            assert_eq!(
+                guard.items_by_symbol.get("NVDA").map(|i| i.status.as_str()),
+                Some("ARMED")
+            );
+        }
+
+        // Subsequent full-cap 100 share entry is admitted cleanly
+        let d2 = engine.evaluate_and_reserve(&sample_request(dec!(100)));
+        assert!(d2.allowed);
+        assert_eq!(engine.reserved_qty("NVDA"), dec!(100));
     }
 }

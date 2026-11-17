@@ -26,8 +26,7 @@ use nautilus_datainfra::{
     DataInfraError, DataInfraStreamEvent, DataInfraTimeframe, KafkaBrokerEnvelope,
     KafkaEnvelopePayload, KafkaPayloadFrame, KafkaPayloadSource, KafkaStreamSessionCoordinator,
     StreamDecodeOutcome, StreamLifecycleListener, TOPIC_SIP_BARS_1M, TOPIC_SIP_QUOTES,
-    TOPIC_SIP_STATUSES, TcpKafkaPayloadSource, VersionEvaluation, parse_broker_wire_frame,
-    to_instrument_id,
+    TOPIC_SIP_STATUSES, TcpKafkaPayloadSource, VersionEvaluation, to_instrument_id,
 };
 use nautilus_model::{
     enums::MarketStatusAction,
@@ -114,6 +113,11 @@ fn test_decode_canonical_bar_quote_and_status_wire_frames() {
         "ingest_ts_ms": 1711980060125
     }"#;
 
+    let bar_wire_legacy: CanonicalBarWire =
+        serde_json::from_slice(bar_json).expect("legacy CanonicalBarWire JSON should deserialize");
+    assert_eq!(bar_wire_legacy.market, "US");
+    assert_eq!(bar_wire_legacy.origin, "REALTIME");
+
     let bar_outcome = decoder
         .decode_topic_payload(TOPIC_SIP_BARS_1M, bar_json)
         .expect("valid CanonicalBarWire JSON should decode");
@@ -132,6 +136,92 @@ fn test_decode_canonical_bar_quote_and_status_wire_frames() {
         other => panic!("expected Emitted(Bar), got {other:?}"),
     }
 
+    // 1b. Explicit `market` and `origin` fields on initial Bar and UpdatedBar
+    let explicit_bar_v1_json = br#"{
+        "market": "US",
+        "symbol": "TSLA",
+        "timeframe": "1m",
+        "bar_ts": 1711980060,
+        "open": 175.00,
+        "high": 176.50,
+        "low": 174.80,
+        "close": 176.10,
+        "volume": 32100.0,
+        "vwap": 175.85,
+        "trade_count": 210,
+        "version": 1,
+        "is_synthetic": false,
+        "is_correction": false,
+        "is_suspect_spike": false,
+        "session": "REGULAR",
+        "origin": "REALTIME",
+        "provider": "alpaca_sip",
+        "source_ts_ms": 1711980120000,
+        "ingest_ts_ms": 1711980120050
+    }"#;
+    let explicit_bar_v1_wire: CanonicalBarWire = serde_json::from_slice(explicit_bar_v1_json)
+        .expect("explicit CanonicalBarWire v1 should deserialize");
+    assert_eq!(explicit_bar_v1_wire.market, "US");
+    assert_eq!(explicit_bar_v1_wire.origin, "REALTIME");
+
+    let explicit_v1_outcome = decoder
+        .decode_topic_payload(TOPIC_SIP_BARS_1M, explicit_bar_v1_json)
+        .expect("explicit CanonicalBarWire v1 should decode");
+    match explicit_v1_outcome {
+        StreamDecodeOutcome::Emitted(DataInfraStreamEvent::Bar(bar)) => {
+            assert_eq!(bar.bar_type.to_string(), "TSLA.NASDAQ-1-MINUTE-LAST-EXTERNAL");
+            assert_eq!(bar.close, Price::new(176.10, 2));
+            assert_eq!(bar.volume, Quantity::new(32_100.0, 0));
+        }
+        other => panic!("expected Emitted(Bar) for explicit v1, got {other:?}"),
+    }
+
+    let explicit_bar_v2_json = br#"{
+        "market": "US",
+        "symbol": "TSLA",
+        "timeframe": "1m",
+        "bar_ts": 1711980060,
+        "open": 175.00,
+        "high": 176.80,
+        "low": 174.80,
+        "close": 176.45,
+        "volume": 33500.0,
+        "vwap": 175.95,
+        "trade_count": 225,
+        "version": 2,
+        "is_synthetic": false,
+        "is_correction": true,
+        "is_suspect_spike": false,
+        "session": "REGULAR",
+        "origin": "EOD_SYNC",
+        "provider": "alpaca_sip",
+        "source_ts_ms": 1711980125000,
+        "ingest_ts_ms": 1711980125050
+    }"#;
+    let explicit_bar_v2_wire: CanonicalBarWire = serde_json::from_slice(explicit_bar_v2_json)
+        .expect("explicit CanonicalBarWire v2 should deserialize");
+    assert_eq!(explicit_bar_v2_wire.market, "US");
+    assert_eq!(explicit_bar_v2_wire.origin, "EOD_SYNC");
+
+    let explicit_v2_outcome = decoder
+        .decode_topic_payload("md.sip.bars.1m.updated.v1", explicit_bar_v2_json)
+        .expect("explicit CanonicalBarWire v2 should decode");
+    match explicit_v2_outcome {
+        StreamDecodeOutcome::Emitted(DataInfraStreamEvent::UpdatedBar {
+            bar,
+            version,
+            is_correction,
+        }) => {
+            assert_eq!(version, 2);
+            assert!(is_correction);
+            assert_eq!(bar.bar_type.to_string(), "TSLA.NASDAQ-1-MINUTE-LAST-EXTERNAL");
+            assert_eq!(bar.high, Price::new(176.80, 2));
+            assert_eq!(bar.close, Price::new(176.45, 2));
+            assert_eq!(bar.volume, Quantity::new(33_500.0, 0));
+        }
+        other => panic!("expected Emitted(UpdatedBar) for explicit v2, got {other:?}"),
+    }
+
     // 2. Valid L1 SIP quote frame on md.sip.quotes
     let quote_json = br#"{
         "symbol": "MSFT",
@@ -148,6 +238,21 @@ fn test_decode_canonical_bar_quote_and_status_wire_frames() {
 
     let quote_wire: CanonicalQuoteWire =
         serde_json::from_slice(quote_json).expect("CanonicalQuoteWire should deserialize");
+    assert_eq!(quote_wire.market, "US");
+    let explicit_quote_wire = CanonicalQuoteWire {
+        market: "US".to_string(),
+        symbol: "MSFT".to_string(),
+        quote_ts_ms: 1_711_980_005_250,
+        ingest_ts_ms: 1_711_980_005_255,
+        bid_price: 420.15,
+        bid_size: 300.0,
+        ask_price: 420.20,
+        ask_size: 500.0,
+        mid_price: 420.175,
+        spread_bps: 1.19,
+        provider: "alpaca_sip".to_string(),
+    };
+    assert_eq!(quote_wire, explicit_quote_wire);
     let direct_quote = quote_wire
         .to_nautilus_quote("NASDAQ", 2, 0)
         .expect("direct quote conversion should succeed");
@@ -183,6 +288,10 @@ fn test_decode_canonical_bar_quote_and_status_wire_frames() {
         "provider": "alpaca_sip"
     }"#;
 
+    let pause_wire_legacy: CanonicalTradingStatusWire = serde_json::from_slice(pause_json)
+        .expect("legacy CanonicalTradingStatusWire JSON should deserialize");
+    assert_eq!(pause_wire_legacy.market, "US");
+
     let pause_outcome = decoder
         .decode_topic_payload(TOPIC_SIP_STATUSES, pause_json)
         .expect("valid CanonicalTradingStatusWire JSON should decode");
@@ -209,6 +318,7 @@ fn test_decode_canonical_bar_quote_and_status_wire_frames() {
     }
 
     let ssr_wire = CanonicalTradingStatusWire {
+        market: "US".to_string(),
         symbol: "AMD".to_string(),
         status_ts_ms: 1_711_980_020_000,
         ingest_ts_ms: 0,
@@ -233,6 +343,7 @@ fn test_quality_guards_filter_synthetic_and_suspect_spike_and_reject_corrupted_f
 
     // 1. Synthetic +3s zero-volume placeholder bar -> FilteredSynthetic (must NOT record version)
     let synthetic_bar = CanonicalBarWire {
+        market: "US".to_string(),
         symbol: "aapl".to_string(),
         timeframe: "1m".to_string(),
         bar_ts: 1_711_980_120,
@@ -248,6 +359,7 @@ fn test_quality_guards_filter_synthetic_and_suspect_spike_and_reject_corrupted_f
         is_correction: false,
         is_suspect_spike: false,
         session: "REGULAR".to_string(),
+        origin: "REALTIME".to_string(),
         provider: "alpaca_sip".to_string(),
         source_ts_ms: 1_711_980_183_000,
         ingest_ts_ms: 1_711_980_183_010,
@@ -369,6 +481,7 @@ fn test_same_window_version_deduplication_and_upgrade_tracking() {
     let bar_ts = 1_711_980_900_i64;
 
     let v1_wire = CanonicalBarWire {
+        market: "US".to_string(),
         symbol: "AAPL".to_string(),
         timeframe: "15m".to_string(),
         bar_ts,
@@ -384,6 +497,7 @@ fn test_same_window_version_deduplication_and_upgrade_tracking() {
         is_correction: false,
         is_suspect_spike: false,
         session: "REGULAR".to_string(),
+        origin: "REALTIME".to_string(),
         provider: "alpaca_sip".to_string(),
         source_ts_ms: 1_711_981_800_000,
         ingest_ts_ms: 1_711_981_800_100,
@@ -603,13 +717,14 @@ fn test_kafka_stream_session_coordinator_isolates_lifecycle_and_fails_closed_whe
 }
 
 #[test]
-fn test_parse_broker_wire_frame_all_supported_formats_and_fail_closed() {
+fn test_kafka_broker_envelope_and_canonical_wire_frame_serialization() {
     assert_eq!(
         DEFAULT_SIP_KAFKA_TOPICS,
         [TOPIC_SIP_BARS_1M, TOPIC_SIP_QUOTES, TOPIC_SIP_STATUSES]
     );
 
     let bar_wire = CanonicalBarWire {
+        market: "US".to_string(),
         symbol: "AAPL".to_string(),
         timeframe: "1m".to_string(),
         bar_ts: 1_711_980_000,
@@ -625,32 +740,26 @@ fn test_parse_broker_wire_frame_all_supported_formats_and_fail_closed() {
         is_correction: false,
         is_suspect_spike: false,
         session: "REGULAR".to_string(),
+        origin: "REALTIME".to_string(),
         provider: "alpaca_sip".to_string(),
         source_ts_ms: 1_711_980_060_000,
         ingest_ts_ms: 1_711_980_060_050,
     };
-    let bar_json_str = serde_json::to_string(&bar_wire).unwrap();
 
-    // 1. Topic-prefixed frames (`\t`, `|`, `:`, space)
-    for sep in ["\t", "|", ":", " "] {
-        let raw = format!("{TOPIC_SIP_BARS_1M}{sep}{bar_json_str}");
-        let parsed = parse_broker_wire_frame(raw.as_bytes()).expect("parse topic-prefixed frame");
-        assert_eq!(parsed.topic, TOPIC_SIP_BARS_1M);
-        let decoded: CanonicalBarWire = serde_json::from_slice(&parsed.payload).unwrap();
-        assert_eq!(decoded, bar_wire);
-    }
-
-    // 2. Strongly typed KafkaBrokerEnvelope with Structured, JsonString (`value`), and JsonBytes (`data`)
+    // 1. Strongly typed KafkaBrokerEnvelope with Structured, JsonString (`value`), and JsonBytes (`data`)
     let env_structured = KafkaBrokerEnvelope {
         topic: TOPIC_SIP_BARS_1M.to_string(),
         payload: KafkaEnvelopePayload::Structured(CanonicalWireFrame::Bar(bar_wire.clone())),
     };
     let raw_env_struct = serde_json::to_vec(&env_structured).unwrap();
-    let parsed_env_struct =
-        parse_broker_wire_frame(&raw_env_struct).expect("parse structured envelope");
+    let parsed_env_struct: KafkaBrokerEnvelope =
+        serde_json::from_slice(&raw_env_struct).expect("parse structured envelope");
     assert_eq!(parsed_env_struct.topic, TOPIC_SIP_BARS_1M);
-    let decoded_struct: CanonicalBarWire =
-        serde_json::from_slice(&parsed_env_struct.payload).unwrap();
+    let payload_bytes = parsed_env_struct
+        .payload
+        .into_payload_bytes()
+        .expect("serialize structured payload");
+    let decoded_struct: CanonicalBarWire = serde_json::from_slice(&payload_bytes).unwrap();
     assert_eq!(decoded_struct, bar_wire);
 
     let raw_env_value = serde_json::json!({
@@ -658,76 +767,24 @@ fn test_parse_broker_wire_frame_all_supported_formats_and_fail_closed() {
         "value": r#"{"symbol":"AAPL","quote_ts_ms":1711980005000,"bid_price":170.1,"bid_size":100.0,"ask_price":170.2,"ask_size":200.0}"#
     })
     .to_string();
-    let parsed_env_val =
-        parse_broker_wire_frame(raw_env_value.as_bytes()).expect("parse value-aliased envelope");
+    let parsed_env_val: KafkaBrokerEnvelope =
+        serde_json::from_str(&raw_env_value).expect("parse value-aliased envelope");
     assert_eq!(parsed_env_val.topic, TOPIC_SIP_QUOTES);
 
-    let status_bytes = br#"{"symbol":"AAPL","status_ts_ms":1711980010000,"state":"TRADING"}"#.to_vec();
+    let status_bytes =
+        br#"{"symbol":"AAPL","status_ts_ms":1711980010000,"state":"TRADING"}"#.to_vec();
     let raw_env_data = serde_json::json!({
         "topic": TOPIC_SIP_STATUSES,
         "data": status_bytes
     })
     .to_string();
-    let parsed_env_data =
-        parse_broker_wire_frame(raw_env_data.as_bytes()).expect("parse data-aliased byte envelope");
+    let parsed_env_data: KafkaBrokerEnvelope =
+        serde_json::from_str(&raw_env_data).expect("parse data-aliased byte envelope");
     assert_eq!(parsed_env_data.topic, TOPIC_SIP_STATUSES);
-    assert_eq!(parsed_env_data.payload, status_bytes);
-
-    // 3. Direct CanonicalWireFrame topic inference (1m bar, 15m bar, quote, status)
-    let direct_1m = parse_broker_wire_frame(bar_json_str.as_bytes()).expect("direct 1m bar");
-    assert_eq!(direct_1m.topic, TOPIC_SIP_BARS_1M);
-
-    let mut bar_15m = bar_wire.clone();
-    bar_15m.timeframe = "15m".to_string();
-    let direct_15m =
-        parse_broker_wire_frame(&serde_json::to_vec(&bar_15m).unwrap()).expect("direct 15m bar");
-    assert_eq!(direct_15m.topic, "md.sip.bars.15m");
-
-    let quote_wire = CanonicalQuoteWire {
-        symbol: "AAPL".to_string(),
-        quote_ts_ms: 1_711_980_005_000,
-        ingest_ts_ms: 1_711_980_005_010,
-        bid_price: 170.10,
-        bid_size: 100.0,
-        ask_price: 170.20,
-        ask_size: 200.0,
-        mid_price: 170.15,
-        spread_bps: 5.87,
-        provider: "alpaca_sip".to_string(),
-    };
-    let direct_quote =
-        parse_broker_wire_frame(&serde_json::to_vec(&quote_wire).unwrap()).expect("direct quote");
-    assert_eq!(direct_quote.topic, TOPIC_SIP_QUOTES);
-
-    let status_wire = CanonicalTradingStatusWire {
-        symbol: "AAPL".to_string(),
-        status_ts_ms: 1_711_980_010_000,
-        ingest_ts_ms: 1_711_980_010_005,
-        state: "HALTED".to_string(),
-        reason_code: Some("T1".to_string()),
-        provider: "alpaca_sip".to_string(),
-    };
-    let direct_status =
-        parse_broker_wire_frame(&serde_json::to_vec(&status_wire).unwrap()).expect("direct status");
-    assert_eq!(direct_status.topic, TOPIC_SIP_STATUSES);
-
-    // 4. Fail-closed rejections: empty, non-UTF8, non-JSON, malformed JSON
-    assert!(matches!(
-        parse_broker_wire_frame(b"   \n\t "),
-        Err(DataInfraError::Transport(_))
-    ));
-    assert!(matches!(
-        parse_broker_wire_frame(&[0xff, 0xfe, 0xfd]),
-        Err(DataInfraError::Transport(_))
-    ));
-    assert!(matches!(
-        parse_broker_wire_frame(b"PLAIN_TEXT_NO_JSON"),
-        Err(DataInfraError::Transport(_))
-    ));
-    assert!(matches!(
-        parse_broker_wire_frame(b"{\"unrecognized_schema\": 123}"),
-        Err(DataInfraError::Transport(_))
-    ));
+    assert_eq!(
+        parsed_env_data.payload.into_payload_bytes().unwrap(),
+        status_bytes
+    );
 }
 
 #[tokio::test]
@@ -906,6 +963,232 @@ async fn test_tcp_kafka_payload_source_ephemeral_broker_streaming_failover_and_c
         .await
         .expect_err("malformed non-JSON Kafka record must fail closed");
     assert!(matches!(bad_err, DataInfraError::Transport(_)));
+
+    source.close().await.expect("close TcpKafkaPayloadSource");
+}
+
+#[tokio::test]
+async fn test_kafka_partition_polling_priority_batch_cap_and_poison_pill_offset_advance() {
+    let live_addr = std::env::var("KAFKA_BROKERS").unwrap_or_else(|_| "127.0.0.1:9092".to_string());
+
+    // Use the canonical SIP topics so `topic_poll_priority` assigns:
+    // - `md.sip.statuses` -> 0
+    // - `md.sip.bars.1m`  -> 1
+    // - `md.sip.quotes`   -> 2
+    let quote_topic = TOPIC_SIP_QUOTES.to_string();
+    let bar_topic = TOPIC_SIP_BARS_1M.to_string();
+    let status_topic = TOPIC_SIP_STATUSES.to_string();
+
+    let producer_client = ClientBuilder::new(vec![live_addr.clone()])
+        .build()
+        .await
+        .expect("connect to local Kafka broker on 127.0.0.1:9092");
+    if let Ok(ctrl) = producer_client.controller_client() {
+        for t in [&quote_topic, &bar_topic, &status_topic] {
+            let _ = ctrl.create_topic(t.as_str(), 1, 1, 5_000).await;
+        }
+    }
+
+    let cfg = DataInfraConfig::new_checked(
+        "http://127.0.0.1:8123",
+        "market_data",
+        2_000,
+        0,
+        vec![live_addr],
+        "nautilus-datainfra-fairness-test",
+        "http://127.0.0.1:8012",
+        "ALPACA",
+    )
+    .expect("valid DataInfraConfig");
+
+    // Deliberately pass `quote_topic` first in the configured topics list to verify `ensure_session`
+    // sorts cursors by `topic_poll_priority` (`statuses` -> `bars` -> `quotes`).
+    let source = TcpKafkaPayloadSource::with_topics(
+        &cfg,
+        vec![quote_topic.clone(), bar_topic.clone(), status_topic.clone()],
+    )
+    .expect("create TcpKafkaPayloadSource");
+
+    // Establish initial session (`OffsetAt::Latest`)
+    assert!(source.next_frame().await.expect("initial poll").is_none());
+
+    let quote_pc = producer_client
+        .partition_client(quote_topic.clone(), 0, UnknownTopicHandling::Retry)
+        .await
+        .expect("quote partition client");
+    let bar_pc = producer_client
+        .partition_client(bar_topic.clone(), 0, UnknownTopicHandling::Retry)
+        .await
+        .expect("bar partition client");
+    let status_pc = producer_client
+        .partition_client(status_topic.clone(), 0, UnknownTopicHandling::Retry)
+        .await
+        .expect("status partition client");
+
+    let ts = rskafka::chrono::Utc::now();
+
+    // 1. Produce 80 quotes (> MAX_RECORDS_PER_PARTITION_POLL = 64), 1 bar, and 1 status simultaneously.
+    //    Because `statuses` (priority 0) and `bars` (priority 1) are polled before `quotes` (priority 2),
+    //    the first two frames returned by `next_frame()` MUST be the status frame and the bar frame,
+    //    followed by at most 64 quote frames from the first poll cycle!
+    let mut quote_records = Vec::with_capacity(80);
+    for idx in 0..80_u64 {
+        let q_json = format!(
+            r#"{{"symbol":"AAPL","quote_ts_ms":{},"bid_price":185.0,"bid_size":100.0,"ask_price":185.1,"ask_size":100.0}}"#,
+            1_777_896_600_000_u64 + idx
+        );
+        quote_records.push(Record {
+            key: Some(b"AAPL".to_vec()),
+            value: Some(q_json.into_bytes()),
+            headers: std::collections::BTreeMap::new(),
+            timestamp: ts,
+        });
+    }
+    quote_pc
+        .produce(quote_records, Compression::NoCompression)
+        .await
+        .expect("produce 80 quotes");
+
+    bar_pc
+        .produce(
+            vec![Record {
+                key: Some(b"AAPL".to_vec()),
+                value: Some(
+                    br#"{"symbol":"AAPL","timeframe":"1m","bar_ts":1777896600,"open":185.0,"high":186.0,"low":184.5,"close":185.5,"volume":42000.0,"version":1,"is_synthetic":false,"is_suspect_spike":false}"#
+                        .to_vec(),
+                ),
+                headers: std::collections::BTreeMap::new(),
+                timestamp: ts,
+            }],
+            Compression::NoCompression,
+        )
+        .await
+        .expect("produce 1 bar");
+
+    status_pc
+        .produce(
+            vec![Record {
+                key: Some(b"AAPL".to_vec()),
+                value: Some(
+                    br#"{"symbol":"AAPL","status_ts_ms":1777896600000,"state":"HALTED","reason":"LULD_PAUSE"}"#
+                        .to_vec(),
+                ),
+                headers: std::collections::BTreeMap::new(),
+                timestamp: ts,
+            }],
+            Compression::NoCompression,
+        )
+        .await
+        .expect("produce 1 status");
+
+    let first = source
+        .next_frame()
+        .await
+        .expect("poll #1")
+        .expect("frame #1");
+    let second = source
+        .next_frame()
+        .await
+        .expect("poll #2")
+        .expect("frame #2");
+    assert_eq!(
+        first.topic, status_topic,
+        "md.sip.statuses must be polled with highest priority (before bars and quotes)"
+    );
+    assert_eq!(
+        second.topic, bar_topic,
+        "md.sip.bars.1m must be polled before md.sip.quotes"
+    );
+
+    // Drain the 64 quotes queued from the first poll batch (`MAX_RECORDS_PER_PARTITION_POLL = 64`),
+    // then produce a new status event while 16 quotes remain unpolled on the broker partition.
+    // On the next poll cycle (65th call after the 2 status/bar frames), the new status event must be
+    // prioritized ahead of the remaining 16 quotes!
+    for _ in 0..64 {
+        let q_frame = source
+            .next_frame()
+            .await
+            .expect("poll queued quote")
+            .expect("quote frame");
+        assert_eq!(q_frame.topic, quote_topic);
+    }
+
+    status_pc
+        .produce(
+            vec![Record {
+                key: Some(b"AAPL".to_vec()),
+                value: Some(
+                    br#"{"symbol":"AAPL","status_ts_ms":1777896660000,"state":"TRADING"}"#
+                        .to_vec(),
+                ),
+                headers: std::collections::BTreeMap::new(),
+                timestamp: ts,
+            }],
+            Compression::NoCompression,
+        )
+        .await
+        .expect("produce 2nd status while 16 quotes remain on broker");
+
+    let next_cycle_first = source
+        .next_frame()
+        .await
+        .expect("poll next cycle")
+        .expect("frame after 64-quote cap");
+    assert_eq!(
+        next_cycle_first.topic, status_topic,
+        "per-partition batch cap (64) must prevent quote flood from starving subsequent status events"
+    );
+
+    // Drain the remaining 16 quotes
+    for _ in 0..16 {
+        let q_frame = source
+            .next_frame()
+            .await
+            .expect("poll remaining quote")
+            .expect("remaining quote frame");
+        assert_eq!(q_frame.topic, quote_topic);
+    }
+
+    // 2. Poison-pill offset advance: produce a corrupt non-JSON record followed by a valid JSON record
+    //    on `bar_topic`. The first `next_frame()` must return `Err(DataInfraError::Transport)` AND
+    //    advance `cursor.next_offset` so the very next `next_frame()` returns `Ok(Some(valid_frame))`
+    //    rather than getting stuck on the poison pill forever.
+    bar_pc
+        .produce(
+            vec![
+                Record {
+                    key: Some(b"AAPL".to_vec()),
+                    value: Some(b"POISON_PILL_CORRUPT_PAYLOAD".to_vec()),
+                    headers: std::collections::BTreeMap::new(),
+                    timestamp: ts,
+                },
+                Record {
+                    key: Some(b"AAPL".to_vec()),
+                    value: Some(
+                        br#"{"symbol":"AAPL","timeframe":"1m","bar_ts":1777896660,"open":185.5,"high":186.5,"low":185.0,"close":186.0,"volume":31000.0,"version":1,"is_synthetic":false,"is_suspect_spike":false}"#
+                            .to_vec(),
+                    ),
+                    headers: std::collections::BTreeMap::new(),
+                    timestamp: ts,
+                },
+            ],
+            Compression::NoCompression,
+        )
+        .await
+        .expect("produce poison pill + valid bar");
+
+    let poison_err = source
+        .next_frame()
+        .await
+        .expect_err("corrupt record must return Err");
+    assert!(matches!(poison_err, DataInfraError::Transport(_)));
+
+    let recovered_frame = source
+        .next_frame()
+        .await
+        .expect("next_frame after poison pill must not re-read corrupt offset")
+        .expect("valid bar record after poison pill must be returned");
+    assert_eq!(recovered_frame.topic, bar_topic);
 
     source.close().await.expect("close TcpKafkaPayloadSource");
 }

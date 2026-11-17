@@ -47,5 +47,5 @@ pub use factories::AlpacaExecutionClientFactory;
 pub use http::AlpacaHttpClient;
 pub use websocket::{
     AlpacaExecutionUpdate, AlpacaTradeEventKind, AlpacaTradeUpdatePayload, AlpacaWsClient,
-    AlpacaWsLifecycleObserver, AlpacaWsSessionState,
+    AlpacaWsLifecycleObserver, AlpacaWsOrderPayload, AlpacaWsSessionState,
 };

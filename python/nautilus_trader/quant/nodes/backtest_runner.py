@@ -15,12 +15,14 @@ from __future__ import annotations
 
 import gc
 import math
+import os
 import statistics
 import uuid
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from urllib.parse import quote
 
 from nautilus_trader.quant.contracts.models import (
     BREAKOUT_ARCHETYPE_IDS,
@@ -938,6 +940,11 @@ class IsomorphicBacktestRunner:
                     first_entry_fill = (fill_ts, px_f)
         self._last_first_entry_fill = first_entry_fill
 
+        order_init_ts_by_id: Dict[str, int] = {
+            str(getattr(o, "client_order_id", "")): int(getattr(o, "ts_init", 0) or 0)
+            for o in orders
+            if str(getattr(o, "client_order_id", ""))
+        }
         net_pnl = 0.0
         trade_cycles: List[Dict[str, Any]] = []
         for pos in positions:
@@ -962,10 +969,13 @@ class IsomorphicBacktestRunner:
             trade_pnls.append(pos_total_pnl)
             ts_opened = int(getattr(pos, "ts_opened", 0) or 0)
             ts_closed = int(getattr(pos, "ts_closed", 0) or 0)
+            opening_ord_id = str(getattr(pos, "opening_order_id", "") or "")
+            signal_ts_ns = order_init_ts_by_id.get(opening_ord_id, 0)
             entry_px = _parse_money_float(getattr(pos, "avg_px_open", 0.0))
             trade_cycles.append(
                 {
                     "instrument_id": inst_key,
+                    "signal_ts_ns": signal_ts_ns,
                     "ts_opened": ts_opened,
                     "ts_closed": ts_closed,
                     "entry_px": entry_px,
@@ -1485,10 +1495,12 @@ class StressFalsifier:
         total_winners = len(winning_cycles)
 
         for cyc in winning_cycles:
+            signal_ts = int(cyc.get("signal_ts_ns", 0) or 0)
             ts_opened = int(cyc.get("ts_opened", 0) or 0)
+            anchor_ts = signal_ts if signal_ts > 0 else ts_opened
             bar_idx = 0
             for idx, b in enumerate(primary_bars):
-                if int(b.ts_init) <= ts_opened:
+                if int(b.ts_init) <= anchor_ts:
                     bar_idx = idx
                 else:
                     break
@@ -1692,4 +1704,66 @@ class StressFalsifier:
 
 
 StressFalsificationSuite = StressFalsifier
+
+
+def build_datainfra_config_from_env() -> DataInfraConfig:
+    """Constructs `DataInfraConfig` from container environment variables."""
+    ch_url = (
+        os.environ.get("DATAINFRA_CLICKHOUSE_URL")
+        or os.environ.get("CLICKHOUSE_URL")
+        or os.environ.get("CLICKHOUSE_HTTP_URL")
+        or ""
+    ).strip()
+    ch_user = (
+        os.environ.get("DATAINFRA_CLICKHOUSE_USER")
+        or os.environ.get("CLICKHOUSE_USER")
+        or os.environ.get("CH_USER")
+        or ""
+    ).strip()
+    ch_pw = (
+        os.environ.get("DATAINFRA_CLICKHOUSE_PASSWORD")
+        or os.environ.get("CLICKHOUSE_PASSWORD")
+        or os.environ.get("CH_PASSWORD")
+        or ""
+    ).strip()
+    if not ch_url:
+        ch_host = os.environ.get("CH_HOST", "127.0.0.1").strip()
+        ch_port = (os.environ.get("CH_HTTP_PORT") or os.environ.get("CH_PORT") or "8123").strip()
+        if ch_user:
+            ch_url = f"http://{ch_host}:{ch_port}/?user={quote(ch_user)}&password={quote(ch_pw)}"
+        else:
+            ch_url = f"http://{ch_host}:{ch_port}"
+    elif ch_user and "user=" not in ch_url and "@" not in ch_url:
+        sep = "&" if "?" in ch_url else "?"
+        ch_url = f"{ch_url}{sep}user={quote(ch_user)}&password={quote(ch_pw)}"
+    ch_db = (
+        os.environ.get("DATAINFRA_CLICKHOUSE_DATABASE")
+        or os.environ.get("CLICKHOUSE_DATABASE")
+        or os.environ.get("CH_DB")
+        or "quant_market_data"
+    ).strip()
+    brokers_raw = (
+        os.environ.get("DATAINFRA_KAFKA_BROKERS")
+        or os.environ.get("KAFKA_BROKERS")
+        or "127.0.0.1:9092"
+    )
+    brokers = [b.strip() for b in brokers_raw.split(",") if b.strip()]
+    cal_url = (
+        os.environ.get("DATAINFRA_CALENDAR_SERVICE_URL")
+        or os.environ.get("CALENDAR_SERVICE_URL")
+        or "http://127.0.0.1:8012"
+    ).strip()
+    venue = (
+        os.environ.get("DATAINFRA_DEFAULT_VENUE")
+        or os.environ.get("DEFAULT_VENUE")
+        or "ALPACA"
+    ).strip().upper()
+    return DataInfraConfig(
+        clickhouse_url=ch_url,
+        clickhouse_database=ch_db,
+        kafka_brokers=brokers,
+        kafka_group_id=os.environ.get("KAFKA_GROUP_ID", "nautilus-mcp-service"),
+        calendar_service_url=cal_url,
+        default_venue=venue,
+    )
 

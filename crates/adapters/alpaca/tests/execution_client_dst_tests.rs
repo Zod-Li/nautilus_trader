@@ -48,8 +48,8 @@ use nautilus_common::{
         ExecutionEvent,
         execution::{
             BatchCancelOrders, CancelAllOrders, CancelOrder, GenerateFillReportsBuilder,
-            GenerateOrderStatusReportsBuilder, GeneratePositionStatusReportsBuilder, ModifyOrder,
-            SubmitOrder, SubmitOrderList,
+            GenerateOrderStatusReport, GenerateOrderStatusReportsBuilder,
+            GeneratePositionStatusReportsBuilder, ModifyOrder, SubmitOrder, SubmitOrderList,
         },
     },
 };
@@ -160,6 +160,24 @@ fn make_test_config(http_base_url: &str, ws_url: &str) -> AlpacaExecClientConfig
 
 fn drain_events(rx: &mut UnboundedReceiver<ExecutionEvent>) -> Vec<ExecutionEvent> {
     let mut out = Vec::new();
+    while let Ok(ev) = rx.try_recv() {
+        out.push(ev);
+    }
+    out
+}
+
+async fn recv_events(
+    rx: &mut UnboundedReceiver<ExecutionEvent>,
+    expected_count: usize,
+) -> Vec<ExecutionEvent> {
+    let mut out = Vec::with_capacity(expected_count);
+    for _ in 0..expected_count {
+        let ev = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timed out waiting for expected ExecutionEvent")
+            .expect("ExecutionEvent channel closed unexpectedly");
+        out.push(ev);
+    }
     while let Ok(ev) = rx.try_recv() {
         out.push(ev);
     }
@@ -885,11 +903,11 @@ async fn test_single_leg_limit_stoplimit_and_bracket_oco_oto_order_lists_dst() {
     });
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
-    replace_exec_event_sender(tx);
+    replace_exec_event_sender(tx.clone());
 
     let cache = Rc::new(RefCell::new(Cache::default()));
     let config = make_test_config(&http_base_url, "ws://127.0.0.1:9/stream");
-    let client = AlpacaExecutionClient::new(
+    let mut client = AlpacaExecutionClient::new(
         TraderId::from("TRADER-001"),
         ClientId::from(ALPACA_VENUE),
         AccountId::from("ALPACA-001"),
@@ -898,6 +916,7 @@ async fn test_single_leg_limit_stoplimit_and_bracket_oco_oto_order_lists_dst() {
     )
     .unwrap()
     .with_ws_enabled(false);
+    client.set_sender(tx);
 
     // 1. Submit LimitOrder
     let lmt_order = make_limit_order(
@@ -916,6 +935,7 @@ async fn test_single_leg_limit_stoplimit_and_bracket_oco_oto_order_lists_dst() {
         .add_order(lmt_order.clone(), None, Some(ClientId::from(ALPACA_VENUE)), false)
         .unwrap();
     client.submit_order(make_submit_order_cmd(&lmt_order)).unwrap();
+    let mut single_events = recv_events(&mut rx, 2).await;
 
     // 2. Submit StopLimitOrder
     let slmt_order = make_stop_limit_order(
@@ -935,8 +955,7 @@ async fn test_single_leg_limit_stoplimit_and_bracket_oco_oto_order_lists_dst() {
         .add_order(slmt_order.clone(), None, Some(ClientId::from(ALPACA_VENUE)), false)
         .unwrap();
     client.submit_order(make_submit_order_cmd(&slmt_order)).unwrap();
-
-    let single_events = drain_events(&mut rx);
+    single_events.extend(recv_events(&mut rx, 2).await);
     assert_eq!(single_events.len(), 4);
     assert!(matches!(
         single_events[1],
@@ -1024,7 +1043,7 @@ async fn test_single_leg_limit_stoplimit_and_bracket_oco_oto_order_lists_dst() {
     );
     client.submit_order_list(brk_cmd).unwrap();
 
-    let brk_events = drain_events(&mut rx);
+    let brk_events = recv_events(&mut rx, 6).await;
     // 3 Submitted + 3 Accepted = 6 events
     assert_eq!(brk_events.len(), 6);
     assert!(matches!(
@@ -1105,7 +1124,7 @@ async fn test_single_leg_limit_stoplimit_and_bracket_oco_oto_order_lists_dst() {
     );
     client.submit_order_list(oco_cmd).unwrap();
 
-    let oco_events = drain_events(&mut rx);
+    let oco_events = recv_events(&mut rx, 4).await;
     assert_eq!(oco_events.len(), 4);
     assert!(matches!(
         oco_events[2],
@@ -1177,7 +1196,7 @@ async fn test_single_leg_limit_stoplimit_and_bracket_oco_oto_order_lists_dst() {
     );
     client.submit_order_list(oto_cmd).unwrap();
 
-    let oto_events = drain_events(&mut rx);
+    let oto_events = recv_events(&mut rx, 4).await;
     assert_eq!(oto_events.len(), 4);
     assert!(matches!(
         oto_events[2],
@@ -1255,13 +1274,26 @@ async fn test_modify_cancel_cancel_all_and_batch_cancel_orders_dst() {
         )
         .await;
 
-        // 3. CancelOrder DELETE /v2/orders/VEN-MOD-2
+        // 3. CancelOrder DELETE /v2/orders/VEN-MOD-2 + post-cancel GET /v2/orders/VEN-MOD-2
         let (mut s3, _) = http_listener.accept().await.unwrap();
         let (m3, p3, _) = read_http_request(&mut s3).await;
         assert_eq!((m3.as_str(), p3.as_str()), ("DELETE", "/v2/orders/VEN-MOD-2"));
         write_http_response(&mut s3, "204 No Content", "").await;
 
-        // 4. CancelAllOrders: GET /v2/orders?status=open&limit=500 followed by DELETE /v2/orders/VEN-ALL-1
+        let (mut s3_get, _) = http_listener.accept().await.unwrap();
+        let (m3_get, p3_get, _) = read_http_request(&mut s3_get).await;
+        assert_eq!(
+            (m3_get.as_str(), p3_get.as_str()),
+            ("GET", "/v2/orders/VEN-MOD-2")
+        );
+        write_http_response(
+            &mut s3_get,
+            "200 OK",
+            r#"{"id":"VEN-MOD-2","replaces":"VEN-MOD-1","client_order_id":"CID-MOD-1","created_at":"2026-03-31T14:40:05Z","canceled_at":"2026-03-31T14:40:06Z","symbol":"AAPL","qty":"15","filled_qty":"0","type":"limit","side":"buy","time_in_force":"day","limit_price":"202.50","status":"canceled"}"#,
+        )
+        .await;
+
+        // 4. CancelAllOrders: GET /v2/orders?status=open&limit=500 followed by DELETE /v2/orders/VEN-ALL-1 + GET /v2/orders/VEN-ALL-1
         let (mut s4, _) = http_listener.accept().await.unwrap();
         let (m4, p4, _) = read_http_request(&mut s4).await;
         assert_eq!(
@@ -1283,30 +1315,63 @@ async fn test_modify_cancel_cancel_all_and_batch_cancel_orders_dst() {
         assert_eq!((m5.as_str(), p5.as_str()), ("DELETE", "/v2/orders/VEN-ALL-1"));
         write_http_response(&mut s5, "204 No Content", "").await;
 
-        // 5. BatchCancelOrders: DELETE /v2/orders/VEN-BATCH-1 and DELETE /v2/orders/VEN-BATCH-2
+        let (mut s5_get, _) = http_listener.accept().await.unwrap();
+        let (m5_get, p5_get, _) = read_http_request(&mut s5_get).await;
+        assert_eq!(
+            (m5_get.as_str(), p5_get.as_str()),
+            ("GET", "/v2/orders/VEN-ALL-1")
+        );
+        write_http_response(
+            &mut s5_get,
+            "200 OK",
+            r#"{"id":"VEN-ALL-1","client_order_id":"CID-ALL-1","created_at":"2026-03-31T14:41:00Z","canceled_at":"2026-03-31T14:41:01Z","symbol":"NVDA","qty":"20","filled_qty":"0","type":"limit","side":"buy","time_in_force":"day","limit_price":"130.00","status":"canceled"}"#,
+        )
+        .await;
+
+        // 5. BatchCancelOrders: DELETE + GET /v2/orders/VEN-BATCH-1 and DELETE + GET /v2/orders/VEN-BATCH-2
         let (mut s6, _) = http_listener.accept().await.unwrap();
         let (m6, p6, _) = read_http_request(&mut s6).await;
-        assert_eq!(
-            (m6.as_str(), p6.as_str()),
-            ("DELETE", "/v2/orders/VEN-BATCH-1")
-        );
+        assert_eq!(m6.as_str(), "DELETE");
         write_http_response(&mut s6, "204 No Content", "").await;
+
+        let (mut s6_get, _) = http_listener.accept().await.unwrap();
+        let (m6_get, p6_get, _) = read_http_request(&mut s6_get).await;
+        assert_eq!((m6_get.as_str(), p6_get.as_str()), ("GET", p6.as_str()));
+        write_http_response(
+            &mut s6_get,
+            "200 OK",
+            r#"{"id":"VEN-BATCH-1","client_order_id":"CID-BATCH-1","created_at":"2026-03-31T14:41:00Z","canceled_at":"2026-03-31T14:41:02Z","symbol":"NVDA","qty":"10","filled_qty":"0","type":"limit","side":"buy","time_in_force":"day","limit_price":"131.00","status":"canceled"}"#,
+        )
+        .await;
 
         let (mut s7, _) = http_listener.accept().await.unwrap();
         let (m7, p7, _) = read_http_request(&mut s7).await;
+        assert_eq!(m7.as_str(), "DELETE");
+        let mut batch_paths = [p6.as_str(), p7.as_str()];
+        batch_paths.sort_unstable();
         assert_eq!(
-            (m7.as_str(), p7.as_str()),
-            ("DELETE", "/v2/orders/VEN-BATCH-2")
+            batch_paths,
+            ["/v2/orders/VEN-BATCH-1", "/v2/orders/VEN-BATCH-2"]
         );
         write_http_response(&mut s7, "204 No Content", "").await;
+
+        let (mut s7_get, _) = http_listener.accept().await.unwrap();
+        let (m7_get, p7_get, _) = read_http_request(&mut s7_get).await;
+        assert_eq!((m7_get.as_str(), p7_get.as_str()), ("GET", p7.as_str()));
+        write_http_response(
+            &mut s7_get,
+            "200 OK",
+            r#"{"id":"VEN-BATCH-2","client_order_id":"CID-BATCH-2","created_at":"2026-03-31T14:41:00Z","canceled_at":"2026-03-31T14:41:02Z","symbol":"NVDA","qty":"10","filled_qty":"0","type":"limit","side":"sell","time_in_force":"day","limit_price":"145.00","status":"canceled"}"#,
+        )
+        .await;
     });
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
-    replace_exec_event_sender(tx);
+    replace_exec_event_sender(tx.clone());
 
     let cache = Rc::new(RefCell::new(Cache::default()));
     let config = make_test_config(&http_base_url, "ws://127.0.0.1:9/stream");
-    let client = AlpacaExecutionClient::new(
+    let mut client = AlpacaExecutionClient::new(
         TraderId::from("TRADER-001"),
         ClientId::from(ALPACA_VENUE),
         AccountId::from("ALPACA-001"),
@@ -1315,6 +1380,7 @@ async fn test_modify_cancel_cancel_all_and_batch_cancel_orders_dst() {
     )
     .unwrap()
     .with_ws_enabled(false);
+    client.set_sender(tx);
 
     // Add orders to cache
     let mod_order = make_limit_order(
@@ -1371,7 +1437,7 @@ async fn test_modify_cancel_cancel_all_and_batch_cancel_orders_dst() {
 
     // 1. Submit CID-MOD-1
     client.submit_order(make_submit_order_cmd(&mod_order)).unwrap();
-    let _ = drain_events(&mut rx);
+    let _ = recv_events(&mut rx, 2).await;
 
     // 2. Modify CID-MOD-1 (uses tracked VenueOrderId VEN-MOD-1 -> replaces with VEN-MOD-2)
     let modify_cmd = ModifyOrder::new(
@@ -1391,7 +1457,7 @@ async fn test_modify_cancel_cancel_all_and_batch_cancel_orders_dst() {
     );
     client.modify_order(modify_cmd).unwrap();
 
-    let mod_events = drain_events(&mut rx);
+    let mod_events = recv_events(&mut rx, 1).await;
     assert_eq!(mod_events.len(), 1);
     match &mod_events[0] {
         ExecutionEvent::Order(OrderEventAny::Updated(u)) => {
@@ -1418,7 +1484,7 @@ async fn test_modify_cancel_cancel_all_and_batch_cancel_orders_dst() {
     );
     client.cancel_order(cancel_cmd).unwrap();
 
-    let cancel_events = drain_events(&mut rx);
+    let cancel_events = recv_events(&mut rx, 1).await;
     assert_eq!(cancel_events.len(), 1);
     assert!(matches!(
         cancel_events[0],
@@ -1441,7 +1507,7 @@ async fn test_modify_cancel_cancel_all_and_batch_cancel_orders_dst() {
     );
     client.cancel_all_orders(cancel_all_cmd).unwrap();
 
-    let cancel_all_events = drain_events(&mut rx);
+    let cancel_all_events = recv_events(&mut rx, 1).await;
     assert_eq!(cancel_all_events.len(), 1);
     assert!(matches!(
         cancel_all_events[0],
@@ -1489,24 +1555,24 @@ async fn test_modify_cancel_cancel_all_and_batch_cancel_orders_dst() {
     );
     client.batch_cancel_orders(batch_cancel_cmd).unwrap();
 
-    let batch_cancel_events = drain_events(&mut rx);
+    let batch_cancel_events = recv_events(&mut rx, 2).await;
     assert_eq!(
         batch_cancel_events.len(),
         2,
         "batch_cancel_orders must cancel each order in the batch and emit OrderCanceled"
     );
-    assert!(matches!(
-        batch_cancel_events[0],
-        ExecutionEvent::Order(OrderEventAny::Canceled(ref c))
+    assert!(batch_cancel_events.iter().any(|ev| matches!(
+        ev,
+        ExecutionEvent::Order(OrderEventAny::Canceled(c))
             if c.client_order_id == ClientOrderId::from("CID-BATCH-1")
                 && c.venue_order_id == Some(VenueOrderId::from("VEN-BATCH-1"))
-    ));
-    assert!(matches!(
-        batch_cancel_events[1],
-        ExecutionEvent::Order(OrderEventAny::Canceled(ref c))
+    )));
+    assert!(batch_cancel_events.iter().any(|ev| matches!(
+        ev,
+        ExecutionEvent::Order(OrderEventAny::Canceled(c))
             if c.client_order_id == ClientOrderId::from("CID-BATCH-2")
                 && c.venue_order_id == Some(VenueOrderId::from("VEN-BATCH-2"))
-    ));
+    )));
 
     http_server.await.unwrap();
 }
@@ -2084,11 +2150,11 @@ async fn test_submit_order_and_order_list_idempotent_recovery_and_ws_fill_dedup_
     });
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
-    replace_exec_event_sender(tx);
+    replace_exec_event_sender(tx.clone());
 
     let cache = Rc::new(RefCell::new(Cache::default()));
     let config = make_test_config(&http_base_url, "ws://127.0.0.1:9/stream");
-    let client = AlpacaExecutionClient::new(
+    let mut client = AlpacaExecutionClient::new(
         TraderId::from("TRADER-001"),
         ClientId::from(ALPACA_VENUE),
         AccountId::from("ALPACA-001"),
@@ -2097,6 +2163,7 @@ async fn test_submit_order_and_order_list_idempotent_recovery_and_ws_fill_dedup_
     )
     .unwrap()
     .with_ws_enabled(false);
+    client.set_sender(tx);
 
     // --- Case 1: 500 recovered via get_order_by_client_id (`status: "accepted"`) ---
     let ord_acc = make_limit_order(
@@ -2116,7 +2183,7 @@ async fn test_submit_order_and_order_list_idempotent_recovery_and_ws_fill_dedup_
         .unwrap();
     client.submit_order(make_submit_order_cmd(&ord_acc)).unwrap();
 
-    let ev_acc = drain_events(&mut rx);
+    let ev_acc = recv_events(&mut rx, 2).await;
     assert_eq!(
         ev_acc.len(),
         2,
@@ -2158,7 +2225,7 @@ async fn test_submit_order_and_order_list_idempotent_recovery_and_ws_fill_dedup_
         .submit_order(make_submit_order_cmd(&ord_filled))
         .unwrap();
 
-    let ev_filled = drain_events(&mut rx);
+    let ev_filled = recv_events(&mut rx, 3).await;
     assert_eq!(
         ev_filled.len(),
         3,
@@ -2281,7 +2348,7 @@ async fn test_submit_order_and_order_list_idempotent_recovery_and_ws_fill_dedup_
     );
     client.submit_order_list(brk_cmd).unwrap();
 
-    let ev_brk = drain_events(&mut rx);
+    let ev_brk = recv_events(&mut rx, 6).await;
     assert_eq!(ev_brk.len(), 6, "3 Submitted + 3 Accepted on bracket recovery");
     assert!(matches!(
         ev_brk[3],
@@ -2319,7 +2386,7 @@ async fn test_submit_order_and_order_list_idempotent_recovery_and_ws_fill_dedup_
         .unwrap();
     client.submit_order(make_submit_order_cmd(&ord_wash)).unwrap();
 
-    let ev_wash = drain_events(&mut rx);
+    let ev_wash = recv_events(&mut rx, 2).await;
     assert_eq!(ev_wash.len(), 2);
     assert!(matches!(
         ev_wash[1],
@@ -2345,7 +2412,7 @@ async fn test_submit_order_and_order_list_idempotent_recovery_and_ws_fill_dedup_
         .unwrap();
     client.submit_order(make_submit_order_cmd(&ord_404)).unwrap();
 
-    let ev_404 = drain_events(&mut rx);
+    let ev_404 = recv_events(&mut rx, 2).await;
     assert_eq!(ev_404.len(), 2);
     assert!(matches!(
         ev_404[1],
@@ -2359,11 +2426,11 @@ async fn test_submit_order_and_order_list_idempotent_recovery_and_ws_fill_dedup_
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_ws_stopped_event_emits_order_accepted_and_never_canceled_dst() {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
-    replace_exec_event_sender(tx);
+    replace_exec_event_sender(tx.clone());
 
     let cache = Rc::new(RefCell::new(Cache::default()));
     let config = make_test_config("http://127.0.0.1:9", "ws://127.0.0.1:9/stream");
-    let client = AlpacaExecutionClient::new(
+    let mut client = AlpacaExecutionClient::new(
         TraderId::from("TRADER-001"),
         ClientId::from(ALPACA_VENUE),
         AccountId::from("ALPACA-001"),
@@ -2372,6 +2439,7 @@ async fn test_ws_stopped_event_emits_order_accepted_and_never_canceled_dst() {
     )
     .unwrap()
     .with_ws_enabled(false);
+    client.set_sender(tx);
 
     let stop_order = make_stop_market_order(
         "CID-WS-STOPPED",
@@ -2536,11 +2604,11 @@ async fn test_cross_path_ws_and_rest_fill_reconciliation_dedup_and_delta_notiona
     });
 
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
-    replace_exec_event_sender(tx);
+    replace_exec_event_sender(tx.clone());
 
     let cache = Rc::new(RefCell::new(Cache::default()));
     let config = make_test_config(&http_base_url, "ws://127.0.0.1:9/stream");
-    let client = AlpacaExecutionClient::new(
+    let mut client = AlpacaExecutionClient::new(
         TraderId::from("TRADER-001"),
         ClientId::from(ALPACA_VENUE),
         AccountId::from("ALPACA-001"),
@@ -2549,6 +2617,7 @@ async fn test_cross_path_ws_and_rest_fill_reconciliation_dedup_and_delta_notiona
     )
     .unwrap()
     .with_ws_enabled(false);
+    client.set_sender(tx);
 
     let ord_a = make_limit_order(
         "CID-CROSS-A",
@@ -2787,4 +2856,669 @@ async fn test_cross_path_ws_and_rest_fill_reconciliation_dedup_and_delta_notiona
     );
 
     http_server.await.unwrap();
+}
+
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_finding14_direct_get_order_by_venue_id_and_non_blocking_spawn_dst() {
+    let http_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let http_addr = http_listener.local_addr().unwrap();
+    let http_base_url = format!("http://{http_addr}");
+
+    let http_server = tokio::spawn(async move {
+        // 1. Slow POST /v2/orders (40ms delay) to verify `submit_order` does not block the caller thread
+        let (mut s1, _) = http_listener.accept().await.unwrap();
+        let (m1, p1, _) = read_http_request(&mut s1).await;
+        assert_eq!((m1.as_str(), p1.as_str()), ("POST", "/v2/orders"));
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        write_http_response(
+            &mut s1,
+            "200 OK",
+            r#"{"id":"VEN-F14-1","client_order_id":"CID-F14-1","created_at":"2026-03-31T15:00:00Z","submitted_at":"2026-03-31T15:00:00.100Z","symbol":"AAPL","qty":"10","filled_qty":"0","order_class":"simple","type":"limit","side":"buy","time_in_force":"day","limit_price":"200.00","status":"accepted"}"#,
+        )
+        .await;
+
+        // 2. Direct GET /v2/orders/VEN-F14-1 for `generate_order_status_report` (venue_order_id only)
+        let (mut s2, _) = http_listener.accept().await.unwrap();
+        let (m2, p2, _) = read_http_request(&mut s2).await;
+        assert_eq!(
+            (m2.as_str(), p2.as_str()),
+            ("GET", "/v2/orders/VEN-F14-1"),
+            "generate_order_status_report with venue_order_id must call GET /v2/orders/{{id}} directly"
+        );
+        write_http_response(
+            &mut s2,
+            "200 OK",
+            r#"{"id":"VEN-F14-1","client_order_id":"CID-F14-1","created_at":"2026-03-31T15:00:00Z","submitted_at":"2026-03-31T15:00:00.100Z","filled_at":"2026-03-31T15:00:02Z","symbol":"AAPL","qty":"10","filled_qty":"10","filled_avg_price":"199.75","order_class":"simple","type":"limit","side":"buy","time_in_force":"day","limit_price":"200.00","status":"filled"}"#,
+        )
+        .await;
+
+        // 3. Direct GET /v2/orders/VEN-F14-MISSING -> 404 returns Ok(None)
+        let (mut s3, _) = http_listener.accept().await.unwrap();
+        let (m3, p3, _) = read_http_request(&mut s3).await;
+        assert_eq!(
+            (m3.as_str(), p3.as_str()),
+            ("GET", "/v2/orders/VEN-F14-MISSING")
+        );
+        write_http_response(
+            &mut s3,
+            "404 Not Found",
+            r#"{"code":40410000,"message":"order not found"}"#,
+        )
+        .await;
+
+        // 4. Direct GET /v2/orders/VEN-F14-1 for `generate_fill_reports` when venue_order_id is specified
+        let (mut s4, _) = http_listener.accept().await.unwrap();
+        let (m4, p4, _) = read_http_request(&mut s4).await;
+        assert_eq!(
+            (m4.as_str(), p4.as_str()),
+            ("GET", "/v2/orders/VEN-F14-1"),
+            "generate_fill_reports with venue_order_id must call GET /v2/orders/{{id}} directly instead of list_orders(all)"
+        );
+        write_http_response(
+            &mut s4,
+            "200 OK",
+            r#"{"id":"VEN-F14-1","client_order_id":"CID-F14-1","created_at":"2026-03-31T15:00:00Z","submitted_at":"2026-03-31T15:00:00.100Z","filled_at":"2026-03-31T15:00:02Z","symbol":"AAPL","qty":"10","filled_qty":"10","filled_avg_price":"199.75","order_class":"simple","type":"limit","side":"buy","time_in_force":"day","limit_price":"200.00","status":"filled"}"#,
+        )
+        .await;
+    });
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+    replace_exec_event_sender(tx.clone());
+
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let config = make_test_config(&http_base_url, "ws://127.0.0.1:9/stream");
+    let mut client = AlpacaExecutionClient::new(
+        TraderId::from("TRADER-001"),
+        ClientId::from(ALPACA_VENUE),
+        AccountId::from("ALPACA-001"),
+        config,
+        cache.clone(),
+    )
+    .unwrap()
+    .with_ws_enabled(false);
+    client.set_sender(tx);
+
+    let ord = make_limit_order(
+        "CID-F14-1",
+        "AAPL",
+        OrderSide::Buy,
+        "10",
+        "200.00",
+        None,
+        None,
+        None,
+        None,
+    );
+    cache
+        .borrow_mut()
+        .add_order(ord.clone(), None, Some(ClientId::from(ALPACA_VENUE)), false)
+        .unwrap();
+
+    // 1. Verify `submit_order` is non-blocking (< 15ms even though server delays 40ms)
+    let t0 = std::time::Instant::now();
+    client.submit_order(make_submit_order_cmd(&ord)).unwrap();
+    let submit_elapsed = t0.elapsed();
+    assert!(
+        submit_elapsed < Duration::from_millis(15),
+        "submit_order must not block the execution thread (took {submit_elapsed:?})"
+    );
+    let submit_events = recv_events(&mut rx, 2).await;
+    assert_eq!(submit_events.len(), 2);
+
+    // 2. Verify `generate_order_status_report` with `venue_order_id` hits `GET /v2/orders/VEN-F14-1`
+    let ts_init = UnixNanos::from(1_700_000_000_000_000_000u64);
+    let status_cmd = GenerateOrderStatusReport::new(
+        UUID4::new(),
+        ts_init,
+        Some(InstrumentId::from("AAPL.ALPACA")),
+        None,
+        Some(VenueOrderId::from("VEN-F14-1")),
+        None,
+        None,
+    );
+    let report = client
+        .generate_order_status_report(&status_cmd)
+        .await
+        .expect("generate_order_status_report should succeed")
+        .expect("report should be Some");
+    assert_eq!(report.venue_order_id, VenueOrderId::from("VEN-F14-1"));
+    assert_eq!(report.order_status, OrderStatus::Filled);
+
+    // 3. Verify 404 on `GET /v2/orders/VEN-F14-MISSING` returns `Ok(None)`
+    let missing_cmd = GenerateOrderStatusReport::new(
+        UUID4::new(),
+        ts_init,
+        Some(InstrumentId::from("AAPL.ALPACA")),
+        None,
+        Some(VenueOrderId::from("VEN-F14-MISSING")),
+        None,
+        None,
+    );
+    let missing_report = client
+        .generate_order_status_report(&missing_cmd)
+        .await
+        .expect("404 should map to Ok(None)");
+    assert!(missing_report.is_none());
+
+    // 4. Verify `generate_fill_reports` with `venue_order_id` hits `GET /v2/orders/VEN-F14-1`
+    let fill_cmd = GenerateFillReportsBuilder::default()
+        .ts_init(ts_init)
+        .instrument_id(Some(InstrumentId::from("AAPL.ALPACA")))
+        .venue_order_id(Some(VenueOrderId::from("VEN-F14-1")))
+        .build()
+        .unwrap();
+    let fills = client
+        .generate_fill_reports(fill_cmd)
+        .await
+        .expect("generate_fill_reports with venue_order_id should succeed");
+    assert_eq!(fills.len(), 1);
+    assert_eq!(fills[0].venue_order_id, VenueOrderId::from("VEN-F14-1"));
+    assert_eq!(fills[0].last_qty, Quantity::from("10"));
+    assert_eq!(fills[0].last_px, Price::from("199.75"));
+
+    http_server.await.unwrap();
+}
+
+// =================================================================================================
+// Ticket 03: Alpaca Atomic `PATCH /v2/orders/{id}` (`replaces`) Lineage, WS-Before-HTTP Race,
+// and Per-Instrument FIFO Order Serialization DST
+// =================================================================================================
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_ticket03_patch_replaces_lineage_and_ws_before_http_race_dst() {
+    let http_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let http_addr = http_listener.local_addr().unwrap();
+    let http_base_url = format!("http://{http_addr}");
+
+    let (patch1_arrived_tx, patch1_arrived_rx) = tokio::sync::oneshot::channel::<()>();
+    let (patch1_release_tx, patch1_release_rx) = tokio::sync::oneshot::channel::<()>();
+    let (patch2_arrived_tx, patch2_arrived_rx) = tokio::sync::oneshot::channel::<()>();
+    let (patch2_release_tx, patch2_release_rx) = tokio::sync::oneshot::channel::<()>();
+
+    let http_server = tokio::spawn(async move {
+        // 1. Initial StopMarket submission: CID-STOP-1 -> VEN-STOP-1 (40 shares @ $190.00)
+        let (mut s1, _) = http_listener.accept().await.unwrap();
+        let (m1, p1, _) = read_http_request(&mut s1).await;
+        assert_eq!((m1.as_str(), p1.as_str()), ("POST", "/v2/orders"));
+        write_http_response(
+            &mut s1,
+            "200 OK",
+            r#"{"id":"VEN-STOP-1","client_order_id":"CID-STOP-1","created_at":"2026-03-31T15:10:00Z","submitted_at":"2026-03-31T15:10:00Z","symbol":"AAPL","qty":"40","filled_qty":"0","order_class":"simple","type":"stop","side":"sell","time_in_force":"day","stop_price":"190.00","status":"accepted"}"#,
+        )
+        .await;
+
+        // 2. First ModifyOrder: PATCH /v2/orders/VEN-STOP-1 -> VEN-STOP-2 (100 shares @ $195.00)
+        //    Hold HTTP response until WS `replaced` + `new` frames have been processed first!
+        let (mut s2, _) = http_listener.accept().await.unwrap();
+        let (m2, p2, body2) = read_http_request(&mut s2).await;
+        assert_eq!(
+            (m2.as_str(), p2.as_str()),
+            ("PATCH", "/v2/orders/VEN-STOP-1")
+        );
+        let j2: serde_json::Value = serde_json::from_str(&body2).unwrap();
+        assert_eq!(j2["qty"], "100");
+        assert_eq!(j2["stop_price"], "195.00");
+        let _ = patch1_arrived_tx.send(());
+        let _ = patch1_release_rx.await;
+        write_http_response(
+            &mut s2,
+            "200 OK",
+            r#"{"id":"VEN-STOP-2","replaces":"VEN-STOP-1","client_order_id":"alpaca-auto-cid-hop1","created_at":"2026-03-31T15:10:05Z","submitted_at":"2026-03-31T15:10:05Z","symbol":"AAPL","qty":"100","filled_qty":"0","order_class":"simple","type":"stop","side":"sell","time_in_force":"day","stop_price":"195.00","status":"replaced"}"#,
+        )
+        .await;
+
+        // 3. Second ModifyOrder (trailing stop ratchet): PATCH /v2/orders/VEN-STOP-2 -> VEN-STOP-3
+        //    Notice `ModifyOrder` only supplies `CID-STOP-1` (`venue_order_id = None`), so the
+        //    execution client must resolve `CID-STOP-1 -> VEN-STOP-2`!
+        let (mut s3, _) = http_listener.accept().await.unwrap();
+        let (m3, p3, body3) = read_http_request(&mut s3).await;
+        assert_eq!(
+            (m3.as_str(), p3.as_str()),
+            ("PATCH", "/v2/orders/VEN-STOP-2")
+        );
+        let j3: serde_json::Value = serde_json::from_str(&body3).unwrap();
+        assert_eq!(j3["qty"], "100");
+        assert_eq!(j3["stop_price"], "198.00");
+        let _ = patch2_arrived_tx.send(());
+        let _ = patch2_release_rx.await;
+        write_http_response(
+            &mut s3,
+            "200 OK",
+            r#"{"id":"VEN-STOP-3","replaces":"VEN-STOP-2","client_order_id":"alpaca-auto-cid-hop2","created_at":"2026-03-31T15:10:10Z","submitted_at":"2026-03-31T15:10:10Z","symbol":"AAPL","qty":"100","filled_qty":"0","order_class":"simple","type":"stop","side":"sell","time_in_force":"day","stop_price":"198.00","status":"replaced"}"#,
+        )
+        .await;
+    });
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+    replace_exec_event_sender(tx.clone());
+
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let config = make_test_config(&http_base_url, "ws://127.0.0.1:9/stream");
+    let mut client = AlpacaExecutionClient::new(
+        TraderId::from("TRADER-001"),
+        ClientId::from(ALPACA_VENUE),
+        AccountId::from("ALPACA-001"),
+        config,
+        cache.clone(),
+    )
+    .unwrap()
+    .with_ws_enabled(false);
+    client.set_sender(tx);
+
+    // 1. Submit initial protective stop CID-STOP-1
+    let stop_order = make_stop_market_order(
+        "CID-STOP-1",
+        "AAPL",
+        OrderSide::Sell,
+        "40",
+        "190.00",
+        None,
+        None,
+        None,
+        None,
+    );
+    cache
+        .borrow_mut()
+        .add_order(
+            stop_order.clone(),
+            None,
+            Some(ClientId::from(ALPACA_VENUE)),
+            false,
+        )
+        .unwrap();
+    client
+        .submit_order(make_submit_order_cmd(&stop_order))
+        .unwrap();
+
+    let init_events = recv_events(&mut rx, 2).await;
+    assert_eq!(init_events.len(), 2);
+    assert_eq!(
+        client.client_order_id_for_venue(&VenueOrderId::from("VEN-STOP-1")),
+        Some(ClientOrderId::from("CID-STOP-1"))
+    );
+
+    // 2. Hop 1: Call `modify_order` (`venue_order_id = None`, `qty = 100`, `trigger_price = 195.00`)
+    let mod_cmd_1 = ModifyOrder::new(
+        TraderId::from("TRADER-001"),
+        Some(ClientId::from(ALPACA_VENUE)),
+        StrategyId::from("STRAT-001"),
+        InstrumentId::from("AAPL.ALPACA"),
+        ClientOrderId::from("CID-STOP-1"),
+        None,
+        Some(Quantity::from("100")),
+        None,
+        Some(Price::from("195.00")),
+        UUID4::new(),
+        UnixNanos::from(1_700_000_000_000_000_000u64),
+        None,
+        None,
+    );
+    client.modify_order(mod_cmd_1).unwrap();
+
+    // Wait for HTTP PATCH #1 to reach the server (still held in flight)
+    tokio::time::timeout(Duration::from_secs(2), patch1_arrived_rx)
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Adversarial WS-before-HTTP race: WebSocket `new` frame for replacement order `VEN-STOP-2`
+    // with `replaces: "VEN-STOP-1"` and an Alpaca-generated `client_order_id` arrives BEFORE
+    // the HTTP PATCH response returns!
+    let ws_hop1_new = r#"{
+        "stream": "trade_updates",
+        "data": {
+            "event": "new",
+            "timestamp": "2026-03-31T15:10:05.010Z",
+            "order": {
+                "id": "VEN-STOP-2",
+                "replaces": "VEN-STOP-1",
+                "client_order_id": "alpaca-auto-cid-hop1",
+                "created_at": "2026-03-31T15:10:05Z",
+                "updated_at": "2026-03-31T15:10:05.010Z",
+                "submitted_at": "2026-03-31T15:10:05Z",
+                "symbol": "AAPL",
+                "asset_class": "us_equity",
+                "qty": "100",
+                "filled_qty": "0",
+                "order_class": "simple",
+                "type": "stop",
+                "side": "sell",
+                "time_in_force": "day",
+                "stop_price": "195.00",
+                "status": "new"
+            }
+        }
+    }"#;
+    client.ingest_execution_update(decode_ws_frame_to_update(ws_hop1_new));
+
+    // Verify `VEN-STOP-2 -> CID-STOP-1` lineage is already recorded BEFORE HTTP PATCH returns!
+    assert_eq!(
+        client.client_order_id_for_venue(&VenueOrderId::from("VEN-STOP-2")),
+        Some(ClientOrderId::from("CID-STOP-1")),
+        "WS frame arriving before HTTP PATCH response must resolve and record VEN-STOP-2 -> CID-STOP-1"
+    );
+
+    let ws_hop1_events = drain_events(&mut rx);
+    assert_eq!(ws_hop1_events.len(), 1);
+    match &ws_hop1_events[0] {
+        ExecutionEvent::Order(OrderEventAny::Accepted(a)) => {
+            assert_eq!(a.client_order_id, ClientOrderId::from("CID-STOP-1"));
+            assert_eq!(a.venue_order_id, VenueOrderId::from("VEN-STOP-2"));
+        }
+        other => panic!("expected OrderAccepted with canonical CID-STOP-1, got {other:?}"),
+    }
+
+    // Release HTTP PATCH #1 response and verify `OrderUpdated` also preserves `CID-STOP-1`
+    let _ = patch1_release_tx.send(());
+    let patch1_events = recv_events(&mut rx, 1).await;
+    match &patch1_events[0] {
+        ExecutionEvent::Order(OrderEventAny::Updated(u)) => {
+            assert_eq!(u.client_order_id, ClientOrderId::from("CID-STOP-1"));
+            assert_eq!(u.venue_order_id, Some(VenueOrderId::from("VEN-STOP-2")));
+            assert_eq!(u.quantity, Quantity::from("100"));
+            assert_eq!(u.trigger_price, Some(Price::from("195.00")));
+        }
+        other => panic!("expected OrderUpdated for PATCH #1, got {other:?}"),
+    }
+
+    // 3. Hop 2: Second `modify_order` (`venue_order_id = None`, `trigger_price = 198.00`).
+    //    Client must resolve `CID-STOP-1 -> VEN-STOP-2` and send `PATCH /v2/orders/VEN-STOP-2`.
+    let mod_cmd_2 = ModifyOrder::new(
+        TraderId::from("TRADER-001"),
+        Some(ClientId::from(ALPACA_VENUE)),
+        StrategyId::from("STRAT-001"),
+        InstrumentId::from("AAPL.ALPACA"),
+        ClientOrderId::from("CID-STOP-1"),
+        None,
+        Some(Quantity::from("100")),
+        None,
+        Some(Price::from("198.00")),
+        UUID4::new(),
+        UnixNanos::from(1_700_000_000_000_000_000u64),
+        None,
+        None,
+    );
+    client.modify_order(mod_cmd_2).unwrap();
+
+    tokio::time::timeout(Duration::from_secs(2), patch2_arrived_rx)
+        .await
+        .unwrap()
+        .unwrap();
+
+    // While HTTP PATCH #2 is in flight, WebSocket `replaced` on VEN-STOP-2 (with `replaced_by: VEN-STOP-3`)
+    // and immediate `fill` on VEN-STOP-3 (with `replaces: VEN-STOP-2` and `client_order_id: alpaca-auto-cid-hop2`)
+    // arrive before HTTP PATCH #2 returns!
+    let ws_hop2_replaced = r#"{
+        "stream": "trade_updates",
+        "data": {
+            "event": "replaced",
+            "timestamp": "2026-03-31T15:10:10.005Z",
+            "order": {
+                "id": "VEN-STOP-2",
+                "replaced_by": "VEN-STOP-3",
+                "client_order_id": "alpaca-auto-cid-hop1",
+                "created_at": "2026-03-31T15:10:05Z",
+                "updated_at": "2026-03-31T15:10:10.005Z",
+                "submitted_at": "2026-03-31T15:10:05Z",
+                "symbol": "AAPL",
+                "asset_class": "us_equity",
+                "qty": "100",
+                "filled_qty": "0",
+                "order_class": "simple",
+                "type": "stop",
+                "side": "sell",
+                "time_in_force": "day",
+                "stop_price": "198.00",
+                "status": "replaced"
+            }
+        }
+    }"#;
+    client.ingest_execution_update(decode_ws_frame_to_update(ws_hop2_replaced));
+
+    let ws_hop2_fill = r#"{
+        "stream": "trade_updates",
+        "data": {
+            "event": "fill",
+            "execution_id": "EXEC-STOP-HOP2-FILL",
+            "price": "197.90",
+            "qty": "100",
+            "position_qty": "0",
+            "timestamp": "2026-03-31T15:10:10.020Z",
+            "order": {
+                "id": "VEN-STOP-3",
+                "replaces": "VEN-STOP-2",
+                "client_order_id": "alpaca-auto-cid-hop2",
+                "created_at": "2026-03-31T15:10:10Z",
+                "updated_at": "2026-03-31T15:10:10.020Z",
+                "submitted_at": "2026-03-31T15:10:10Z",
+                "filled_at": "2026-03-31T15:10:10.020Z",
+                "symbol": "AAPL",
+                "asset_class": "us_equity",
+                "qty": "100",
+                "filled_qty": "100",
+                "filled_avg_price": "197.90",
+                "order_class": "simple",
+                "type": "stop",
+                "side": "sell",
+                "time_in_force": "day",
+                "stop_price": "198.00",
+                "status": "filled"
+            }
+        }
+    }"#;
+    client.ingest_execution_update(decode_ws_frame_to_update(ws_hop2_fill));
+
+    assert_eq!(
+        client.client_order_id_for_venue(&VenueOrderId::from("VEN-STOP-3")),
+        Some(ClientOrderId::from("CID-STOP-1")),
+        "multi-hop WS lineage VEN-STOP-1 -> VEN-STOP-2 -> VEN-STOP-3 must resolve to canonical CID-STOP-1"
+    );
+
+    let ws_hop2_events = drain_events(&mut rx);
+    assert_eq!(ws_hop2_events.len(), 2);
+    match &ws_hop2_events[0] {
+        ExecutionEvent::Order(OrderEventAny::Updated(u)) => {
+            assert_eq!(u.client_order_id, ClientOrderId::from("CID-STOP-1"));
+            assert_eq!(u.venue_order_id, Some(VenueOrderId::from("VEN-STOP-3")));
+        }
+        other => panic!("expected OrderUpdated from WS replaced frame, got {other:?}"),
+    }
+    match &ws_hop2_events[1] {
+        ExecutionEvent::Order(OrderEventAny::Filled(f)) => {
+            assert_eq!(f.client_order_id, ClientOrderId::from("CID-STOP-1"));
+            assert_eq!(f.venue_order_id, VenueOrderId::from("VEN-STOP-3"));
+            assert_eq!(f.last_qty, Quantity::from("100"));
+            assert_eq!(f.last_px, Price::from("197.90"));
+        }
+        other => panic!("expected OrderFilled with canonical CID-STOP-1, got {other:?}"),
+    }
+
+    let _ = patch2_release_tx.send(());
+    http_server.await.unwrap();
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert!(
+        rx.try_recv().is_err(),
+        "HTTP PATCH #2 response must be deduplicated via claim_order_updated when WS replaced already emitted OrderUpdated"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_ticket03_per_instrument_fifo_order_serialization_dst() {
+    let http_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let http_addr = http_listener.local_addr().unwrap();
+    let http_base_url = format!("http://{http_addr}");
+
+    let arrival_log: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let arrival_srv = Arc::clone(&arrival_log);
+
+    let http_server = tokio::spawn(async move {
+        // 1. First request on AAPL.ALPACA must be DELETE /v2/orders/VEN-FIFO-OLD,
+        //    followed by post-cancel reconciliation GET /v2/orders/VEN-FIFO-OLD.
+        //    Delay response by 60ms so that if `submit_order` or `modify_order` were spawned
+        //    independently without per-instrument FIFO serialization, they would overtake DELETE!
+        let (mut s1, _) = http_listener.accept().await.unwrap();
+        let (m1, p1, _) = read_http_request(&mut s1).await;
+        arrival_srv.lock().push(format!("START {m1} {p1}"));
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        arrival_srv.lock().push(format!("FINISH {m1} {p1}"));
+        write_http_response(&mut s1, "204 No Content", "").await;
+
+        let (mut s1_get, _) = http_listener.accept().await.unwrap();
+        let (m1_get, p1_get, _) = read_http_request(&mut s1_get).await;
+        arrival_srv.lock().push(format!("START {m1_get} {p1_get}"));
+        arrival_srv.lock().push(format!("FINISH {m1_get} {p1_get}"));
+        write_http_response(
+            &mut s1_get,
+            "200 OK",
+            r#"{"id":"VEN-FIFO-OLD","client_order_id":"CID-FIFO-OLD","created_at":"2026-03-31T15:19:50Z","canceled_at":"2026-03-31T15:19:59Z","symbol":"AAPL","qty":"50","filled_qty":"0","order_class":"simple","type":"stop","side":"sell","time_in_force":"day","stop_price":"190.00","status":"canceled"}"#,
+        )
+        .await;
+
+        // 2. Next request on AAPL.ALPACA must be POST /v2/orders (never arriving before FINISH DELETE + GET).
+        let (mut s2, _) = http_listener.accept().await.unwrap();
+        let (m2, p2, _) = read_http_request(&mut s2).await;
+        arrival_srv.lock().push(format!("START {m2} {p2}"));
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        arrival_srv.lock().push(format!("FINISH {m2} {p2}"));
+        write_http_response(
+            &mut s2,
+            "200 OK",
+            r#"{"id":"VEN-FIFO-NEW-1","client_order_id":"CID-FIFO-NEW","created_at":"2026-03-31T15:20:00Z","submitted_at":"2026-03-31T15:20:00Z","symbol":"AAPL","qty":"50","filled_qty":"0","order_class":"simple","type":"stop","side":"sell","time_in_force":"day","stop_price":"192.00","status":"accepted"}"#,
+        )
+        .await;
+
+        // 3. Third request on AAPL.ALPACA must be PATCH /v2/orders/VEN-FIFO-NEW-1 (never arriving before FINISH POST).
+        let (mut s3, _) = http_listener.accept().await.unwrap();
+        let (m3, p3, _) = read_http_request(&mut s3).await;
+        arrival_srv.lock().push(format!("START {m3} {p3}"));
+        arrival_srv.lock().push(format!("FINISH {m3} {p3}"));
+        write_http_response(
+            &mut s3,
+            "200 OK",
+            r#"{"id":"VEN-FIFO-NEW-2","replaces":"VEN-FIFO-NEW-1","client_order_id":"CID-FIFO-NEW","created_at":"2026-03-31T15:20:01Z","submitted_at":"2026-03-31T15:20:01Z","symbol":"AAPL","qty":"100","filled_qty":"0","order_class":"simple","type":"stop","side":"sell","time_in_force":"day","stop_price":"194.00","status":"replaced"}"#,
+        )
+        .await;
+    });
+
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ExecutionEvent>();
+    replace_exec_event_sender(tx.clone());
+
+    let cache = Rc::new(RefCell::new(Cache::default()));
+    let config = make_test_config(&http_base_url, "ws://127.0.0.1:9/stream");
+    let mut client = AlpacaExecutionClient::new(
+        TraderId::from("TRADER-001"),
+        ClientId::from(ALPACA_VENUE),
+        AccountId::from("ALPACA-001"),
+        config,
+        cache.clone(),
+    )
+    .unwrap()
+    .with_ws_enabled(false);
+    client.set_sender(tx);
+
+    let old_stop = make_stop_market_order(
+        "CID-FIFO-OLD",
+        "AAPL",
+        OrderSide::Sell,
+        "50",
+        "190.00",
+        None,
+        None,
+        None,
+        None,
+    );
+    let new_stop = make_stop_market_order(
+        "CID-FIFO-NEW",
+        "AAPL",
+        OrderSide::Sell,
+        "50",
+        "192.00",
+        None,
+        None,
+        None,
+        None,
+    );
+    {
+        let mut c = cache.borrow_mut();
+        c.add_order(
+            old_stop.clone(),
+            None,
+            Some(ClientId::from(ALPACA_VENUE)),
+            false,
+        )
+        .unwrap();
+        c.add_order(
+            new_stop.clone(),
+            None,
+            Some(ClientId::from(ALPACA_VENUE)),
+            false,
+        )
+        .unwrap();
+    }
+    client.record_venue_order_id(
+        ClientOrderId::from("CID-FIFO-OLD"),
+        VenueOrderId::from("VEN-FIFO-OLD"),
+    );
+
+    // Synchronously dispatch `cancel_order` (`DELETE`), `submit_order` (`POST`), and `modify_order` (`PATCH`)
+    // back-to-back on the same `InstrumentId` (`AAPL.ALPACA`).
+    let cancel_cmd = CancelOrder::new(
+        TraderId::from("TRADER-001"),
+        Some(ClientId::from(ALPACA_VENUE)),
+        StrategyId::from("STRAT-001"),
+        InstrumentId::from("AAPL.ALPACA"),
+        ClientOrderId::from("CID-FIFO-OLD"),
+        Some(VenueOrderId::from("VEN-FIFO-OLD")),
+        UUID4::new(),
+        UnixNanos::from(1_700_000_000_000_000_000u64),
+        None,
+        None,
+    );
+    let submit_cmd = make_submit_order_cmd(&new_stop);
+    let modify_cmd = ModifyOrder::new(
+        TraderId::from("TRADER-001"),
+        Some(ClientId::from(ALPACA_VENUE)),
+        StrategyId::from("STRAT-001"),
+        InstrumentId::from("AAPL.ALPACA"),
+        ClientOrderId::from("CID-FIFO-NEW"),
+        None,
+        Some(Quantity::from("100")),
+        None,
+        Some(Price::from("194.00")),
+        UUID4::new(),
+        UnixNanos::from(1_700_000_000_000_000u64),
+        None,
+        None,
+    );
+
+    client.cancel_order(cancel_cmd).unwrap();
+    client.submit_order(submit_cmd).unwrap();
+    client.modify_order(modify_cmd).unwrap();
+
+    // Expect:
+    // - OrderSubmitted (emitted synchronously before HTTP POST)
+    // - OrderCanceled (from DELETE)
+    // - OrderAccepted (from POST)
+    // - OrderUpdated (from PATCH)
+    let events = recv_events(&mut rx, 4).await;
+    assert_eq!(events.len(), 4);
+
+    http_server.await.unwrap();
+
+    let recorded = arrival_log.lock().clone();
+    assert_eq!(
+        recorded,
+        vec![
+            "START DELETE /v2/orders/VEN-FIFO-OLD".to_string(),
+            "FINISH DELETE /v2/orders/VEN-FIFO-OLD".to_string(),
+            "START GET /v2/orders/VEN-FIFO-OLD".to_string(),
+            "FINISH GET /v2/orders/VEN-FIFO-OLD".to_string(),
+            "START POST /v2/orders".to_string(),
+            "FINISH POST /v2/orders".to_string(),
+            "START PATCH /v2/orders/VEN-FIFO-NEW-1".to_string(),
+            "FINISH PATCH /v2/orders/VEN-FIFO-NEW-1".to_string(),
+        ],
+        "Per-instrument FIFO queue must strictly serialize DELETE (+ post-cancel GET) -> POST -> PATCH without overlapping"
+    );
 }

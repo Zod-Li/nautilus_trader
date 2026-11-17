@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import date
+from datetime import date, datetime, timezone
 from decimal import Decimal
 import json
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 from uuid import UUID, uuid4
 
 import psycopg2
@@ -15,9 +15,15 @@ from psycopg2.extras import RealDictCursor, register_uuid
 from evolution_engine.config_center.envelope import Envelope, load_envelope
 from evolution_engine.db.dsn import resolve_database_dsn
 from nautilus_trader.quant.contracts.models import (
+    ArchetypeStrategyConfig,
     PlanContractValidationError,
     PlanItemContract,
+    PlanRiskEnvelope,
+    PlanSide,
+    StrategyArchetypeId,
     _to_decimal,
+    compute_intraday_entry_valid_until,
+    default_limit_collar_for_archetype,
 )
 
 register_uuid()
@@ -316,26 +322,85 @@ class PlanContractRepository:
 
         return resolved_plan_id
 
-    def load_latest_plan_lock_event_payload(
+    @staticmethod
+    def _table_exists(cur: Any, table_name: str) -> bool:
+        cur.execute("SELECT to_regclass(%s) AS reg", (f"public.{table_name}",))
+        row = cur.fetchone()
+        if isinstance(row, Mapping):
+            return row.get("reg") is not None
+        if isinstance(row, (tuple, list)) and row:
+            return row[0] is not None
+        return False
+
+    def has_locked_plan(
         self,
-        trading_date: date,
+        trading_date: date | str,
         market: str = "US_EQUITY",
-    ) -> Dict[str, Any]:
-        """Loads the latest `PLAN_LOCKED` event payload for `(trading_date, market)`."""
+    ) -> bool:
+        """Return True if a `LOCKED` trading plan exists in `trading_plans` for `(trading_date, market)`
+        (including 0-item `LOCKED_NO_TRADE` plans).
+        """
+        td = (
+            date.fromisoformat(str(trading_date)[:10])
+            if isinstance(trading_date, str)
+            else trading_date
+        )
+        mkt = str(market or "US_EQUITY").strip()
         conn = psycopg2.connect(self._dsn, cursor_factory=RealDictCursor)
         try:
             with conn.cursor() as cur:
+                if not self._table_exists(cur, "trading_plans"):
+                    return False
+                cur.execute(
+                    """
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM trading_plans
+                        WHERE trading_date = %s::date
+                          AND (market = %s OR (%s IN ('US', 'US_EQUITY') AND market IN ('US', 'US_EQUITY')))
+                          AND status = 'LOCKED'
+                    ) AS has_locked
+                    """,
+                    (td, mkt, mkt),
+                )
+                row = cur.fetchone()
+                if isinstance(row, Mapping):
+                    return bool(row.get("has_locked", row.get("exists", False)))
+                if isinstance(row, (tuple, list)) and row:
+                    return bool(row[0])
+                return False
+        finally:
+            conn.close()
+
+    def load_latest_plan_lock_event_payload(
+        self,
+        trading_date: date | str,
+        market: str = "US_EQUITY",
+    ) -> Dict[str, Any]:
+        """Loads the latest `PLAN_LOCKED` event payload for `(trading_date, market)`."""
+        td = (
+            date.fromisoformat(str(trading_date)[:10])
+            if isinstance(trading_date, str)
+            else trading_date
+        )
+        mkt = str(market or "US_EQUITY").strip()
+        conn = psycopg2.connect(self._dsn, cursor_factory=RealDictCursor)
+        try:
+            with conn.cursor() as cur:
+                if not self._table_exists(cur, "trading_plans"):
+                    return {}
                 cur.execute(
                     """
                     SELECT e.payload, p.rejections
                     FROM trading_plans p
                     LEFT JOIN trading_plan_events e
                       ON e.plan_id = p.plan_id AND e.event_type = 'PLAN_LOCKED'
-                    WHERE p.trading_date = %s AND p.market = %s
+                    WHERE p.trading_date = %s
+                      AND (p.market = %s OR (%s IN ('US', 'US_EQUITY') AND p.market IN ('US', 'US_EQUITY')))
                     ORDER BY e.ts DESC NULLS LAST, p.locked_at DESC NULLS LAST
                     LIMIT 1
                     """,
-                    (trading_date, market),
+                    (td, mkt, mkt),
                 )
                 row = cur.fetchone()
                 if row is None:
@@ -344,7 +409,7 @@ class PlanContractRepository:
                 if isinstance(raw_payload, str):
                     try:
                         parsed = json.loads(raw_payload)
-                    except Exception:
+                    except (TypeError, ValueError):
                         parsed = {}
                 elif isinstance(raw_payload, Mapping):
                     parsed = dict(raw_payload)
@@ -354,7 +419,7 @@ class PlanContractRepository:
                 if isinstance(raw_rej, str):
                     try:
                         rej_list = json.loads(raw_rej)
-                    except Exception:
+                    except (TypeError, ValueError):
                         rej_list = []
                 elif isinstance(raw_rej, list):
                     rej_list = list(raw_rej)
@@ -370,10 +435,16 @@ class PlanContractRepository:
 
     def load_locked_plan_items(
         self,
-        trading_date: date,
+        trading_date: date | str,
         market: str = "US_EQUITY",
     ) -> List[PlanItemContract]:
         """Load all `PlanItemContract` records belonging to the `LOCKED` plan for `(trading_date, market)`."""
+        td = (
+            date.fromisoformat(str(trading_date)[:10])
+            if isinstance(trading_date, str)
+            else trading_date
+        )
+        mkt = str(market or "US_EQUITY").strip()
         conn = psycopg2.connect(self._dsn, cursor_factory=RealDictCursor)
         try:
             with conn.cursor() as cur:
@@ -383,11 +454,11 @@ class PlanContractRepository:
                     FROM trading_plan_items i
                     JOIN trading_plans p ON p.plan_id = i.plan_id
                     WHERE p.trading_date = %s
-                      AND p.market = %s
+                      AND (p.market = %s OR (%s IN ('US', 'US_EQUITY') AND p.market IN ('US', 'US_EQUITY')))
                       AND p.status = 'LOCKED'
                     ORDER BY i.symbol ASC
                     """,
-                    (trading_date, market),
+                    (td, mkt, mkt),
                 )
                 rows = cur.fetchall()
         finally:
@@ -399,6 +470,282 @@ class PlanContractRepository:
             contract.validate(safety_envelope=self._safety_envelope)
             contracts.append(contract)
         return contracts
+
+    def load_carry_over_items_for_open_positions(
+        self,
+        trading_date: date | str,
+        market: str = "US_EQUITY",
+        excluded_symbols: Optional[Iterable[str]] = None,
+    ) -> List[PlanItemContract]:
+        """Hydrate exit-only `PlanItemContract` instances for open overnight positions in `trading_positions`
+        whose symbols are not already present in today's locked `trading_plan_items`.
+        """
+        td = (
+            date.fromisoformat(str(trading_date)[:10])
+            if isinstance(trading_date, str)
+            else trading_date
+        )
+        mkt = str(market or "US_EQUITY").strip()
+        excluded = {
+            str(s).strip().upper()
+            for s in (excluded_symbols or ())
+            if str(s).strip()
+        }
+
+        conn = psycopg2.connect(self._dsn, cursor_factory=RealDictCursor)
+        try:
+            with conn.cursor() as cur:
+                if not self._table_exists(cur, "trading_positions"):
+                    return []
+                cur.execute(
+                    """
+                    SELECT *
+                    FROM trading_positions
+                    WHERE ABS(qty) > 1e-9
+                    ORDER BY symbol ASC
+                    """
+                )
+                pos_rows = cur.fetchall() or []
+                open_positions = [
+                    r
+                    for r in pos_rows
+                    if str(r.get("symbol") or "").strip().upper()
+                    and str(r.get("symbol") or "").strip().upper() not in excluded
+                ]
+                if not open_positions:
+                    return []
+
+                vetoed_symbols: set[str] = set()
+                decisions_by_symbol: Dict[str, str] = {}
+                today_plan_id: Optional[UUID] = None
+
+                def _ingest_decisions(raw_decisions: Any) -> None:
+                    if isinstance(raw_decisions, str):
+                        try:
+                            raw_decisions = json.loads(raw_decisions)
+                        except (TypeError, ValueError):
+                            return
+                    if isinstance(raw_decisions, Mapping):
+                        if "carry_over_decisions" in raw_decisions or "vetoed_symbols" in raw_decisions:
+                            for vs in raw_decisions.get("vetoed_symbols") or ():
+                                vs_norm = str(vs).strip().upper()
+                                if vs_norm:
+                                    vetoed_symbols.add(vs_norm)
+                            _ingest_decisions(raw_decisions.get("carry_over_decisions"))
+                            return
+                        for k, v in raw_decisions.items():
+                            sym_k = str(k).strip().upper()
+                            if not sym_k:
+                                continue
+                            if isinstance(v, Mapping):
+                                dec_v = str(
+                                    v.get("decision")
+                                    or v.get("lifecycle_state")
+                                    or v.get("action")
+                                    or v.get("status")
+                                    or ""
+                                ).strip().upper()
+                            else:
+                                dec_v = str(v).strip().upper()
+                            if dec_v:
+                                decisions_by_symbol[sym_k] = dec_v
+                    elif isinstance(raw_decisions, list):
+                        for entry in raw_decisions:
+                            if isinstance(entry, Mapping):
+                                sym_e = str(entry.get("symbol") or "").strip().upper()
+                                dec_e = str(
+                                    entry.get("decision")
+                                    or entry.get("lifecycle_state")
+                                    or entry.get("action")
+                                    or entry.get("status")
+                                    or ""
+                                ).strip().upper()
+                                if sym_e and dec_e:
+                                    decisions_by_symbol[sym_e] = dec_e
+
+                if self._table_exists(cur, "trading_plans"):
+                    cur.execute(
+                        """
+                        SELECT *
+                        FROM trading_plans
+                        WHERE trading_date = %s::date
+                          AND (market = %s OR (%s IN ('US', 'US_EQUITY') AND market IN ('US', 'US_EQUITY')))
+                        ORDER BY locked_at DESC NULLS LAST, created_at DESC NULLS LAST
+                        LIMIT 1
+                        """,
+                        (td, mkt, mkt),
+                    )
+                    plan_row = cur.fetchone()
+                    if plan_row is not None:
+                        if plan_row.get("plan_id") is not None:
+                            today_plan_id = UUID(str(plan_row["plan_id"]))
+                        raw_rej = plan_row.get("rejections")
+                        if isinstance(raw_rej, str):
+                            try:
+                                raw_rej = json.loads(raw_rej)
+                            except (TypeError, ValueError):
+                                raw_rej = []
+                        if isinstance(raw_rej, list):
+                            for item in raw_rej:
+                                if isinstance(item, str) and item.strip():
+                                    vetoed_symbols.add(item.strip().upper())
+                                elif isinstance(item, Mapping):
+                                    _ingest_decisions([item])
+                        for col_name in ("regime_consensus_json", "carry_over_decisions", "review"):
+                            if col_name in plan_row and plan_row.get(col_name) is not None:
+                                _ingest_decisions(plan_row.get(col_name))
+
+                        if today_plan_id is not None and self._table_exists(cur, "trading_plan_events"):
+                            cur.execute(
+                                """
+                                SELECT payload
+                                FROM trading_plan_events
+                                WHERE plan_id = %s AND event_type = 'PLAN_LOCKED'
+                                ORDER BY ts DESC NULLS LAST
+                                LIMIT 1
+                                """,
+                                (today_plan_id,),
+                            )
+                            ev_row = cur.fetchone()
+                            if ev_row is not None and ev_row.get("payload") is not None:
+                                _ingest_decisions(ev_row.get("payload"))
+
+                if self._table_exists(cur, "committee_deliberation_runs"):
+                    cur.execute(
+                        """
+                        SELECT carry_over_decisions, vetoed_symbols
+                        FROM committee_deliberation_runs
+                        WHERE trading_date = %s::date
+                        ORDER BY COALESCE(completed_at, started_at) DESC NULLS LAST
+                        LIMIT 1
+                        """,
+                        (td,),
+                    )
+                    delib_row = cur.fetchone()
+                    if delib_row is not None:
+                        _ingest_decisions(delib_row.get("carry_over_decisions"))
+                        raw_vs = delib_row.get("vetoed_symbols")
+                        if isinstance(raw_vs, str):
+                            try:
+                                raw_vs = json.loads(raw_vs)
+                            except (TypeError, ValueError):
+                                raw_vs = []
+                        if isinstance(raw_vs, list):
+                            for vs in raw_vs:
+                                if str(vs).strip():
+                                    vetoed_symbols.add(str(vs).strip().upper())
+
+                has_plan_items_table = self._table_exists(cur, "trading_plan_items")
+                has_protective_orders_table = self._table_exists(cur, "protective_orders")
+
+                carry_over_contracts: List[PlanItemContract] = []
+                for pos_row in open_positions:
+                    sym = str(pos_row["symbol"]).strip().upper()
+                    pos_qty = _to_decimal(pos_row["qty"], "qty")
+                    abs_qty = abs(pos_qty)
+                    pos_side = PlanSide.LONG if pos_qty > Decimal("0") else PlanSide.SHORT
+
+                    sym_dec = decisions_by_symbol.get(sym, "")
+                    if sym in vetoed_symbols or sym_dec in (
+                        "THESIS_INVALIDATED_EXIT",
+                        "EXIT_AT_OPEN",
+                        "VETO",
+                        "VETOED",
+                        "INVALIDATED",
+                        "FORCE_EXIT",
+                        "IMMEDIATE_EXIT",
+                    ):
+                        carry_over_status = "THESIS_INVALIDATED_EXIT"
+                    else:
+                        carry_over_status = "CARRY_OVER_EXIT_ONLY"
+
+                    hist_row = None
+                    if has_plan_items_table:
+                        cur.execute(
+                            """
+                            SELECT i.*
+                            FROM trading_plan_items i
+                            JOIN trading_plans p ON p.plan_id = i.plan_id
+                            WHERE p.trading_date < %s::date
+                              AND (p.market = %s OR (%s IN ('US', 'US_EQUITY') AND p.market IN ('US', 'US_EQUITY')))
+                              AND p.status = 'LOCKED'
+                              AND i.symbol = %s
+                            ORDER BY p.trading_date DESC, i.updated_at DESC NULLS LAST
+                            LIMIT 1
+                            """,
+                            (td, mkt, mkt, sym),
+                        )
+                        hist_row = cur.fetchone()
+                        if hist_row is None and pos_row.get("plan_item_id") is not None:
+                            cur.execute(
+                                "SELECT * FROM trading_plan_items WHERE item_id = %s LIMIT 1",
+                                (pos_row["plan_item_id"],),
+                            )
+                            hist_row = cur.fetchone()
+
+                    if hist_row is None:
+                        raise RuntimeError(
+                            f"Open carry-over position for {sym} has no historical LOCKED "
+                            "trading_plan_items contract in PostgreSQL (fail-closed)"
+                        )
+
+                    prot_row = None
+                    if has_protective_orders_table:
+                        cur.execute(
+                            """
+                            SELECT stop_price, status
+                            FROM protective_orders
+                            WHERE symbol = %s
+                              AND status IN ('ACTIVE', 'WORKING', 'PENDING_NEW', 'REPLACING')
+                            ORDER BY updated_at DESC NULLS LAST
+                            LIMIT 1
+                            """,
+                            (sym,),
+                        )
+                        prot_row = cur.fetchone()
+
+                    stop_candidates: List[Decimal] = []
+                    for raw_stop in (
+                        pos_row.get("stop_loss_price"),
+                        prot_row.get("stop_price") if prot_row is not None else None,
+                        hist_row.get("current_stop_price"),
+                        hist_row.get("initial_stop_price"),
+                    ):
+                        if raw_stop is not None and str(raw_stop).strip() != "":
+                            dec_s = _to_decimal(raw_stop, "stop_price")
+                            if dec_s > Decimal("0"):
+                                stop_candidates.append(dec_s)
+
+                    row_dict = dict(hist_row)
+                    row_side = PlanSide(str(row_dict.get("side") or pos_side.value).lower())
+                    if stop_candidates:
+                        row_dict["current_stop_price"] = (
+                            max(stop_candidates)
+                            if row_side == PlanSide.LONG
+                            else min(stop_candidates)
+                        )
+                    row_dict["approved_qty_cap"] = Decimal("0")
+                    row_dict["status"] = "EXPIRED"
+                    row_dict["filled_qty"] = abs_qty
+                    row_dict["carry_over_status"] = carry_over_status
+                    raw_trace = row_dict.get("sizing_trace") or {}
+                    if isinstance(raw_trace, str):
+                        try:
+                            raw_trace = json.loads(raw_trace)
+                        except (TypeError, ValueError):
+                            raw_trace = {}
+                    trace_dict = dict(raw_trace) if isinstance(raw_trace, Mapping) else {}
+                    trace_dict["carry_over_status"] = carry_over_status
+                    trace_dict["carry_over_position_qty"] = str(pos_qty)
+                    trace_dict["carry_over_from_plan_id"] = str(row_dict.get("plan_id") or "")
+                    trace_dict["max_new_orders"] = 0
+                    row_dict["sizing_trace"] = trace_dict
+                    contract = PlanItemContract.from_db_row(row_dict)
+                    carry_over_contracts.append(contract)
+
+                return carry_over_contracts
+        finally:
+            conn.close()
 
     def get_plan_item(self, item_id: UUID) -> PlanItemContract:
         """Fetch a single `PlanItemContract` by `item_id`."""

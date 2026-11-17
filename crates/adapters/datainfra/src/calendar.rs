@@ -136,18 +136,6 @@ impl CalendarSessionStatus {
         ts_ns >= open_ns && ts_ns < close_ns
     }
 
-    /// Returns `true` if a bar closing at `ts_close_ns` falls within `(rth_open_ns, rth_close_ns]`.
-    #[must_use]
-    pub fn contains_rth_bar_close_ns(&self, ts_close_ns: UnixNanos) -> bool {
-        let Some(open_ns) = self.rth_open_ns() else {
-            return false;
-        };
-        let Some(close_ns) = self.rth_close_ns() else {
-            return false;
-        };
-        ts_close_ns > open_ns && ts_close_ns <= close_ns
-    }
-
     /// Returns `true` when `bar_open_ns` has reached or passed `rth_close_ns()`
     /// (or precedes `rth_open_ns()` on a different UTC day) and the cached session
     /// status must be refreshed for `bar_open_ns`.
