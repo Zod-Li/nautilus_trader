@@ -765,6 +765,7 @@ class PostgresPlanGateBackend:
         self._known_symbols: set[str] = set()
         self._symbol_by_item_id: Dict[str, str] = {}
         self._items_by_symbol: Dict[str, PlanItemContract] = {}
+        self._baseline_items_by_symbol: Dict[str, PlanItemContract] = {}
         self._runtime_items_by_symbol: Dict[str, Tuple[PlanItemContract, Optional[Decimal]]] = {}
         self._removed_runtime_symbols: set[str] = set()
         self._released_cap_by_symbol: Dict[str, Decimal] = {}
@@ -844,6 +845,7 @@ class PostgresPlanGateBackend:
             self._async_writer.set_trading_date(trading_date)
         if clear_runtime_items:
             self._runtime_items_by_symbol.clear()
+            self._baseline_items_by_symbol.clear()
             self._removed_runtime_symbols.clear()
             self._released_cap_by_symbol.clear()
         if sync and self._persist_to_db:
@@ -877,6 +879,9 @@ class PostgresPlanGateBackend:
             self._known_symbols.add(norm_sym)
             self._symbol_by_item_id[str(adjusted_item.item_id)] = norm_sym
             self._items_by_symbol[norm_sym] = adjusted_item
+            baseline_item = self._baseline_items_by_symbol.get(norm_sym)
+            if baseline_item is None or baseline_item.item_id != adjusted_item.item_id:
+                self._baseline_items_by_symbol[norm_sym] = adjusted_item
 
     def remove_runtime_plan_item(self, symbol: str) -> None:
         """Removes a runtime `PlanItemContract` overlay for `symbol` and evicts it from `RustPlanGateEngine`."""
@@ -885,6 +890,7 @@ class PostgresPlanGateBackend:
             return
         with self._sync_lock:
             self._removed_runtime_symbols.add(norm_sym)
+            self._baseline_items_by_symbol.pop(norm_sym, None)
             removed_runtime = self._runtime_items_by_symbol.pop(norm_sym, None)
             removed_item = self._items_by_symbol.pop(norm_sym, None)
             self._known_symbols.discard(norm_sym)
@@ -1538,6 +1544,96 @@ class PostgresPlanGateBackend:
                     True, f"PostgreSQL sync failed ({exc})"
                 )
 
+    def _maybe_reanchor_multi_cycle_envelope(self, request: PlanGateOrderRequest) -> None:
+        """Re-anchor flat multi-day backtest envelope around current entry price while preserving risk budget."""
+        if not (self._allow_multi_cycle_reentry and not self._persist_to_db):
+            return
+        if request.is_reduce_only or request.is_exit_intent:
+            return
+        norm_sym = str(request.symbol or "").strip().upper()
+        if (
+            not norm_sym
+            or norm_sym not in self._items_by_symbol
+            or self.reserved_qty(norm_sym) != Decimal("0")
+            or request.cache_open_entry_qty != Decimal("0")
+        ):
+            return
+        entry_ref = request.reference_price or request.limit_price or Decimal("0")
+        cur_item = self._items_by_symbol[norm_sym]
+        orig_item = self._baseline_items_by_symbol.get(norm_sym, cur_item)
+        if entry_ref <= Decimal("0") or orig_item.risk_envelope.target_qty <= Decimal("0"):
+            return
+        orig_ref_px = (
+            orig_item.risk_envelope.target_notional_usd / orig_item.risk_envelope.target_qty
+        )
+        cur_ref_px = (
+            cur_item.risk_envelope.target_notional_usd / cur_item.risk_envelope.target_qty
+            if cur_item.risk_envelope.target_qty > Decimal("0")
+            else orig_ref_px
+        )
+        if (
+            abs(entry_ref - orig_ref_px) <= Decimal("0.01")
+            and abs(entry_ref - cur_ref_px) <= Decimal("0.01")
+        ):
+            return
+        new_notional = max(
+            Decimal("0.01"),
+            (entry_ref * orig_item.risk_envelope.target_qty).quantize(Decimal("0.01")),
+        )
+        new_max_budget = max(
+            Decimal("0.01"),
+            min(orig_item.risk_envelope.max_risk_budget_usd, new_notional),
+        )
+        orig_stop_dist = abs(orig_ref_px - orig_item.risk_envelope.initial_stop_price)
+        if request.atr is not None and request.atr > Decimal("0"):
+            budget_dist = new_max_budget / max(Decimal("1"), request.quantity)
+            eff_stop_dist = max(Decimal("0.01"), orig_stop_dist, budget_dist)
+        else:
+            eff_stop_dist = max(Decimal("0.01"), orig_stop_dist)
+        if orig_item.risk_envelope.side == PlanSide.LONG:
+            new_stop = max(
+                Decimal("0.01"), (entry_ref - eff_stop_dist).quantize(Decimal("0.01"))
+            )
+        else:
+            new_stop = max(
+                Decimal("0.02"), (entry_ref + eff_stop_dist).quantize(Decimal("0.01"))
+            )
+        new_tp: Optional[Decimal] = None
+        if orig_item.risk_envelope.take_profit_price is not None:
+            orig_tp_dist = max(
+                Decimal("0.01"),
+                abs(orig_item.risk_envelope.take_profit_price - orig_ref_px),
+            )
+            if orig_item.risk_envelope.side == PlanSide.LONG:
+                new_tp = max(
+                    new_stop + Decimal("0.01"),
+                    (entry_ref + orig_tp_dist).quantize(Decimal("0.01")),
+                )
+            else:
+                new_tp = max(
+                    Decimal("0.01"),
+                    min(
+                        new_stop - Decimal("0.01"),
+                        (entry_ref - orig_tp_dist).quantize(Decimal("0.01")),
+                    ),
+                )
+        reanchored = replace(
+            cur_item,
+            filled_qty=Decimal("0"),
+            risk_envelope=replace(
+                cur_item.risk_envelope,
+                initial_stop_price=new_stop,
+                take_profit_price=new_tp,
+                target_notional_usd=new_notional,
+                max_risk_budget_usd=new_max_budget,
+            ),
+        )
+        self.upsert_runtime_plan_item(
+            reanchored,
+            reserved_qty=Decimal("0"),
+            preserve_higher_reservation=False,
+        )
+
     def evaluate_and_reserve(self, request: PlanGateOrderRequest) -> PlanGateDecision:
         if request.is_reduce_only or request.is_exit_intent:
             return PlanGateDecision(
@@ -1547,6 +1643,7 @@ class PostgresPlanGateBackend:
             )
 
         self._poll_notifications_nonblocking()
+        self._maybe_reanchor_multi_cycle_envelope(request)
         norm_sym = str(request.symbol or "").strip().upper()
         req_for_rust = request
         override_stop_reason: str | None = None

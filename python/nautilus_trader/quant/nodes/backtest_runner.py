@@ -667,6 +667,8 @@ class IsomorphicBacktestRunner:
                     update_latency_nanos=0,
                     cancel_latency_nanos=0,
                 ),
+                # Trigger already-marketable protective stops on coarse 15m bars instead of rejecting them.
+                reject_stop_orders=False,
             )
             for eq in equity_list:
                 engine.add_instrument(eq)

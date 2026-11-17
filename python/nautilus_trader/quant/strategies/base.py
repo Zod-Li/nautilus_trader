@@ -32,6 +32,7 @@ from nautilus_trader.model import (
     InstrumentId,
     OrderSide,
     Price,
+    PriceType,
     Quantity,
     StrategyId,
     TimeInForce,
@@ -2350,6 +2351,33 @@ class BaseArchetypeStrategy(Strategy):
                     else float(self._trailing_stop_price)
                 )
 
+        if target_stop_px > 0.0:
+            latest_px = self._resolve_latest_market_price(inst_id)
+            fmt_stop_px = float(self._format_price(target_stop_px, inst_id).as_double())
+            entry_side = spec.get("entry_side")
+            is_long_entry = (
+                entry_side == OrderSide.BUY
+                if entry_side is not None
+                else self._archetype_config.plan_side == PlanSide.LONG
+            )
+            already_breached = latest_px > 0.0 and (
+                (is_long_entry and fmt_stop_px >= latest_px - 1e-9)
+                or (not is_long_entry and fmt_stop_px <= latest_px + 1e-9)
+            )
+            if already_breached:
+                self._notify_safe_exit_begin(sym)
+                exit_side = OrderSide.SELL if is_long_entry else OrderSide.BUY
+                exit_cid = self._submit_plan_gated_exit(
+                    exit_side=exit_side,
+                    quantity=desired_stop_qty,
+                    reference_price=latest_px,
+                    reason_tag="FILL_BAR_STOP_BREACHED_IMMEDIATE_EXIT",
+                    instrument_id=inst_id,
+                    reason="FILL_BAR_STOP_BREACHED_IMMEDIATE_EXIT",
+                    signal_tags=["STOP_LOSS", "PROTECTIVE_STOP"],
+                )
+                return exit_cid or "FILL_BAR_STOP_BREACHED_IMMEDIATE_EXIT"
+
         open_stops = self._get_open_protective_stop_orders(inst_id)
         if len(open_stops) == 1:
             existing_stop = open_stops[0]
@@ -2894,30 +2922,56 @@ class BaseArchetypeStrategy(Strategy):
         target_inst = instrument_id or self._archetype_config.instrument_id
         if self._is_owner_thread():
             cache_obj = getattr(self, "cache", None)
-            if cache_obj is not None and hasattr(cache_obj, "quote_tick"):
-                try:
-                    qt = cache_obj.quote_tick(target_inst)
-                    if qt is not None:
-                        bid_obj = getattr(qt, "bid_price", None)
-                        ask_obj = getattr(qt, "ask_price", None)
-                        bid_val = (
-                            float(bid_obj.as_double())
-                            if hasattr(bid_obj, "as_double")
-                            else float(_to_decimal(bid_obj, "0"))
+            if cache_obj is not None:
+                if hasattr(cache_obj, "quote_tick"):
+                    try:
+                        qt = cache_obj.quote_tick(target_inst)
+                        if qt is not None:
+                            bid_obj = getattr(qt, "bid_price", None)
+                            ask_obj = getattr(qt, "ask_price", None)
+                            bid_val = (
+                                float(bid_obj.as_double())
+                                if hasattr(bid_obj, "as_double")
+                                else float(_to_decimal(bid_obj, "0"))
+                            )
+                            ask_val = (
+                                float(ask_obj.as_double())
+                                if hasattr(ask_obj, "as_double")
+                                else float(_to_decimal(ask_obj, "0"))
+                            )
+                            if self._archetype_config.plan_side == PlanSide.LONG and bid_val > 0.0:
+                                return bid_val
+                            if self._archetype_config.plan_side == PlanSide.SHORT and ask_val > 0.0:
+                                return ask_val
+                            if bid_val > 0.0 and ask_val > 0.0:
+                                return 0.5 * (bid_val + ask_val)
+                    except Exception:
+                        pass
+                if hasattr(cache_obj, "price"):
+                    try:
+                        pref_pt = (
+                            PriceType.BID
+                            if self._archetype_config.plan_side == PlanSide.LONG
+                            else PriceType.ASK
                         )
-                        ask_val = (
-                            float(ask_obj.as_double())
-                            if hasattr(ask_obj, "as_double")
-                            else float(_to_decimal(ask_obj, "0"))
+                        px_obj = cache_obj.price(target_inst, pref_pt) or cache_obj.price(
+                            target_inst, PriceType.LAST
                         )
-                        if self._archetype_config.plan_side == PlanSide.LONG and bid_val > 0.0:
-                            return bid_val
-                        if self._archetype_config.plan_side == PlanSide.SHORT and ask_val > 0.0:
-                            return ask_val
-                        if bid_val > 0.0 and ask_val > 0.0:
-                            return 0.5 * (bid_val + ask_val)
-                except Exception:
-                    pass
+                        if px_obj is not None:
+                            px_val = self._extract_price_float(px_obj)
+                            if px_val > 0.0:
+                                return px_val
+                    except Exception:
+                        pass
+                if hasattr(cache_obj, "bar"):
+                    try:
+                        cb = cache_obj.bar(self._archetype_config.bar_type)
+                        if cb is not None and str(cb.bar_type.instrument_id) == str(target_inst):
+                            bar_close = self._extract_price_float(getattr(cb, "close", None))
+                            if bar_close > 0.0:
+                                return bar_close
+                    except Exception:
+                        pass
         if self._closes:
             return float(self._closes[-1])
         return 0.0
@@ -3008,6 +3062,7 @@ class BaseArchetypeStrategy(Strategy):
             return
 
         latest_px = self._resolve_latest_market_price(target_inst)
+        fmt_target_stop_px = float(self._format_price(target_stop_px, target_inst).as_double())
         reason_str = str(self._event_get(event, "reason", "") or "").lower()
         signed_pos = self._open_position_signed_qty(target_inst)
         is_long_pos = (
@@ -3016,9 +3071,11 @@ class BaseArchetypeStrategy(Strategy):
             else self._archetype_config.plan_side == PlanSide.LONG
         )
         price_breached = (
-            (is_long_pos and latest_px > 0.0 and latest_px <= target_stop_px)
-            or (not is_long_pos and latest_px > 0.0 and latest_px >= target_stop_px)
+            (is_long_pos and latest_px > 0.0 and latest_px <= fmt_target_stop_px)
+            or (not is_long_pos and latest_px > 0.0 and latest_px >= fmt_target_stop_px)
+            or "in the market" in reason_str
             or "stop price" in reason_str
+            or "stop px" in reason_str
             or "stop_price" in reason_str
             or "below market" in reason_str
             or "above market" in reason_str
@@ -3692,6 +3749,36 @@ class BaseArchetypeStrategy(Strategy):
             desired_qty = Decimal(f"{self._protective_stop_qty:.6f}")
         if desired_qty <= Decimal("0"):
             return None
+
+        # Keep trailing stop ratchets strictly outside the current market to avoid in-the-market modify rejections.
+        latest_px = self._resolve_latest_market_price(target_inst)
+        tick = float(self._resolve_tick_size(target_inst))
+        fmt_new_stop = float(self._format_price(new_stop_price, target_inst).as_double())
+        is_long_pos = (
+            signed_pos > Decimal("0")
+            if signed_pos != Decimal("0")
+            else self._archetype_config.plan_side == PlanSide.LONG
+        )
+        existing_stop_prices = [
+            float(self._stop_price_by_cid.get(str(getattr(s, "client_order_id", "") or ""), 0.0) or 0.0)
+            for s in open_stops
+        ]
+        if self._stop_price is not None and self._stop_price > 0.0:
+            existing_stop_prices.append(float(self._stop_price))
+        pos_stop_prices = [p for p in existing_stop_prices if p > 0.0]
+        if latest_px > tick:
+            if is_long_pos and fmt_new_stop >= latest_px - 1e-9:
+                max_admissible = float(self._format_price(latest_px - tick, target_inst).as_double())
+                cur_venue_stop = max(pos_stop_prices) if pos_stop_prices else 0.0
+                if max_admissible <= 0.0 or (cur_venue_stop > 0.0 and max_admissible <= cur_venue_stop + 1e-9):
+                    return None
+                new_stop_price = max_admissible
+            elif not is_long_pos and fmt_new_stop <= latest_px + 1e-9:
+                min_admissible = float(self._format_price(latest_px + tick, target_inst).as_double())
+                cur_venue_stop = min(pos_stop_prices) if pos_stop_prices else 0.0
+                if cur_venue_stop > 0.0 and min_admissible >= cur_venue_stop - 1e-9:
+                    return None
+                new_stop_price = min_admissible
 
         if len(open_stops) == 1:
             existing_stop = open_stops[0]
@@ -4454,7 +4541,11 @@ class BaseArchetypeStrategy(Strategy):
     ) -> str:
         """Executes Two-Phase Safe Exit (or direct exit when no stop is open) via `PLAN_GATE`."""
         resolved_reason = str(reason or reason_tag or "SIGNAL_EXIT")
-        is_emergency_exit = "FAIL_CLOSED" in resolved_reason or "EMERGENCY" in resolved_reason
+        is_emergency_exit = (
+            "FAIL_CLOSED" in resolved_reason
+            or "EMERGENCY" in resolved_reason
+            or "STOP_BREACHED" in resolved_reason
+        )
         if self._in_warmup and not is_emergency_exit:
             return ""
         delay_bars = int(getattr(self._archetype_config, "execution_delay_bars", 0) or 0)
