@@ -1,11 +1,13 @@
 """Multi-venue `nautilus-live-node` assembler, PG `LISTEN/NOTIFY` plan loader, and Backtest-to-Live 100% Parity Gate.
 
-Implements Ticket #16 (`16-multi-venue-live-node-and-parity-gate-seam.md`):
+Implements SPEC-0007 live node assembly and rollover:
 - Loads `LOCKED` `PlanItemContract` items from PostgreSQL via `PlanContractRepository`
   (or awaits `LISTEN nautilus_plan_locked` via event-driven reactive wakeup, zero blind polling `D6.4`).
-- Assembles a production `LiveNode` with `DataInfraDataClientFactory`, `AlpacaExecutionClientFactory`
-  (plus optional `IBKR` / `OKX` execution clients and `RoutingConfig`), `PlanGateExecAlgorithm`,
-  `PostgresTelemetryActor`, and the 1:1 isomorphic `Strategy(StrategyConfig)` instances.
+- Resolves live Alpaca equity metadata via `load_alpaca_equity_instruments` + PG `instrument_metadata_cache`
+  before `run_async()` and off-thread prior to `call_soon_threadsafe` rollover.
+- Assembles a production `LiveNode` with `DataInfraDataClientFactory`, `AlpacaExecutionClientFactory`,
+  Rust `PreTradeRiskGate` (`PostgresPlanGateBackend.as_pre_trade_risk_gate()`),
+  `CollaredTwapExecAlgorithm`, `PostgresTelemetryActor`, and `Strategy(StrategyConfig)` instances.
 - Provides `verify_backtest_to_live_parity` to prove 100% order-intent parity between the
   `IsomorphicBacktestRunner` pipeline and the `LiveNode` execution pipeline on identical bars.
 """
@@ -14,7 +16,6 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
-import gc
 import json
 import logging
 import math
@@ -34,19 +35,31 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Seque
 import psycopg2
 from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
 
+from evolution_engine.config_center.envelope import load_envelope
+from evolution_engine.config_center.schema import SystemConfig
 from evolution_engine.db.dsn import resolve_database_dsn
 from nautilus_trader.quant.contracts.models import (
     MarketableLimitCollar,
     PlanItemContract,
-    PlanRiskEnvelope,
     PlanSide,
     _to_decimal,
+    rule_612_tick_size,
 )
 from nautilus_trader.quant.contracts.repository import PlanContractRepository
-from nautilus_trader.quant.governance.plan_gate import (
-    PLAN_GATE_EXEC_ALGORITHM_ID,
-    PlanGateExecAlgorithm,
-    PlanGateExecAlgorithmConfig,
+from nautilus_trader.quant.execution_algorithms.collared_twap import (
+    COLLARED_TWAP_EXEC_ALGORITHM_ID,
+    CollaredTwapExecAlgorithm,
+    CollaredTwapExecAlgorithmConfig,
+)
+from nautilus_trader.quant.execution_algorithms.friction import (
+    IbkrProFeeSchedule,
+    IbkrProFixedUsEquityFeeModel,
+    compute_ibkr_pro_fixed_commission,
+)
+from nautilus_trader.quant.governance.plan_gate_backend import (
+    EXIT_INTENT_TAGS,
+    PlanGateDecision,
+    PlanGateOrderRequest,
     PostgresPlanGateBackend,
 )
 from nautilus_trader.quant.governance.telemetry_actor import (
@@ -55,7 +68,6 @@ from nautilus_trader.quant.governance.telemetry_actor import (
     ProtectiveOcoMonitor,
 )
 from nautilus_trader.quant.nodes.backtest_runner import (
-    IsomorphicBacktestRunner,
     _build_parity_plan_items,
     _create_default_equity,
     _normalize_bars_for_parity,
@@ -70,6 +82,7 @@ from nautilus_trader.quant.strategies.registry import (
 from nautilus_trader.adapters.alpaca import (
     AlpacaExecClientConfig,
     AlpacaExecutionClientFactory,
+    load_alpaca_equity_instruments,
 )
 from nautilus_trader.adapters.datainfra import (
     DataInfraCatalog,
@@ -81,7 +94,6 @@ from nautilus_trader.common import CacheConfig, Environment
 from nautilus_trader.core import UUID4
 from nautilus_trader.execution import (
     BestPriceFillModel,
-    MakerTakerFeeModel,
     StaticLatencyModel,
 )
 from nautilus_trader.live import (
@@ -96,15 +108,18 @@ from nautilus_trader.model import (
     Bar,
     Currency,
     Equity,
+    InstrumentId,
     LiquiditySide,
     Money,
     OmsType,
     OrderAccepted,
     OrderCanceled,
     OrderCancelRejected,
+    OrderDenied,
     OrderFilled,
     OrderRejected,
     OrderSide,
+    OrderStatus,
     OrderSubmitted,
     OrderType,
     OrderUpdated,
@@ -120,6 +135,7 @@ from nautilus_trader.model import (
     Venue,
     VenueOrderId,
 )
+from nautilus_trader.risk import RiskEngineConfig
 
 PLAN_LOCKED_NOTIFY_CHANNEL: str = "nautilus_plan_locked"
 logger = logging.getLogger(__name__)
@@ -435,7 +451,6 @@ class SipFeederSubscriptionClient:
             }
         ).encode("utf-8")
         url = f"{self._base_url}/v1/subscriptions"
-        last_exc: Optional[Exception] = None
         for attempt in range(self._max_retries + 1):
             req = urllib.request.Request(
                 url,
@@ -448,13 +463,14 @@ class SipFeederSubscriptionClient:
                     raw_body = resp.read().decode("utf-8")
                     return json.loads(raw_body) if raw_body.strip() else {}
             except Exception as exc:
-                last_exc = exc
                 if attempt < self._max_retries:
                     continue
-        assert last_exc is not None
+                raise RuntimeError(
+                    f"sip-feeder {method.upper()} {url} failed for symbols={list(symbols)}: {exc}"
+                ) from exc
         raise RuntimeError(
-            f"sip-feeder {method.upper()} {url} failed for symbols={list(symbols)}: {last_exc}"
-        ) from last_exc
+            f"sip-feeder {method.upper()} {url} failed for symbols={list(symbols)}"
+        )
 
     def sync_plan_subscriptions(
         self,
@@ -498,6 +514,158 @@ class ExtraVenueClientSpec:
 
 
 @dataclass(frozen=True)
+class ResolvedInstrumentEntry:
+    """Result of resolving an Alpaca/cached `Equity` instrument for a plan item."""
+
+    symbol: str
+    instrument: Optional[Equity]
+    status: str
+    reason: str = ""
+
+
+def _is_carry_over_item(item: PlanItemContract) -> bool:
+    co_status = str(
+        getattr(item, "carry_over_status", None)
+        or item.sizing_trace.get("carry_over_status")
+        or ""
+    ).strip().upper()
+    return (
+        co_status in ("RENEWED_ACTIVE", "CARRY_OVER_EXIT_ONLY", "THESIS_INVALIDATED_EXIT")
+        or item.sizing_trace.get("carry_over_position_qty") is not None
+        or item.filled_qty > Decimal("0")
+    )
+
+
+def _metadata_record_from_equity(eq: Equity) -> Dict[str, Any]:
+    return {
+        "symbol": str(eq.id.symbol).split(".", 1)[0].strip().upper(),
+        "asset_class": "us_equity",
+        "status": "active",
+        "tradable": True,
+        "marginable": True,
+        "shortable": True,
+        "easy_to_borrow": False,
+        "fractionable": False,
+        "min_order_size": str(getattr(eq, "min_quantity", None) or getattr(eq, "lot_size", None) or "1"),
+        "price_increment": str(eq.price_increment),
+        "price_precision": int(eq.price_precision),
+        "lot_size": str(getattr(eq, "lot_size", None) or "1"),
+    }
+
+
+def _equity_from_metadata_record(
+    rec: Mapping[str, Any],
+    venue_str: str = "ALPACA",
+    ref_price: Optional[float] = None,
+) -> Equity:
+    sym = str(rec.get("symbol") or "").split(".", 1)[0].strip().upper()
+    inst_id = InstrumentId.from_str(f"{sym}.{venue_str}")
+    raw_tick = rec.get("price_increment")
+    raw_prec = rec.get("price_precision")
+    if raw_tick is not None and raw_prec is not None:
+        tick_dec = _to_decimal(raw_tick, "price_increment")
+        prec = max(1, min(9, int(raw_prec)))
+        tick_str = f"{tick_dec:.{prec}f}"
+    else:
+        ref_dec = (
+            Decimal(str(ref_price))
+            if ref_price is not None and float(ref_price) > 0.0
+            else Decimal("100")
+        )
+        tick = rule_612_tick_size(ref_dec)
+        prec = 4 if tick < Decimal("0.01") else 2
+        tick_str = "0.0001" if prec == 4 else "0.01"
+    raw_lot = rec.get("lot_size") or rec.get("min_order_size") or 1
+    lot_int = max(1, int(Decimal(str(raw_lot))))
+    return Equity(
+        instrument_id=inst_id,
+        raw_symbol=inst_id.symbol,
+        currency=Currency.from_str("USD"),
+        price_precision=prec,
+        price_increment=Price.from_str(tick_str),
+        lot_size=Quantity.from_int(lot_int),
+        ts_event=0,
+        ts_init=0,
+    )
+
+
+def _emit_critical_instrument_alert(
+    dsn: Optional[str],
+    *,
+    event_type: str,
+    symbol: str,
+    title: str,
+    body: str,
+    payload: Mapping[str, Any],
+) -> None:
+    if not dsn:
+        return
+    try:
+        conn = psycopg2.connect(dsn)
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT to_regclass('public.alert_outbox')")
+                    row = cur.fetchone()
+                    if not row or row[0] is None:
+                        return
+                    cur.execute(
+                        """
+                        INSERT INTO alert_outbox (
+                            event_type, severity, source, title, body, payload, dedup_key, status
+                        ) VALUES (
+                            %s, 'CRITICAL', 'nautilus:live_node', %s, %s, %s::jsonb, %s, 'PENDING'
+                        )
+                        """,
+                        (
+                            event_type,
+                            title,
+                            body,
+                            json.dumps(dict(payload)),
+                            f"{event_type}:{symbol}:{uuid.uuid4().hex[:12]}",
+                        ),
+                    )
+        finally:
+            conn.close()
+    except Exception as exc:
+        logger.error("Failed to insert CRITICAL alert %s for %s: %s", event_type, symbol, exc)
+
+
+def _build_live_risk_engine_config(
+    items: Sequence[PlanItemContract],
+    *,
+    system_config: Optional[SystemConfig] = None,
+) -> LiveRiskEngineConfig:
+    sys_cfg = system_config or SystemConfig()
+    env_cfg = load_envelope()
+    env_notional = env_cfg.numeric.get("risk.max_order_notional_usd")
+    if system_config is not None:
+        order_notional_cap = float(sys_cfg.risk.max_order_notional_usd)
+    elif isinstance(env_notional, Mapping) and env_notional.get("max") is not None:
+        order_notional_cap = float(env_notional["max"])
+    else:
+        order_notional_cap = float(sys_cfg.risk.max_order_notional_usd)
+    max_slices = max(
+        [int(getattr(it.execution_spec, "num_slices", 4) or 4) for it in items],
+        default=4,
+    )
+    max_positions = max(
+        1, int(getattr(sys_cfg.admission, "max_new_positions_per_day", 2) or 2)
+    )
+    submit_limit = max(30, len(items) * max_slices * max_positions * 2)
+    modify_limit = max(submit_limit, len(items) * max_slices * max_positions * 4)
+    notional_caps = {
+        it.strategy_config.instrument_id: f"{order_notional_cap:.2f}"
+        for it in items
+    }
+    return LiveRiskEngineConfig(
+        max_notional_per_order=notional_caps if notional_caps else None,
+        max_order_submit_rate=f"{submit_limit}/00:01:00",
+        max_order_modify_rate=f"{modify_limit}/00:01:00",
+    )
+
+
+@dataclass(frozen=True)
 class AssembledLiveNodeBundle:
     """Container holding the built `LiveNode` and its attached isomorphic components."""
 
@@ -505,10 +673,12 @@ class AssembledLiveNodeBundle:
     trading_date: date
     plan_items: Tuple[PlanItemContract, ...]
     strategies: Tuple[BaseArchetypeStrategy, ...]
-    plan_gate: PlanGateExecAlgorithm
+    plan_gate_backend: PostgresPlanGateBackend
     telemetry_actor: PostgresTelemetryActor
     routed_venues: Tuple[str, ...]
+    exec_algorithm: Optional[CollaredTwapExecAlgorithm] = None
     reconciler: Optional["DailyPlanReconciler"] = None
+    instrument_statuses: Mapping[str, str] = field(default_factory=dict)
 
     @property
     def instruments(self) -> Tuple[str, ...]:
@@ -518,8 +688,8 @@ class AssembledLiveNodeBundle:
         self,
         bars_by_instrument: Mapping[str, Sequence[Bar]] | Sequence[Bar],
     ) -> List[Dict[str, Any]]:
-        """Drives the bundle's isomorphic strategy + `PlanGate` + `TelemetryActor` pipeline over `bars_by_instrument`
-        using the real Nautilus `BacktestEngine` kernel and returns the emitted order intents as dicts.
+        """Drives the bundle's isomorphic strategy + `PreTradeRiskGate` + `TelemetryActor` pipeline over `bars_by_instrument`
+        and returns the emitted order intents as dicts.
         """
         if isinstance(bars_by_instrument, Mapping):
             results: List[Dict[str, Any]] = []
@@ -610,6 +780,7 @@ def _load_warmup_bars_for_strategy_with_sources(
     elif datainfra_config is not None and getattr(
         datainfra_config, "clickhouse_url", None
     ):
+        catalog = None
         try:
             catalog = DataInfraCatalog(datainfra_config)
             now_ns = int(time.time() * 1_000_000_000)
@@ -653,6 +824,8 @@ def _load_warmup_bars_for_strategy_with_sources(
                 exc,
             )
             raise
+        finally:
+            catalog = None
 
     collected.sort(
         key=lambda b: int(getattr(b, "ts_init", 0) or getattr(b, "ts_event", 0) or 0)
@@ -682,6 +855,10 @@ class NautilusLiveNodeAssembler:
         warmup_on_build: Optional[bool] = None,
         sip_feeder_url: Optional[str] = None,
         sip_feeder_client: Optional[SipFeederSubscriptionClient] = None,
+        system_config: Optional[SystemConfig] = None,
+        fee_schedule: Optional[IbkrProFeeSchedule] = None,
+        instrument_loader: Optional[Callable[..., List[Equity]]] = None,
+        resolve_instruments_via_alpaca: Optional[bool] = None,
     ) -> None:
         resolved_mode = resolve_trading_mode()
         self._dsn = resolve_database_dsn(dsn)
@@ -726,7 +903,228 @@ class NautilusLiveNodeAssembler:
         self._sip_feeder_client = sip_feeder_client or SipFeederSubscriptionClient(
             base_url=sip_feeder_url
         )
+        self._system_config = system_config
+        self._fee_schedule = fee_schedule or IbkrProFeeSchedule()
+        self._instrument_loader = instrument_loader
+        self._resolve_instruments_via_alpaca = resolve_instruments_via_alpaca
         self._repo = PlanContractRepository(dsn=self._dsn)
+
+    def resolve_instruments_for_items(
+        self,
+        items: Sequence[PlanItemContract],
+        *,
+        persist_to_db: bool = True,
+        trading_date: Optional[date] = None,
+    ) -> Dict[str, ResolvedInstrumentEntry]:
+        """Resolves Alpaca `Equity` instruments (plus `instrument_metadata_cache` persistence/fallback).
+
+        - `NEW_ENTRY` failure/untradable -> status=`INSTRUMENT_UNRESOLVED`, `CANCELLED` in PG + `CRITICAL` alert,
+          isolated so valid symbols proceed.
+        - `CARRY_OVER` transient API error -> restore from `instrument_metadata_cache`, status=`DEGRADED_CACHED_INSTRUMENT`.
+        - `CARRY_OVER` confirmed venue halt/untradable (`ValueError`) -> status=`VENUE_HALTED_FROZEN` + `CRITICAL` alert,
+          preserving reconciliation `Equity` in cache while freezing auto-modifies.
+        """
+        if not items:
+            return {}
+        items_by_sym: Dict[str, PlanItemContract] = {}
+        for item in items:
+            items_by_sym[item.symbol] = item
+
+        if self._instrument_loader is not None:
+            use_alpaca = True
+        elif self._resolve_instruments_via_alpaca is not None:
+            use_alpaca = bool(self._resolve_instruments_via_alpaca)
+        else:
+            api_key = str(getattr(self._alpaca_config, "api_key", "") or "")
+            use_alpaca = self._alpaca_config is not None and bool(api_key)
+
+        syms = sorted(items_by_sym.keys())
+        cached_rows: Dict[str, Dict[str, Any]] = {}
+        if persist_to_db and self._repo is not None:
+            try:
+                cached_rows = self._repo.load_instrument_metadata_cache(syms)
+            except Exception as exc:
+                logger.warning("Failed loading instrument_metadata_cache: %s", exc)
+
+        resolved: Dict[str, ResolvedInstrumentEntry] = {}
+        if not use_alpaca:
+            for sym in syms:
+                item = items_by_sym[sym]
+                venue_str = (
+                    item.strategy_config.instrument_id.split(".", 1)[1].strip().upper()
+                    if "." in item.strategy_config.instrument_id
+                    else (item.venue or "ALPACA")
+                )
+                ref_px = float(item.risk_envelope.reference_price or 0.0)
+                if sym in cached_rows:
+                    eq = _equity_from_metadata_record(
+                        cached_rows[sym],
+                        venue_str,
+                        ref_price=ref_px if ref_px > 0.0 else None,
+                    )
+                else:
+                    eq = _create_default_equity(
+                        sym,
+                        venue_str,
+                        ref_price=ref_px if ref_px > 0.0 else None,
+                    )
+                resolved[sym] = ResolvedInstrumentEntry(
+                    symbol=sym,
+                    instrument=eq,
+                    status="RESOLVED_OFFLINE",
+                )
+            return resolved
+
+        loader = self._instrument_loader or load_alpaca_equity_instruments
+        ref_prices = {
+            sym: float(items_by_sym[sym].risk_envelope.reference_price)
+            for sym in syms
+            if items_by_sym[sym].risk_envelope.reference_price > Decimal("0")
+        }
+        venue_default = items_by_sym[syms[0]].venue or "ALPACA"
+        live_map: Dict[str, Equity] = {}
+        try:
+            batch_eqs = loader(
+                syms,
+                config=self._alpaca_config,
+                ref_prices=ref_prices,
+                venue=venue_default,
+            )
+            for eq in batch_eqs or ():
+                eq_sym = str(eq.id.symbol).split(".", 1)[0].strip().upper()
+                if eq_sym:
+                    live_map[eq_sym] = eq
+        except Exception as batch_exc:
+            logger.warning(
+                "Batch Alpaca instrument resolution failed (%s); isolating per symbol",
+                batch_exc,
+            )
+
+        upserts: List[Dict[str, Any]] = []
+        for sym in syms:
+            item = items_by_sym[sym]
+            venue_str = (
+                item.strategy_config.instrument_id.split(".", 1)[1].strip().upper()
+                if "." in item.strategy_config.instrument_id
+                else (item.venue or venue_default)
+            )
+            ref_px = float(item.risk_envelope.reference_price or 0.0)
+            if sym in live_map:
+                eq = live_map[sym]
+                upserts.append(_metadata_record_from_equity(eq))
+                resolved[sym] = ResolvedInstrumentEntry(
+                    symbol=sym,
+                    instrument=eq,
+                    status="RESOLVED_LIVE",
+                )
+                continue
+
+            try:
+                single_eqs = loader(
+                    [sym],
+                    config=self._alpaca_config,
+                    ref_prices=({sym: ref_px} if ref_px > 0.0 else {}),
+                    venue=venue_str,
+                )
+                if not single_eqs:
+                    raise ValueError(f"Alpaca returned empty instrument list for {sym}")
+                eq = single_eqs[0]
+                upserts.append(_metadata_record_from_equity(eq))
+                resolved[sym] = ResolvedInstrumentEntry(
+                    symbol=sym,
+                    instrument=eq,
+                    status="RESOLVED_LIVE",
+                )
+            except Exception as exc:
+                is_confirmed_untradable = isinstance(exc, ValueError)
+                if _is_carry_over_item(item):
+                    if sym in cached_rows:
+                        eq = _equity_from_metadata_record(
+                            cached_rows[sym],
+                            venue_str,
+                            ref_price=ref_px if ref_px > 0.0 else None,
+                        )
+                    else:
+                        eq = _create_default_equity(
+                            sym,
+                            venue_str,
+                            ref_price=ref_px if ref_px > 0.0 else None,
+                        )
+                    if is_confirmed_untradable:
+                        if persist_to_db:
+                            _emit_critical_instrument_alert(
+                                self._dsn,
+                                event_type="VENUE_HALTED_FROZEN",
+                                symbol=sym,
+                                title=f"Carry-over instrument {sym} untradable/halted at venue",
+                                body=str(exc),
+                                payload={
+                                    "symbol": sym,
+                                    "item_id": str(item.item_id),
+                                    "trading_date": str(trading_date or ""),
+                                    "reason": str(exc),
+                                },
+                            )
+                        resolved[sym] = ResolvedInstrumentEntry(
+                            symbol=sym,
+                            instrument=eq,
+                            status="VENUE_HALTED_FROZEN",
+                            reason=str(exc),
+                        )
+                    else:
+                        logger.warning(
+                            "Carry-over %s using DEGRADED_CACHED_INSTRUMENT after transient API error: %s",
+                            sym,
+                            exc,
+                        )
+                        resolved[sym] = ResolvedInstrumentEntry(
+                            symbol=sym,
+                            instrument=eq,
+                            status="DEGRADED_CACHED_INSTRUMENT",
+                            reason=str(exc),
+                        )
+                else:
+                    if persist_to_db and self._repo is not None:
+                        try:
+                            self._repo.update_item_status(
+                                item.item_id,
+                                "CANCELLED",
+                                actor="nautilus:live_node",
+                                reason=f"INSTRUMENT_UNRESOLVED: {exc}",
+                            )
+                        except Exception as status_exc:
+                            logger.warning(
+                                "Failed updating %s status to CANCELLED: %s",
+                                sym,
+                                status_exc,
+                            )
+                    if persist_to_db:
+                        _emit_critical_instrument_alert(
+                            self._dsn,
+                            event_type="INSTRUMENT_UNRESOLVED",
+                            symbol=sym,
+                            title=f"NEW_ENTRY instrument {sym} failed Alpaca resolution",
+                            body=str(exc),
+                            payload={
+                                "symbol": sym,
+                                "item_id": str(item.item_id),
+                                "trading_date": str(trading_date or ""),
+                                "reason": str(exc),
+                            },
+                        )
+                    resolved[sym] = ResolvedInstrumentEntry(
+                        symbol=sym,
+                        instrument=None,
+                        status="INSTRUMENT_UNRESOLVED",
+                        reason=str(exc),
+                    )
+
+        if upserts and persist_to_db and self._repo is not None:
+            try:
+                self._repo.upsert_instrument_metadata_cache(upserts)
+            except Exception as cache_exc:
+                logger.warning("Failed upserting instrument_metadata_cache: %s", cache_exc)
+        return resolved
 
     @staticmethod
     def _build_default_datainfra_config() -> DataInfraConfig:
@@ -1019,7 +1417,7 @@ class NautilusLiveNodeAssembler:
         warmup_strategies: Optional[bool] = None,
         perform_warmup: Optional[bool] = None,
     ) -> AssembledLiveNodeBundle:
-        """Constructs a `LiveNode` wired with `DataInfra`, `Alpaca`, `PlanGate`, `TelemetryActor`, and `Strategy`s."""
+        """Constructs a `LiveNode` wired with `DataInfra`, `Alpaca`, Rust `PreTradeRiskGate`, `CollaredTwapExecAlgorithm`, `TelemetryActor`, and `Strategy`s."""
         td = (
             date.fromisoformat(str(trading_date)[:10])
             if isinstance(trading_date, str)
@@ -1037,6 +1435,23 @@ class NautilusLiveNodeAssembler:
                 listen_timeout_secs=listen_timeout_secs,
             )
 
+        resolved_instruments = self.resolve_instruments_for_items(
+            locked_items,
+            persist_to_db=bool(persist_telemetry_to_db),
+            trading_date=td,
+        )
+        instrument_statuses = {
+            sym: entry.status for sym, entry in resolved_instruments.items()
+        }
+        active_items = [
+            item
+            for item in locked_items
+            if (
+                resolved_instruments.get(item.symbol) is None
+                or resolved_instruments[item.symbol].status != "INSTRUMENT_UNRESOLVED"
+            )
+        ]
+
         builder = LiveNode.builder(
             self._node_name,
             TraderId(self._trader_id),
@@ -1049,7 +1464,12 @@ class NautilusLiveNodeAssembler:
                 position_check_interval_secs=self._position_check_interval_secs,
             )
         )
-        builder.with_risk_engine_config(LiveRiskEngineConfig())
+        builder.with_risk_engine_config(
+            _build_live_risk_engine_config(
+                active_items,
+                system_config=self._system_config,
+            )
+        )
         builder.with_reconciliation(self._reconciliation_enabled)
         builder.with_reconciliation_lookback_mins(self._reconciliation_lookback_mins)
         if self._cache_config is not None:
@@ -1079,9 +1499,30 @@ class NautilusLiveNodeAssembler:
             routed_venues.append(extra.venue.strip().upper())
 
         node = builder.build()
-        plan_gate: Optional[PlanGateExecAlgorithm] = None
+        node_handle = (
+            node.handle()
+            if not hasattr(node, "trader")
+            and hasattr(node, "handle")
+            and callable(node.handle)
+            else None
+        )
+        collared_twap: Optional[CollaredTwapExecAlgorithm] = None
         telemetry_actor: Optional[PostgresTelemetryActor] = None
+        pg_backend: Optional[PostgresPlanGateBackend] = None
         try:
+            cache_obj = getattr(node, "cache", None)
+            if cache_obj is not None and hasattr(cache_obj, "add_instrument"):
+                for entry in resolved_instruments.values():
+                    if entry.instrument is not None:
+                        try:
+                            cache_obj.add_instrument(entry.instrument)
+                        except Exception as cache_exc:
+                            logger.warning(
+                                "Failed adding resolved instrument %s to node cache: %s",
+                                entry.symbol,
+                                cache_exc,
+                            )
+
             env_label = "LIVE" if self._environment == Environment.LIVE else "PAPER"
             pg_backend = (
                 plan_gate_backend
@@ -1092,6 +1533,8 @@ class NautilusLiveNodeAssembler:
                     market=self._market,
                 )
             )
+            node.set_pre_trade_risk_gate(pg_backend.as_pre_trade_risk_gate())
+
             oco_monitor = ProtectiveOcoMonitor(
                 dsn=self._dsn if persist_telemetry_to_db else None,
                 broker="alpaca",
@@ -1107,6 +1550,32 @@ class NautilusLiveNodeAssembler:
                     pg_backend.register_oco_monitor(oco_monitor)
                 except Exception:
                     pass
+            first_spec = getattr(active_items[0], "execution_spec", None) if active_items else None
+            exec_cfg = (
+                self._system_config.execution
+                if self._system_config is not None
+                else SystemConfig().execution
+            )
+            first_collar = (
+                active_items[0].risk_envelope.collar
+                if active_items
+                else MarketableLimitCollar(
+                    limit_collar_pct=Decimal(str(exec_cfg.limit_collar_pct)),
+                    limit_collar_atr=Decimal(str(exec_cfg.limit_collar_atr)),
+                )
+            )
+            collared_twap = CollaredTwapExecAlgorithm(
+                config=CollaredTwapExecAlgorithmConfig(
+                    exec_algorithm_id=COLLARED_TWAP_EXEC_ALGORITHM_ID,
+                    horizon_secs=float(getattr(first_spec, "twap_horizon_secs", 900) or 900.0),
+                    interval_secs=float(getattr(first_spec, "twap_interval_secs", 60) or 60.0),
+                    default_collar_pct=Decimal(str(first_collar.limit_collar_pct)),
+                    default_collar_atr=Decimal(str(first_collar.limit_collar_atr)),
+                    fee_schedule=self._fee_schedule,
+                    log_events=True,
+                    log_commands=True,
+                )
+            )
             telemetry_actor = PostgresTelemetryActor(
                 PostgresTelemetryActorConfig(
                     dsn=self._dsn if persist_telemetry_to_db else None,
@@ -1119,22 +1588,16 @@ class NautilusLiveNodeAssembler:
                     ),
                 ),
                 oco_monitor=oco_monitor,
+                plan_gate_backend=pg_backend,
+                plan_repo=self._repo,
+                cancel_symbol_entries_callback=collared_twap.cancel_symbol_entries,
             )
-            plan_gate = PlanGateExecAlgorithm(
-                backend=pg_backend,
-                telemetry_actor=telemetry_actor,
-                oco_monitor=oco_monitor,
-                config=PlanGateExecAlgorithmConfig(
-                    exec_algorithm_id=PLAN_GATE_EXEC_ALGORITHM_ID,
-                    collar_market_orders=bool(use_limit_orders),
-                ),
-            )
-            node.add_exec_algorithm(plan_gate)
+            node.add_exec_algorithm(collared_twap)
             node.add_actor(telemetry_actor)
             if hasattr(node, "trader") and getattr(node, "trader", None) is not None:
                 if hasattr(node.trader, "add_exec_algorithm"):
                     try:
-                        node.trader.add_exec_algorithm(plan_gate)
+                        node.trader.add_exec_algorithm(collared_twap)
                     except Exception:
                         pass
                 if hasattr(node.trader, "add_actor"):
@@ -1153,7 +1616,7 @@ class NautilusLiveNodeAssembler:
                 )
             )
             strategies: List[BaseArchetypeStrategy] = []
-            for item in locked_items:
+            for item in active_items:
                 co_status = str(
                     getattr(item, "carry_over_status", None)
                     or item.sizing_trace.get("carry_over_status")
@@ -1211,8 +1674,6 @@ class NautilusLiveNodeAssembler:
                 )
                 if hasattr(strategy, "bind_telemetry_actor"):
                     strategy.bind_telemetry_actor(telemetry_actor)
-                if hasattr(strategy, "bind_plan_gate"):
-                    strategy.bind_plan_gate(plan_gate)
                 if hasattr(strategy, "bind_warmup_loader") and (
                     should_warmup
                     or self._historical_bar_loader is not None
@@ -1261,6 +1722,13 @@ class NautilusLiveNodeAssembler:
                     else:
                         strategy.enter_carry_over_exit_only_mode()
 
+                inst_status = instrument_statuses.get(item.symbol, "")
+                if inst_status == "DEGRADED_CACHED_INSTRUMENT":
+                    strategy.enter_carry_over_exit_only_mode()
+                elif inst_status == "VENUE_HALTED_FROZEN":
+                    strategy._instrument_halted = True
+                    strategy.enter_carry_over_exit_only_mode()
+
                 node.add_strategy(strategy)
                 if hasattr(node, "trader") and getattr(node, "trader", None) is not None and hasattr(node.trader, "add_strategy"):
                     try:
@@ -1270,19 +1738,19 @@ class NautilusLiveNodeAssembler:
                 strategies.append(strategy)
 
             self._sync_sip_feeder_subscriptions(
-                active_symbols=[item.symbol for item in locked_items],
+                active_symbols=[item.symbol for item in active_items],
                 pg_backend=pg_backend,
             )
 
             reconciler = DailyPlanReconciler(
-                plan_gate=plan_gate,
                 plan_gate_backend=pg_backend,
                 telemetry_actor=telemetry_actor,
                 strategies_by_symbol={
-                    item.symbol: strat for item, strat in zip(locked_items, strategies)
+                    item.symbol: strat for item, strat in zip(active_items, strategies)
                 },
-                plan_items_by_symbol={item.symbol: item for item in locked_items},
+                plan_items_by_symbol={item.symbol: item for item in active_items},
                 node=node,
+                node_handle=node_handle,
                 assembler=self,
                 repository=self._repo,
                 warmup_bar_loader=self._historical_bar_loader,
@@ -1295,56 +1763,72 @@ class NautilusLiveNodeAssembler:
             def _clear_reconciler_refs() -> None:
                 rec = weak_rec()
                 if rec is not None:
-                    rec._node = None
-                    rec._plan_gate = None
-                    rec._telemetry_actor = None
-                    rec._strategies_by_symbol.clear()
+                    rec.close()
 
-            if hasattr(plan_gate, "_close_callbacks"):
-                plan_gate._close_callbacks.append(_clear_reconciler_refs)
+            if hasattr(pg_backend, "_close_callbacks"):
+                pg_backend._close_callbacks.append(_clear_reconciler_refs)
 
             return AssembledLiveNodeBundle(
                 node=node,
                 trading_date=td,
-                plan_items=tuple(locked_items),
+                plan_items=tuple(active_items),
                 strategies=tuple(strategies),
-                plan_gate=plan_gate,
+                plan_gate_backend=pg_backend,
                 telemetry_actor=telemetry_actor,
                 routed_venues=tuple(routed_venues),
+                exec_algorithm=collared_twap,
                 reconciler=reconciler,
+                instrument_statuses=instrument_statuses,
             )
         except Exception:
-            if plan_gate is not None:
+            if pg_backend is not None and plan_gate_backend is None:
                 try:
-                    plan_gate.close()
+                    pg_backend.close()
                 except Exception:
                     pass
-                plan_gate = None
             if telemetry_actor is not None:
                 try:
+                    telemetry_actor._cancel_symbol_entries_callback = None
+                    telemetry_actor._plan_gate_backend = None
+                    telemetry_actor._plan_repo = None
                     telemetry_actor.close()
                 except Exception:
                     pass
                 telemetry_actor = None
+            if collared_twap is not None:
+                collared_twap._schedules_by_primary.clear()
+                collared_twap._primary_by_child.clear()
+                collared_twap._primary_by_timer.clear()
+                collared_twap._primaries_by_symbol.clear()
+                collared_twap = None
             try:
                 node.dispose()
             except Exception:
                 pass
             node = None  # type: ignore[assignment]
-            gc.collect()
             raise
+
+
+_MISSING_ATTR = object()
+
+
+def _safe_getattr(obj: Any, attr: str, default: Any = None) -> Any:
+    try:
+        return getattr(obj, attr, default)
+    except (AttributeError, RuntimeError):
+        return default
 
 
 class DailyPlanReconciler:
     """Stateful daily `TradingPlan` rollover reconciler (`P0-EXEC-01`) implementing the
-    4-State Position & Plan Lifecycle Matrix without restarting `LiveNode`:
+    4-State Position & Plan Lifecycle Matrix:
     - `NEW_ACTIVE`: Pos == 0, Symbol in Today's Plan -> instantiate/mount strategy, warm up
-      historical bars (`max(lookback_window * 3, 120)`), and activate in `PlanGate`.
+      historical bars (`max(lookback_window * 3, 120)`), and activate in `PostgresPlanGateBackend`.
     - `RENEWED_ACTIVE`: Pos > 0, Symbol in Today's Plan -> update strategy parameters in-place
       and enforce monotonic stop-loss tightening (`new_stop >= current_stop` for LONG,
       `new_stop <= current_stop` for SHORT).
     - `CARRY_OVER_EXIT_ONLY`: Pos > 0, Symbol absent from Today's Plan -> freeze new entries
-      (`status="EXPIRED"`, `filled_qty = approved_qty_cap` in `PlanGate`, `exit_only_mode=True`
+      (`status="EXPIRED"`, `filled_qty = approved_qty_cap` in backend, `exit_only_mode=True`
       on strategy) while keeping protective stops (`GTC`, `reduce_only=True`) and exit signals active.
     - `THESIS_INVALIDATED_EXIT`: Pos > 0, Symbol VETOED or explicitly invalidated -> transition
       immediately to Two-Phase Safe Exit (`begin_safe_exit` -> cancel old stop leg -> submit
@@ -1355,7 +1839,7 @@ class DailyPlanReconciler:
         self,
         *,
         plan_gate_backend: Optional[Any] = None,
-        plan_gate: Optional[PlanGateExecAlgorithm | Any] = None,
+        plan_gate: Optional[Any] = None,
         telemetry_actor: Optional[PostgresTelemetryActor | Any] = None,
         strategies_by_symbol: Optional[
             Mapping[str, BaseArchetypeStrategy] | Sequence[BaseArchetypeStrategy]
@@ -1364,6 +1848,7 @@ class DailyPlanReconciler:
             Mapping[str, PlanItemContract] | Sequence[PlanItemContract]
         ] = None,
         node: Optional[LiveNode | Any] = None,
+        node_handle: Optional[Any] = None,
         assembler: Optional[NautilusLiveNodeAssembler] = None,
         repository: Optional[PlanContractRepository] = None,
         warmup_bar_loader: Optional[Callable[[str, str, int], Sequence[Bar]]] = None,
@@ -1378,9 +1863,18 @@ class DailyPlanReconciler:
                 plan_gate, "_backend", None
             )
         self._backend = resolved_backend
-        self._plan_gate = plan_gate
         self._telemetry_actor = telemetry_actor
         self._node = node
+        self._node_has_trader: bool = False
+        self._node_handle: Optional[Any] = node_handle
+        self._node_cache: Optional[Any] = None
+        if self._node is not None:
+            self._node_has_trader = (
+                _safe_getattr(self._node, "trader", _MISSING_ATTR) is not _MISSING_ATTR
+            )
+            if self._node_handle is None and not self._node_has_trader:
+                self._safe_node_handle()
+            self._node_cache = _safe_getattr(self._node, "cache", None)
         self._assembler = assembler
         self._repository = repository or (
             assembler.repository if assembler is not None else None
@@ -1437,9 +1931,47 @@ class DailyPlanReconciler:
     def node_reload_required(self) -> bool:
         return self._node_reload_required
 
+    def close(self) -> None:
+        """Clears references to LiveNode, telemetry actor, strategies, and assembler."""
+        self._node = None
+        self._node_handle = None
+        self._node_cache = None
+        self._telemetry_actor = None
+        self._strategies_by_symbol.clear()
+        self._assembler = None
+        self._event_loop = None
+        self._pending_node_strategies.clear()
+
+    def _safe_node_handle(self) -> Optional[Any]:
+        if self._node_handle is not None:
+            return self._node_handle
+        if self._node is None or not self._is_owner_thread():
+            return None
+        handle_fn = _safe_getattr(self._node, "handle", None)
+        if handle_fn is not None and callable(handle_fn):
+            try:
+                self._node_handle = handle_fn()
+                return self._node_handle
+            except (AttributeError, RuntimeError) as exc:
+                logger.debug(
+                    "LiveNode handle() failed during rollover access: %s",
+                    exc,
+                )
+                return None
+        return None
+
     def bind_event_loop(self, loop: Optional[asyncio.AbstractEventLoop]) -> None:
         self._event_loop = loop
         if loop is not None:
+            if self._is_owner_thread() and self._node is not None:
+                self._node_has_trader = (
+                    _safe_getattr(self._node, "trader", _MISSING_ATTR)
+                    is not _MISSING_ATTR
+                )
+                if self._node_handle is None and not self._node_has_trader:
+                    self._safe_node_handle()
+                if self._node_cache is None:
+                    self._node_cache = _safe_getattr(self._node, "cache", None)
             self._owner_thread_id = threading.get_ident()
 
     def _is_owner_thread(self) -> bool:
@@ -1459,24 +1991,29 @@ class DailyPlanReconciler:
         strat._owner_thread_id = threading.get_ident()
         if self._node is None:
             return
-        if hasattr(self._node, "trader") and getattr(self._node, "trader", None) is not None:
-            trader = self._node.trader
+        trader = _safe_getattr(self._node, "trader", None)
+        if trader is not None:
             if hasattr(trader, "add_strategy"):
                 try:
                     trader.add_strategy(strat)
                 except Exception:
                     pass
+            try:
+                node_is_running_attr = _safe_getattr(self._node, "is_running", False)
+                node_is_running = bool(
+                    node_is_running_attr()
+                    if callable(node_is_running_attr)
+                    else node_is_running_attr
+                )
+            except (AttributeError, RuntimeError):
+                node_is_running = False
             is_trader_running = (
                 bool(
                     trader.is_running()
                     if callable(getattr(trader, "is_running", None))
                     else getattr(trader, "is_running", False)
                 )
-                or bool(
-                    self._node.is_running()
-                    if callable(getattr(self._node, "is_running", None))
-                    else getattr(self._node, "is_running", False)
-                )
+                or node_is_running
             )
             if is_trader_running and hasattr(strat, "start"):
                 try:
@@ -1489,7 +2026,7 @@ class DailyPlanReconciler:
                         strat.start()
                 except Exception:
                     pass
-        elif hasattr(self._node, "add_strategy"):
+        elif _safe_getattr(self._node, "add_strategy", _MISSING_ATTR) is not _MISSING_ATTR:
             try:
                 self._node.add_strategy(strat)
             except Exception as exc:
@@ -1501,11 +2038,10 @@ class DailyPlanReconciler:
                     exc,
                     self._trading_date,
                 )
-                if hasattr(self._node, "handle") and callable(self._node.handle):
+                handle = self._safe_node_handle()
+                if handle is not None and hasattr(handle, "stop") and callable(handle.stop):
                     try:
-                        handle = self._node.handle()
-                        if hasattr(handle, "stop") and callable(handle.stop):
-                            handle.stop()
+                        handle.stop()
                     except Exception as stop_exc:
                         logger.debug(
                             "LiveNode handle.stop() failed during reload request: %s",
@@ -1539,7 +2075,7 @@ class DailyPlanReconciler:
         if bundle.reconciler is not None and assembler is None and warmup_bar_loader is None:
             return bundle.reconciler
         return cls(
-            plan_gate=bundle.plan_gate,
+            plan_gate_backend=bundle.plan_gate_backend,
             telemetry_actor=bundle.telemetry_actor,
             strategies_by_symbol=bundle.strategies,
             plan_items_by_symbol=bundle.plan_items,
@@ -1646,6 +2182,7 @@ class DailyPlanReconciler:
         ] = None,
         warmup_bars_by_symbol: Optional[Mapping[str, Sequence[Bar]]] = None,
         execute_thesis_exits_immediately: bool = False,
+        pre_resolved_instruments: Optional[Mapping[str, ResolvedInstrumentEntry]] = None,
     ) -> DailyPlanRolloverReport:
         """Reconciles open positions from Day `T-1` against Day `T`'s locked `PlanItemContract`s."""
         if (
@@ -1653,6 +2190,31 @@ class DailyPlanReconciler:
             and self._event_loop is not None
             and self._event_loop.is_running()
         ):
+            offthread_items = list(new_plan_items) if new_plan_items is not None else None
+            if (
+                offthread_items is None
+                and self._repository is not None
+            ):
+                offthread_items = self._repository.load_locked_plan_items(
+                    trading_date=trading_date,
+                    market=(
+                        self._assembler._market
+                        if self._assembler is not None
+                        else "US_EQUITY"
+                    ),
+                )
+            offthread_resolved = pre_resolved_instruments
+            if (
+                offthread_resolved is None
+                and self._assembler is not None
+                and offthread_items
+            ):
+                offthread_resolved = self._assembler.resolve_instruments_for_items(
+                    offthread_items,
+                    persist_to_db=True,
+                    trading_date=trading_date,
+                )
+
             fut: concurrent.futures.Future[DailyPlanRolloverReport] = (
                 concurrent.futures.Future()
             )
@@ -1661,11 +2223,12 @@ class DailyPlanReconciler:
                 try:
                     res = self.reconcile(
                         trading_date,
-                        new_plan_items,
+                        offthread_items,
                         vetoed_symbols=vetoed_symbols,
                         open_positions_by_symbol=open_positions_by_symbol,
                         warmup_bars_by_symbol=warmup_bars_by_symbol,
                         execute_thesis_exits_immediately=execute_thesis_exits_immediately,
+                        pre_resolved_instruments=offthread_resolved,
                     )
                     fut.set_result(res)
                 except Exception as exc:
@@ -1692,6 +2255,34 @@ class DailyPlanReconciler:
         else:
             resolved_items = []
 
+        resolved_inst_map: Dict[str, ResolvedInstrumentEntry] = dict(
+            pre_resolved_instruments or {}
+        )
+        if not resolved_inst_map and self._assembler is not None and resolved_items:
+            resolved_inst_map = self._assembler.resolve_instruments_for_items(
+                resolved_items,
+                persist_to_db=True,
+                trading_date=trading_date,
+            )
+
+        if self._is_owner_thread() and self._node is not None:
+            cache_obj = (
+                self._node_cache
+                if self._node_cache is not None
+                else _safe_getattr(self._node, "cache", None)
+            )
+            if cache_obj is not None and hasattr(cache_obj, "add_instrument"):
+                for entry in resolved_inst_map.values():
+                    if entry.instrument is not None:
+                        try:
+                            cache_obj.add_instrument(entry.instrument)
+                        except Exception as cache_exc:
+                            logger.warning(
+                                "Failed adding resolved instrument %s to node cache during rollover: %s",
+                                entry.symbol,
+                                cache_exc,
+                            )
+
         vetoed_set: Set[str] = {
             str(s).strip().upper() for s in (vetoed_symbols or ()) if str(s).strip()
         }
@@ -1710,7 +2301,8 @@ class DailyPlanReconciler:
             else:
                 new_items_by_symbol[sym] = item
 
-        # Snapshot prior items before hot-reloading backend trading_date
+        # Snapshot prior items and prior trading_date before hot-reloading backend trading_date
+        prior_trading_date = self._trading_date
         prior_items_by_symbol: Dict[str, PlanItemContract] = dict(
             self._plan_items_by_symbol
         )
@@ -1763,6 +2355,11 @@ class DailyPlanReconciler:
             | vetoed_set
         )
         decisions: List[SymbolRolloverDecision] = []
+        _defer_reload_only = (
+            not self._is_owner_thread()
+            and self._node is not None
+            and not self._node_has_trader
+        )
 
         for sym in all_symbols:
             pos_qty = pos_by_symbol.get(sym, Decimal("0"))
@@ -1772,7 +2369,7 @@ class DailyPlanReconciler:
 
             # State 4: THESIS_INVALIDATED_EXIT (Pos > 0 and Symbol VETOED / invalidated)
             if sym in vetoed_set and has_open_pos:
-                if strat is None and prior_item is not None:
+                if strat is None and prior_item is not None and not _defer_reload_only:
                     strat = instantiate_strategy_from_contract(
                         prior_item,
                         use_limit_orders=self._use_limit_orders,
@@ -1780,11 +2377,17 @@ class DailyPlanReconciler:
                     )
                     if self._telemetry_actor is not None:
                         strat.bind_telemetry_actor(self._telemetry_actor)
-                    if self._plan_gate is not None and hasattr(strat, "bind_plan_gate"):
-                        strat.bind_plan_gate(self._plan_gate)
                     strat.set_tracked_position_signed_qty(pos_qty)
                     self._mount_or_queue_strategy(strat)
                     self._strategies_by_symbol[sym] = strat
+
+                inst_entry = resolved_inst_map.get(sym)
+                if inst_entry is not None:
+                    if inst_entry.status == "DEGRADED_CACHED_INSTRUMENT" and strat is not None:
+                        strat.enter_carry_over_exit_only_mode()
+                    elif inst_entry.status == "VENUE_HALTED_FROZEN" and strat is not None:
+                        strat._instrument_halted = True
+                        strat.enter_carry_over_exit_only_mode()
 
                 base_contract = prior_item or self._build_fallback_carry_over_contract(
                     sym, strat, pos_qty
@@ -1865,18 +2468,25 @@ class DailyPlanReconciler:
                         )
                     else:
                         renewed_env = new_item.risk_envelope
-                    strat = instantiate_strategy_from_contract(
-                        replace(new_item, risk_envelope=renewed_env),
-                        use_limit_orders=self._use_limit_orders,
-                        submit_protective_stop=self._submit_protective_stop,
-                    )
-                    if self._telemetry_actor is not None:
-                        strat.bind_telemetry_actor(self._telemetry_actor)
-                    if self._plan_gate is not None and hasattr(strat, "bind_plan_gate"):
-                        strat.bind_plan_gate(self._plan_gate)
-                    strat.set_tracked_position_signed_qty(pos_qty)
-                    self._mount_or_queue_strategy(strat)
-                    self._strategies_by_symbol[sym] = strat
+                    if not _defer_reload_only:
+                        strat = instantiate_strategy_from_contract(
+                            replace(new_item, risk_envelope=renewed_env),
+                            use_limit_orders=self._use_limit_orders,
+                            submit_protective_stop=self._submit_protective_stop,
+                        )
+                        if self._telemetry_actor is not None:
+                            strat.bind_telemetry_actor(self._telemetry_actor)
+                        strat.set_tracked_position_signed_qty(pos_qty)
+                        self._mount_or_queue_strategy(strat)
+                        self._strategies_by_symbol[sym] = strat
+
+                inst_entry = resolved_inst_map.get(sym)
+                if inst_entry is not None:
+                    if inst_entry.status == "DEGRADED_CACHED_INSTRUMENT" and strat is not None:
+                        strat.enter_carry_over_exit_only_mode()
+                    elif inst_entry.status == "VENUE_HALTED_FROZEN" and strat is not None:
+                        strat._instrument_halted = True
+                        strat.enter_carry_over_exit_only_mode()
 
                 carried_reserved = max(new_item.filled_qty, abs(pos_qty))
                 renewed_item = replace(
@@ -1921,7 +2531,7 @@ class DailyPlanReconciler:
 
             # State 3: CARRY_OVER_EXIT_ONLY (Pos > 0 and Symbol NOT in Today's Plan)
             if sym not in new_items_by_symbol and has_open_pos:
-                if strat is None and prior_item is not None:
+                if strat is None and prior_item is not None and not _defer_reload_only:
                     strat = instantiate_strategy_from_contract(
                         prior_item,
                         use_limit_orders=self._use_limit_orders,
@@ -1929,11 +2539,17 @@ class DailyPlanReconciler:
                     )
                     if self._telemetry_actor is not None:
                         strat.bind_telemetry_actor(self._telemetry_actor)
-                    if self._plan_gate is not None and hasattr(strat, "bind_plan_gate"):
-                        strat.bind_plan_gate(self._plan_gate)
                     strat.set_tracked_position_signed_qty(pos_qty)
                     self._mount_or_queue_strategy(strat)
                     self._strategies_by_symbol[sym] = strat
+
+                inst_entry = resolved_inst_map.get(sym)
+                if inst_entry is not None:
+                    if inst_entry.status == "DEGRADED_CACHED_INSTRUMENT" and strat is not None:
+                        strat.enter_carry_over_exit_only_mode()
+                    elif inst_entry.status == "VENUE_HALTED_FROZEN" and strat is not None:
+                        strat._instrument_halted = True
+                        strat.enter_carry_over_exit_only_mode()
 
                 base_contract = prior_item or self._build_fallback_carry_over_contract(
                     sym, strat, pos_qty
@@ -1985,43 +2601,50 @@ class DailyPlanReconciler:
 
             # State 1: NEW_ACTIVE (Pos == 0 and Symbol in Today's Plan)
             if sym in new_items_by_symbol and not has_open_pos:
-                new_item = new_items_by_symbol[sym]
-                if (
-                    strat is None
-                    or strat.archetype_config.ARCHETYPE_ID
-                    != new_item.strategy_config.archetype_id
-                ):
-                    strat = instantiate_strategy_from_contract(
-                        new_item,
-                        use_limit_orders=self._use_limit_orders,
-                        submit_protective_stop=self._submit_protective_stop,
+                inst_entry = resolved_inst_map.get(sym)
+                if inst_entry is not None and inst_entry.status == "INSTRUMENT_UNRESOLVED":
+                    logger.warning(
+                        "Isolating NEW_ENTRY %s during rollover: INSTRUMENT_UNRESOLVED (%s)",
+                        sym,
+                        inst_entry.reason,
                     )
-                    if self._telemetry_actor is not None and hasattr(
-                        strat, "bind_telemetry_actor"
+                    self._plan_items_by_symbol.pop(sym, None)
+                    continue
+                new_item = new_items_by_symbol[sym]
+                warmup_fed = 0
+                if not _defer_reload_only:
+                    if (
+                        strat is None
+                        or strat.archetype_config.ARCHETYPE_ID
+                        != new_item.strategy_config.archetype_id
                     ):
-                        strat.bind_telemetry_actor(self._telemetry_actor)
-                    if self._plan_gate is not None and hasattr(
-                        strat, "bind_plan_gate"
-                    ):
-                        strat.bind_plan_gate(self._plan_gate)
-                    if self._assembler is not None and hasattr(
-                        strat, "bind_warmup_loader"
-                    ):
-                        strat.bind_warmup_loader(
-                            lambda s=strat: self._assembler.load_warmup_bars_for_strategy(s)
+                        strat = instantiate_strategy_from_contract(
+                            new_item,
+                            use_limit_orders=self._use_limit_orders,
+                            submit_protective_stop=self._submit_protective_stop,
                         )
-                    self._mount_or_queue_strategy(strat)
-                    self._strategies_by_symbol[sym] = strat
-                else:
-                    strat.apply_renewed_plan_item(new_item)
-                    if hasattr(strat, "reset_rolling_windows"):
-                        strat.reset_rolling_windows()
+                        if self._telemetry_actor is not None and hasattr(
+                            strat, "bind_telemetry_actor"
+                        ):
+                            strat.bind_telemetry_actor(self._telemetry_actor)
+                        if self._assembler is not None and hasattr(
+                            strat, "bind_warmup_loader"
+                        ):
+                            strat.bind_warmup_loader(
+                                lambda s=strat: self._assembler.load_warmup_bars_for_strategy(s)
+                            )
+                        self._mount_or_queue_strategy(strat)
+                        self._strategies_by_symbol[sym] = strat
+                    else:
+                        strat.apply_renewed_plan_item(new_item)
+                        if hasattr(strat, "reset_rolling_windows"):
+                            strat.reset_rolling_windows()
 
-                warmup_fed = self._warmup_new_strategy(
-                    sym,
-                    strat,
-                    warmup_bars_by_symbol=warmup_bars_by_symbol,
-                )
+                    warmup_fed = self._warmup_new_strategy(
+                        sym,
+                        strat,
+                        warmup_bars_by_symbol=warmup_bars_by_symbol,
+                    )
                 if self._backend is not None and hasattr(
                     self._backend, "upsert_runtime_plan_item"
                 ):
@@ -2112,7 +2735,72 @@ class DailyPlanReconciler:
             sip_feeder_subscriptions=sip_sync_result,
         )
         self._last_report = report
+        if (
+            self._node is not None
+            and not self._node_has_trader
+            and (
+                self._safe_node_handle() is not None
+                or (
+                    self._event_loop is not None
+                    and not self._event_loop.is_closed()
+                    and self._event_loop.is_running()
+                )
+            )
+            and (
+                (prior_trading_date is not None and trading_date != prior_trading_date)
+                or any(
+                    d.state
+                    in (
+                        RolloverLifecycleState.NEW_ACTIVE,
+                        RolloverLifecycleState.RENEWED_ACTIVE,
+                        RolloverLifecycleState.THESIS_INVALIDATED_EXIT,
+                    )
+                    for d in decisions
+                )
+            )
+        ):
+            self._request_node_reload_stop()
         return report
+
+    def _request_node_reload_stop(self) -> None:
+        self._node_reload_required = True
+        handle = self._safe_node_handle()
+        if handle is not None and hasattr(handle, "stop") and callable(handle.stop):
+            if (
+                not self._is_owner_thread()
+                and self._event_loop is not None
+                and not self._event_loop.is_closed()
+                and self._event_loop.is_running()
+            ):
+                self._event_loop.call_soon_threadsafe(handle.stop)
+            else:
+                try:
+                    handle.stop()
+                except Exception as stop_exc:
+                    logger.debug(
+                        "LiveNode handle.stop() failed during rollover reload request: %s",
+                        stop_exc,
+                    )
+        elif (
+            not self._is_owner_thread()
+            and self._node is not None
+            and self._event_loop is not None
+            and not self._event_loop.is_closed()
+            and self._event_loop.is_running()
+        ):
+
+            def _stop_on_main_loop() -> None:
+                try:
+                    h = self._safe_node_handle()
+                    if h is not None and hasattr(h, "stop") and callable(h.stop):
+                        h.stop()
+                except Exception as stop_exc:
+                    logger.debug(
+                        "LiveNode handle.stop() failed on main loop: %s",
+                        stop_exc,
+                    )
+
+            self._event_loop.call_soon_threadsafe(_stop_on_main_loop)
 
 
 class DailyPlanRolloverListener:
@@ -2267,10 +2955,18 @@ class DailyPlanRolloverListener:
             payload=raw_payload,
             target_date=target_date,
         )
+        pre_resolved: Optional[Dict[str, ResolvedInstrumentEntry]] = None
+        if items and getattr(self._reconciler, "_assembler", None) is not None:
+            pre_resolved = self._reconciler._assembler.resolve_instruments_for_items(
+                items,
+                persist_to_db=True,
+                trading_date=target_date,
+            )
         report = self._reconciler.reconcile(
             trading_date=target_date,
             new_plan_items=items,
             vetoed_symbols=vetoed_symbols if vetoed_symbols else None,
+            pre_resolved_instruments=pre_resolved,
         )
         if self._on_rollover_callback is not None:
             self._on_rollover_callback(report)
@@ -2422,7 +3118,16 @@ def _extract_parity_order_intents(
     decisions: Mapping[str, Any],
     ts_init_overrides: Optional[Mapping[str, int]] = None,
 ) -> Tuple[ParityOrderIntent, ...]:
-    order_list = list(orders)
+    def _is_twap_child(o: Any) -> bool:
+        cid = str(getattr(o, "client_order_id", ""))
+        spawn_id = str(getattr(o, "exec_spawn_id", "") or "")
+        if "-E" in cid:
+            return True
+        if spawn_id and spawn_id != cid:
+            return True
+        return False
+
+    order_list = [o for o in orders if not _is_twap_child(o)]
     overrides = dict(ts_init_overrides or {})
     primary_ts_by_cid: Dict[str, int] = {}
     for o in order_list:
@@ -2471,7 +3176,13 @@ def _extract_parity_order_intents(
         trig_attr = getattr(order, "trigger_price", None)
         exec_algo = str(getattr(order, "exec_algorithm_id", "") or "")
         dec = decisions.get(cid)
-        admitted = bool(dec.allowed) if dec is not None else False
+        if dec is not None:
+            admitted = bool(dec.allowed)
+        else:
+            admitted = getattr(order, "status", None) not in (
+                OrderStatus.DENIED,
+                OrderStatus.INITIALIZED,
+            )
         intents.append(
             ParityOrderIntent(
                 sequence_index=idx,
@@ -2502,7 +3213,16 @@ def _run_backtest_pipeline_order_intents(
 ) -> Tuple[ParityOrderIntent, ...]:
     normalized_bars = _normalize_bars_for_parity(bars)
     venue_str = plan_item.strategy_config.instrument_id.split(".", 1)[1].strip().upper()
-    equities: List[Equity] = [_create_default_equity(plan_item.symbol, venue_str)]
+    ref_px = float(plan_item.risk_envelope.reference_price or 0.0)
+    if ref_px <= 0.0 and normalized_bars:
+        ref_px = float(normalized_bars[0].close)
+    equities: List[Equity] = [
+        _create_default_equity(
+            plan_item.symbol,
+            venue_str,
+            ref_price=ref_px if ref_px > 0.0 else None,
+        )
+    ]
     items_to_lock = _build_parity_plan_items(plan_item, venue_str)
     can_persist = bool(
         include_telemetry_actor
@@ -2510,30 +3230,55 @@ def _run_backtest_pipeline_order_intents(
         and _has_existing_locked_plan_for_parity(dsn, trading_date, items_to_lock)
     )
 
-    engine = BacktestEngine(
-        BacktestEngineConfig(bypass_logging=True, run_analysis=False)
+    sys_cfg = SystemConfig()
+    env_cfg = load_envelope()
+    env_notional = env_cfg.numeric.get("risk.max_order_notional_usd")
+    notional_cap = float(
+        env_notional["max"]
+        if isinstance(env_notional, Mapping) and env_notional.get("max") is not None
+        else sys_cfg.risk.max_order_notional_usd
     )
-    plan_gate: Optional[PlanGateExecAlgorithm] = None
+    risk_engine_cfg = RiskEngineConfig(
+        max_notional_per_order={
+            str(eq.id): f"{notional_cap:.2f}" for eq in equities
+        },
+        max_order_submit_rate="120/00:01:00",
+        max_order_modify_rate="240/00:01:00",
+    )
+    engine = BacktestEngine(
+        BacktestEngineConfig(
+            bypass_logging=True,
+            run_analysis=False,
+            risk_engine=risk_engine_cfg,
+        )
+    )
+    pg_backend: Optional[PostgresPlanGateBackend] = None
+    collared_twap: Optional[CollaredTwapExecAlgorithm] = None
     telemetry_actor: Optional[PostgresTelemetryActor] = None
     strategy: Optional[BaseArchetypeStrategy] = None
+    fill_model_obj: Optional[BestPriceFillModel] = None
+    fee_model_obj: Optional[IbkrProFixedUsEquityFeeModel] = None
+    latency_model_obj: Optional[StaticLatencyModel] = None
+    orders_out: List[Any] = []
     try:
+        fill_model_obj = BestPriceFillModel(prob_fill_on_limit=1.0, prob_slippage=0.0)
+        fee_model_obj = IbkrProFixedUsEquityFeeModel()
+        latency_model_obj = StaticLatencyModel(
+            base_latency_nanos=0,
+            insert_latency_nanos=1,
+            update_latency_nanos=0,
+            cancel_latency_nanos=0,
+        )
         engine.add_venue(
             venue=Venue(venue_str),
             oms_type=OmsType.NETTING,
             account_type=AccountType.MARGIN,
             starting_balances=[Money.from_str("100000.00 USD")],
             base_currency=Currency.from_str("USD"),
-            fill_model=BestPriceFillModel(prob_fill_on_limit=1.0, prob_slippage=0.0),
-            fee_model=MakerTakerFeeModel(
-                maker_rate=Decimal("0.0002"),
-                taker_rate=Decimal("0.0005"),
-            ),
-            latency_model=StaticLatencyModel(
-                base_latency_nanos=0,
-                insert_latency_nanos=1,
-                update_latency_nanos=0,
-                cancel_latency_nanos=0,
-            ),
+            fill_model=fill_model_obj,
+            fee_model=fee_model_obj,
+            latency_model=latency_model_obj,
+            reject_stop_orders=True,
         )
         for eq in equities:
             engine.add_instrument(eq)
@@ -2548,10 +3293,26 @@ def _run_backtest_pipeline_order_intents(
         oco_monitor = ProtectiveOcoMonitor(
             dsn=dsn if can_persist else None,
             persist_to_db=can_persist,
-            on_entry_freeze_callback=lambda sym, reason: pg_backend.set_entry_freeze(
+            on_entry_freeze_callback=lambda sym, reason, _b=pg_backend: _b.set_entry_freeze(
                 True,
                 reason=reason,
                 updated_by=f"nautilus:protective_oco_monitor:{sym}",
+            ),
+        )
+        exec_spec = getattr(items_to_lock[0], "execution_spec", None)
+        collared_twap = CollaredTwapExecAlgorithm(
+            config=CollaredTwapExecAlgorithmConfig(
+                exec_algorithm_id=COLLARED_TWAP_EXEC_ALGORITHM_ID,
+                horizon_secs=float(getattr(exec_spec, "twap_horizon_secs", 900) or 900.0),
+                interval_secs=float(getattr(exec_spec, "twap_interval_secs", 60) or 60.0),
+                default_collar_pct=Decimal(
+                    str(items_to_lock[0].risk_envelope.collar.limit_collar_pct)
+                ),
+                default_collar_atr=Decimal(
+                    str(items_to_lock[0].risk_envelope.collar.limit_collar_atr)
+                ),
+                log_events=False,
+                log_commands=False,
             ),
         )
         telemetry_actor = PostgresTelemetryActor(
@@ -2564,18 +3325,12 @@ def _run_backtest_pipeline_order_intents(
                 enforce_protective_oco_on_position_events=bool(submit_protective_stop),
             ),
             oco_monitor=oco_monitor,
+            plan_gate_backend=pg_backend,
+            cancel_symbol_entries_callback=collared_twap.cancel_symbol_entries,
         )
-        plan_gate = PlanGateExecAlgorithm(
-            backend=pg_backend,
-            telemetry_actor=telemetry_actor,
-            oco_monitor=oco_monitor,
-            config=PlanGateExecAlgorithmConfig(
-                exec_algorithm_id=PLAN_GATE_EXEC_ALGORITHM_ID,
-                collar_market_orders=bool(use_limit_orders),
-            ),
-        )
+        engine.set_pre_trade_risk_gate(pg_backend.as_pre_trade_risk_gate())
         engine.add_actor(telemetry_actor)
-        engine.add_exec_algorithm(plan_gate)
+        engine.add_exec_algorithm(collared_twap)
 
         strategy = instantiate_strategy_from_contract(
             items_to_lock[0],
@@ -2583,43 +3338,60 @@ def _run_backtest_pipeline_order_intents(
             submit_protective_stop=submit_protective_stop,
         )
         strategy.bind_telemetry_actor(telemetry_actor)
-        if hasattr(strategy, "bind_plan_gate"):
-            strategy.bind_plan_gate(plan_gate)
         engine.add_strategy(strategy)
 
         engine.add_data(normalized_bars)
         engine.run()
+        pg_backend.flush_rust_mutations(1024)
 
         if telemetry_actor is not None:
             telemetry_actor.sync_from_cache()
             telemetry_actor.flush()
 
-        return _extract_parity_order_intents(
-            orders=list(engine.cache.orders() or []),
-            decisions=plan_gate.decisions,
+        orders_out = list(engine.cache.orders() or [])
+        intents_result = _extract_parity_order_intents(
+            orders=orders_out,
+            decisions={},
         )
+        orders_out.clear()
+        return intents_result
     finally:
+        orders_out.clear()
         if strategy is not None:
             strategy._cached_order_factory = None
             strategy._cached_clock = None
             strategy._telemetry_actor_ref = None
-            strategy._plan_gate_ref = None
-        if plan_gate is not None:
-            plan_gate._cached_cache = None
-            plan_gate._cached_clock = None
-            plan_gate._cached_msgbus = None
-            plan_gate._telemetry_actor = None
-            plan_gate._oco_monitor = None
-            plan_gate._registered_strategies.clear()
-            plan_gate.close()
+            if hasattr(strategy, "_warmup_loader"):
+                strategy._warmup_loader = None
+        if collared_twap is not None:
+            collared_twap._schedules_by_primary.clear()
+            collared_twap._primary_by_child.clear()
+            collared_twap._primary_by_timer.clear()
+            collared_twap._primaries_by_symbol.clear()
         if telemetry_actor is not None:
             telemetry_actor._cached_cache = None
             telemetry_actor._cached_clock = None
+            telemetry_actor._cancel_symbol_entries_callback = None
+            telemetry_actor._plan_gate_backend = None
+            telemetry_actor._plan_repo = None
             if hasattr(telemetry_actor, "_oco_monitor") and telemetry_actor._oco_monitor is not None:
                 telemetry_actor._oco_monitor._on_entry_freeze_callback = None
+                telemetry_actor._oco_monitor._entry_freeze_callbacks.clear()
             telemetry_actor.close()
+        if pg_backend is not None:
+            pg_backend.close()
         engine.dispose()
-        del strategy, plan_gate, telemetry_actor, engine
+        del (
+            orders_out,
+            fill_model_obj,
+            fee_model_obj,
+            latency_model_obj,
+            strategy,
+            collared_twap,
+            telemetry_actor,
+            pg_backend,
+            engine,
+        )
 
 
 def _capture_pipeline_order_intents(
@@ -2633,26 +3405,22 @@ def _capture_pipeline_order_intents(
     submit_protective_stop: bool = True,
     include_telemetry_actor: bool = True,
 ) -> Tuple[ParityOrderIntent, ...]:
-    """Runs the exact `Strategy(StrategyConfig) + PlanGateExecAlgorithm(PostgresPlanGateBackend)` pipeline
+    """Runs the exact `Strategy(StrategyConfig) + Rust PreTradeRiskGate + CollaredTwapExecAlgorithm` pipeline
     in `BacktestEngine` on an isolated worker thread (preserving caller thread's `LiveNode` `msgbus`)
     and extracts the chronological sequence of `ParityOrderIntent`s.
     """
-    gc.collect()
-    try:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            return pool.submit(
-                _run_backtest_pipeline_order_intents,
-                plan_item=plan_item,
-                bars=bars,
-                dsn=dsn,
-                trading_date=trading_date,
-                environment_label=environment_label,
-                use_limit_orders=use_limit_orders,
-                submit_protective_stop=submit_protective_stop,
-                include_telemetry_actor=include_telemetry_actor,
-            ).result()
-    finally:
-        gc.collect()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        return pool.submit(
+            _run_backtest_pipeline_order_intents,
+            plan_item=plan_item,
+            bars=bars,
+            dsn=dsn,
+            trading_date=trading_date,
+            environment_label=environment_label,
+            use_limit_orders=use_limit_orders,
+            submit_protective_stop=submit_protective_stop,
+            include_telemetry_actor=include_telemetry_actor,
+        ).result()
 
 
 def _capture_live_node_order_intents(
@@ -2670,44 +3438,46 @@ def _capture_live_node_order_intents(
     """
     normalized_bars = _normalize_bars_for_parity(bars)
     owns_bundle = bundle is None
-    if bundle is None:
-        resolved_date = trading_date or (
-            datetime.fromtimestamp(
-                max(int(b.ts_init) for b in normalized_bars) / 1e9,
-                tz=timezone.utc,
-            ).date()
-            if normalized_bars
-            else datetime.now(tz=timezone.utc).date()
-        )
-        venue_str = plan_item.strategy_config.instrument_id.split(".", 1)[1].strip().upper()
-        items_to_lock = _build_parity_plan_items(plan_item, venue_str)
-        can_persist_live = _has_existing_locked_plan_for_parity(
-            dsn, resolved_date, items_to_lock
-        )
-        pg_backend = PostgresPlanGateBackend(
-            plan_items=items_to_lock,
-            entry_freeze=False,
-            trading_date=resolved_date,
-            persist_to_db=False,
-            allow_multi_cycle_reentry=False,
-        )
-        assembler = NautilusLiveNodeAssembler(
-            dsn=dsn or "postgresql://localhost:5432/trading",
-            alpaca_config=AlpacaExecClientConfig(
-                api_key="parity-gate-key",
-                api_secret="parity-gate-secret",
-            ),
-        )
-        bundle = assembler.build_live_node(
-            trading_date=resolved_date,
-            plan_items=[items_to_lock[0]],
-            plan_gate_backend=pg_backend,
-            persist_telemetry_to_db=can_persist_live,
-            use_limit_orders=use_limit_orders,
-            submit_protective_stop=submit_protective_stop,
-            warmup_strategies=False,
-        )
+    owned_pg_backend: Optional[PostgresPlanGateBackend] = None
     try:
+        if bundle is None:
+            resolved_date = trading_date or (
+                datetime.fromtimestamp(
+                    max(int(b.ts_init) for b in normalized_bars) / 1e9,
+                    tz=timezone.utc,
+                ).date()
+                if normalized_bars
+                else datetime.now(tz=timezone.utc).date()
+            )
+            venue_str = plan_item.strategy_config.instrument_id.split(".", 1)[1].strip().upper()
+            items_to_lock = _build_parity_plan_items(plan_item, venue_str)
+            can_persist_live = _has_existing_locked_plan_for_parity(
+                dsn, resolved_date, items_to_lock
+            )
+            owned_pg_backend = PostgresPlanGateBackend(
+                plan_items=items_to_lock,
+                entry_freeze=False,
+                trading_date=resolved_date,
+                persist_to_db=False,
+                allow_multi_cycle_reentry=False,
+            )
+            assembler = NautilusLiveNodeAssembler(
+                dsn=dsn or "postgresql://localhost:5432/trading",
+                alpaca_config=AlpacaExecClientConfig(
+                    api_key="alpaca-paper-offline-key",
+                    api_secret="alpaca-paper-offline-secret",
+                ),
+                resolve_instruments_via_alpaca=False,
+            )
+            bundle = assembler.build_live_node(
+                trading_date=resolved_date,
+                plan_items=[items_to_lock[0]],
+                plan_gate_backend=owned_pg_backend,
+                persist_telemetry_to_db=can_persist_live,
+                use_limit_orders=use_limit_orders,
+                submit_protective_stop=submit_protective_stop,
+                warmup_strategies=False,
+            )
         return _drive_live_node_bundle_order_intents(
             bundle=bundle,
             plan_item=plan_item,
@@ -2719,35 +3489,33 @@ def _capture_live_node_order_intents(
                 strat._cached_order_factory = None
                 strat._cached_clock = None
                 strat._telemetry_actor_ref = None
-                strat._plan_gate_ref = None
-            try:
-                if bundle.plan_gate.is_running():
-                    bundle.plan_gate.stop()
-            except Exception:
-                pass
             try:
                 if bundle.telemetry_actor.is_running():
                     bundle.telemetry_actor.stop()
             except Exception:
                 pass
-            bundle.plan_gate._cached_cache = None
-            bundle.plan_gate._cached_clock = None
-            bundle.plan_gate._cached_msgbus = None
-            bundle.plan_gate._telemetry_actor = None
-            bundle.plan_gate._oco_monitor = None
-            bundle.plan_gate._registered_strategies.clear()
             bundle.telemetry_actor._cached_cache = None
             bundle.telemetry_actor._cached_clock = None
+            bundle.telemetry_actor._cancel_symbol_entries_callback = None
+            bundle.telemetry_actor._plan_gate_backend = None
+            bundle.telemetry_actor._plan_repo = None
             if (
                 hasattr(bundle.telemetry_actor, "_oco_monitor")
                 and bundle.telemetry_actor._oco_monitor is not None
             ):
                 bundle.telemetry_actor._oco_monitor._on_entry_freeze_callback = None
-            bundle.plan_gate.close()
+                bundle.telemetry_actor._oco_monitor._entry_freeze_callbacks.clear()
+            if getattr(bundle, "exec_algorithm", None) is not None:
+                bundle.exec_algorithm._schedules_by_primary.clear()
+                bundle.exec_algorithm._primary_by_child.clear()
+                bundle.exec_algorithm._primary_by_timer.clear()
+                bundle.exec_algorithm._primaries_by_symbol.clear()
+            bundle.plan_gate_backend.close()
             bundle.telemetry_actor.close()
             bundle.node.dispose()
             bundle = None  # type: ignore[assignment]
-            gc.collect()
+        elif owns_bundle and owned_pg_backend is not None:
+            owned_pg_backend.close()
 
 
 def _drive_live_node_bundle_order_intents(
@@ -2756,8 +3524,8 @@ def _drive_live_node_bundle_order_intents(
     plan_item: PlanItemContract,
     bars: Sequence[Bar],
 ) -> Tuple[ParityOrderIntent, ...]:
-    """Drives `bundle`'s registered `Strategy` + `PlanGate` + `TelemetryActor` instances directly over `bars`
-    using real Nautilus `Order` and `Position` domain events.
+    """Drives `bundle`'s registered `Strategy` + `PostgresPlanGateBackend` (`RustPlanGateEngine`) + `TelemetryActor`
+    instances directly over `bars` using real Nautilus `Order` and `Position` domain events.
     """
     matching_strategies = [
         s
@@ -2779,30 +3547,35 @@ def _drive_live_node_bundle_order_intents(
     sorted_bars = _normalize_bars_for_parity(bars)
 
     items_to_lock = _build_parity_plan_items(plan_item, venue_str)
-    backend = bundle.plan_gate.backend
+    backend = bundle.plan_gate_backend
     if hasattr(backend, "upsert_plan_item"):
         for item in items_to_lock:
             backend.upsert_plan_item(item)
     elif hasattr(backend, "lock_plan"):
         backend.lock_plan(bundle.trading_date, items_to_lock)
-    if hasattr(bundle.plan_gate, "sync_from_db"):
-        bundle.plan_gate.sync_from_db()
+    if hasattr(backend, "sync_from_db"):
+        backend.sync_from_db()
 
     if not bundle.telemetry_actor.is_running():
         bundle.telemetry_actor.start()
-    if not bundle.plan_gate.is_running():
-        bundle.plan_gate.start()
 
-    equity = _create_default_equity(plan_item.symbol, venue_str)
+    ref_px = float(plan_item.risk_envelope.reference_price or 0.0)
+    if ref_px <= 0.0 and sorted_bars:
+        ref_px = float(sorted_bars[0].close)
+    equity = _create_default_equity(
+        plan_item.symbol,
+        venue_str,
+        ref_price=ref_px if ref_px > 0.0 else None,
+    )
     account_id = AccountId(f"{venue_str}-001")
     usd = Currency.from_str("USD")
-    maker_rate = Decimal("0.0002")
-    taker_rate = Decimal("0.0005")
+    fee_schedule = IbkrProFeeSchedule()
 
     existing_cached = list(live_strat.cache.orders() or [])
     seen_cids: set[str] = {str(o.client_order_id) for o in existing_cached}
     submitted_cids: set[str] = set(seen_cids)
     order_by_cid: Dict[str, Any] = {str(o.client_order_id): o for o in existing_cached}
+    decisions_by_cid: Dict[str, PlanGateDecision] = {}
     order_bar_ts_by_cid: Dict[str, int] = {}
     in_flight_submitted: List[Any] = []
     working_orders: List[Any] = []
@@ -2813,15 +3586,23 @@ def _drive_live_node_bundle_order_intents(
     venue_seq = 0
     trade_seq = 0
     pos_seq = 0
+    last_bar_close = ref_px if ref_px > 0.0 else 100.0
+
+    telemetry_actor = bundle.telemetry_actor
+
+    def _emit_telemetry_order_event(ev: Any) -> None:
+        if telemetry_actor is not None and hasattr(telemetry_actor, "on_order_event"):
+            telemetry_actor.on_order_event(ev)
 
     def _apply_order_event(o: Any, ev: Any) -> None:
         cid = str(o.client_order_id)
         seen_objs = {id(o)}
         o.apply(ev)
-        try:
-            live_strat.cache.update_order(o)
-        except Exception:
-            pass
+        if hasattr(live_strat.cache, "update_order"):
+            try:
+                live_strat.cache.update_order(o)
+            except Exception:
+                pass
         for store_name in ("_submitted_orders_by_cid", "_stop_orders_by_cid"):
             store = getattr(live_strat, store_name, None)
             if isinstance(store, Mapping):
@@ -2832,6 +3613,7 @@ def _drive_live_node_bundle_order_intents(
                         alt_o.apply(ev)
                     except Exception:
                         pass
+        _emit_telemetry_order_event(ev)
 
     def _collect_new_orders(bar_ts: int) -> None:
         while True:
@@ -2848,19 +3630,77 @@ def _drive_live_node_bundle_order_intents(
                 seen_cids.add(cid)
                 order_by_cid[cid] = o
                 order_bar_ts_by_cid[cid] = bar_ts
-                if (
-                    cid not in bundle.plan_gate.decisions
-                    and cid not in bundle.plan_gate._spawn_to_primary_cid
-                ):
-                    bundle.plan_gate.on_order(o)
+                ev_attr = getattr(o, "events", None)
+                if ev_attr is not None:
+                    for init_ev in (ev_attr() if callable(ev_attr) else ev_attr) or ():
+                        _emit_telemetry_order_event(init_ev)
+                raw_exec_params = getattr(o, "exec_algorithm_params", None) or {}
+                stop_raw = raw_exec_params.get("stop_loss_price") or getattr(
+                    o, "trigger_price", None
+                )
+                atr_raw = raw_exec_params.get("daily_atr_14") or raw_exec_params.get(
+                    "atr"
+                )
+                tags_raw = tuple(str(t) for t in (getattr(o, "tags", None) or ()))
+                is_reduce = bool(getattr(o, "is_reduce_only", False))
+                is_exit = is_reduce or any(t in EXIT_INTENT_TAGS for t in tags_raw)
+                open_entry_qty = Decimal("0")
+                filled_entry_qty = Decimal("0")
+                for cached_ord in live_strat.cache.orders() or ():
+                    if str(cached_ord.instrument_id) != str(o.instrument_id):
+                        continue
+                    if bool(getattr(cached_ord, "is_reduce_only", False)):
+                        continue
+                    if str(cached_ord.client_order_id) == cid:
+                        continue
+                    st = getattr(cached_ord, "status", None)
+                    if st in (
+                        OrderStatus.ACCEPTED,
+                        OrderStatus.SUBMITTED,
+                        OrderStatus.PENDING_UPDATE,
+                        OrderStatus.PARTIALLY_FILLED,
+                    ):
+                        open_entry_qty += Decimal(str(cached_ord.quantity.as_decimal()))
+                    elif st == OrderStatus.FILLED:
+                        filled_entry_qty += Decimal(
+                            str(cached_ord.filled_qty.as_decimal())
+                        )
+                req = PlanGateOrderRequest(
+                    client_order_id=cid,
+                    strategy_id=str(o.strategy_id),
+                    instrument_id=str(o.instrument_id),
+                    symbol=str(o.instrument_id).split(".", 1)[0].strip().upper(),
+                    venue=venue_str,
+                    order_side=o.side,
+                    order_type=o.order_type,
+                    quantity=Decimal(str(o.quantity.as_decimal())),
+                    is_reduce_only=is_reduce,
+                    evaluation_ts=datetime.fromtimestamp(
+                        bar_ts / 1_000_000_000.0, tz=timezone.utc
+                    ),
+                    limit_price=(
+                        Decimal(str(o.price.as_double()))
+                        if getattr(o, "price", None) is not None
+                        else None
+                    ),
+                    reference_price=Decimal(str(last_bar_close)),
+                    stop_loss_price=(
+                        Decimal(str(stop_raw)) if stop_raw is not None else None
+                    ),
+                    atr=(Decimal(str(atr_raw)) if atr_raw is not None else None),
+                    collar_market_order=False,
+                    allow_uncollared_market_order=False,
+                    is_exit_intent=is_exit,
+                    cache_open_entry_qty=open_entry_qty,
+                    cache_filled_entry_qty=filled_entry_qty,
+                )
+                decisions_by_cid[cid] = backend.evaluate_and_reserve(req)
 
         for cid, o in list(order_by_cid.items()):
             if cid in submitted_cids:
                 continue
             submitted_cids.add(cid)
-            if cid in set(bundle.plan_gate._spawn_to_primary_cid.values()):
-                continue
-            dec = bundle.plan_gate.decisions.get(cid)
+            dec = decisions_by_cid.get(cid)
             if dec is not None and dec.allowed:
                 ev_sub = OrderSubmitted(
                     o.trader_id,
@@ -2873,9 +3713,21 @@ def _drive_live_node_bundle_order_intents(
                     bar_ts,
                 )
                 _apply_order_event(o, ev_sub)
-                bundle.plan_gate.on_order_event(ev_sub)
                 live_strat.on_order_submitted(ev_sub)
                 in_flight_submitted.append(o)
+            else:
+                ev_den = OrderDenied(
+                    o.trader_id,
+                    o.strategy_id,
+                    o.instrument_id,
+                    o.client_order_id,
+                    (dec.reason if dec is not None else "PLAN_GATE_DENIED"),
+                    UUID4(),
+                    bar_ts,
+                    bar_ts,
+                )
+                _apply_order_event(o, ev_den)
+                live_strat.on_order_denied(ev_den)
 
     def _apply_modify(o: Any, mod: Mapping[str, Any], bar_ts: int) -> None:
         new_qty = mod.get("quantity") or o.quantity
@@ -2905,7 +3757,12 @@ def _drive_live_node_bundle_order_intents(
             new_trig,
         )
         _apply_order_event(o, ev_upd)
-        bundle.plan_gate.on_order_event(ev_upd)
+        if not bool(getattr(o, "is_reduce_only", False)):
+            backend.reconcile_order_updated(
+                str(o.client_order_id),
+                str(o.instrument_id).split(".", 1)[0].strip().upper(),
+                Decimal(str(new_qty.as_decimal())),
+            )
         live_strat.on_order_updated(ev_upd)
 
     def _process_cancels_and_modifies(bar_ts: int) -> None:
@@ -2945,7 +3802,11 @@ def _drive_live_node_bundle_order_intents(
                         account_id,
                     )
                     _apply_order_event(target_ord, ev_can)
-                    bundle.plan_gate.on_order_canceled(ev_can)
+                    backend.reconcile_terminal_order(
+                        str(target_ord.client_order_id),
+                        str(target_ord.instrument_id).split(".", 1)[0].strip().upper(),
+                        Decimal(str(target_ord.filled_qty.as_decimal())),
+                    )
                     live_strat.on_order_canceled(ev_can)
                     _collect_new_orders(bar_ts)
                 elif target_ord in in_flight_submitted:
@@ -2962,7 +3823,6 @@ def _drive_live_node_bundle_order_intents(
                         None,
                         account_id,
                     )
-                    bundle.plan_gate.on_order_event(ev_crej)
                     if hasattr(live_strat, "on_order_cancel_rejected"):
                         live_strat.on_order_cancel_rejected(ev_crej)
                     _collect_new_orders(bar_ts)
@@ -2974,12 +3834,17 @@ def _drive_live_node_bundle_order_intents(
         bar_ts: int,
     ) -> None:
         nonlocal trade_seq, pos_seq, open_pos
+        _ = liq_side
         trade_seq += 1
         qty_dec = Decimal(str(o.quantity.as_decimal()))
         px_str = f"{fill_px_float:.2f}"
         px_dec = Decimal(px_str)
-        rate = maker_rate if liq_side == LiquiditySide.MAKER else taker_rate
-        comm_dec = (qty_dec * px_dec * rate).quantize(Decimal("0.01"))
+        comm_dec = compute_ibkr_pro_fixed_commission(
+            side=o.side,
+            quantity=qty_dec,
+            fill_px=px_dec,
+            schedule=fee_schedule,
+        )
         if open_pos is None or open_pos.is_closed:
             pos_seq += 1
             pos_id = PositionId(f"{o.instrument_id}-{o.strategy_id}-{pos_seq}")
@@ -3007,24 +3872,28 @@ def _drive_live_node_bundle_order_intents(
             Money.from_str(f"{comm_dec} USD"),
         )
         _apply_order_event(o, ev_fill)
-        bundle.plan_gate.on_order_filled(ev_fill)
+        backend.reconcile_terminal_order(
+            str(o.client_order_id),
+            str(o.instrument_id).split(".", 1)[0].strip().upper(),
+            Decimal(str(o.filled_qty.as_decimal())),
+        )
         live_strat.on_order_filled(ev_fill)
         if open_pos is None or open_pos.is_closed:
             open_pos = Position(equity, ev_fill)
             ev_pos = PositionOpened.create(open_pos, ev_fill, UUID4(), bar_ts)
-            bundle.plan_gate.on_position_event(ev_pos)
             if hasattr(live_strat, "on_position_opened"):
                 live_strat.on_position_opened(ev_pos)
         else:
             open_pos.apply(ev_fill)
             if open_pos.is_closed:
                 ev_pos = PositionClosed.create(open_pos, ev_fill, UUID4(), bar_ts)
-                bundle.plan_gate.on_position_event(ev_pos)
+                backend.release_closed_position_capacity(
+                    str(o.instrument_id).split(".", 1)[0].strip().upper(),
+                )
                 if hasattr(live_strat, "on_position_closed"):
                     live_strat.on_position_closed(ev_pos)
             else:
                 ev_pos = PositionChanged.create(open_pos, ev_fill, UUID4(), bar_ts)
-                bundle.plan_gate.on_position_event(ev_pos)
                 if hasattr(live_strat, "on_position_changed"):
                     live_strat.on_position_changed(ev_pos)
         _collect_new_orders(bar_ts)
@@ -3035,6 +3904,7 @@ def _drive_live_node_bundle_order_intents(
         b_open = float(bar.open.as_double())
         b_high = float(bar.high.as_double())
         b_low = float(bar.low.as_double())
+        last_bar_close = float(bar.close.as_double())
 
         arriving = list(in_flight_submitted)
         in_flight_submitted.clear()
@@ -3065,7 +3935,11 @@ def _drive_live_node_bundle_order_intents(
                         False,
                     )
                     _apply_order_event(o, ev_rej)
-                    bundle.plan_gate.on_order_rejected(ev_rej)
+                    backend.reconcile_terminal_order(
+                        str(o.client_order_id),
+                        str(o.instrument_id).split(".", 1)[0].strip().upper(),
+                        Decimal("0"),
+                    )
                     live_strat.on_order_rejected(ev_rej)
                     _collect_new_orders(bar_ts)
                     _process_cancels_and_modifies(bar_ts)
@@ -3087,7 +3961,6 @@ def _drive_live_node_bundle_order_intents(
             )
             _apply_order_event(o, ev_acc)
             working_orders.append(o)
-            bundle.plan_gate.on_order_event(ev_acc)
             live_strat.on_order_accepted(ev_acc)
             for queued_mod in pending_modifies_by_cid.pop(cid, ()):
                 _apply_modify(o, queued_mod, bar_ts)
@@ -3148,7 +4021,7 @@ def _drive_live_node_bundle_order_intents(
 
     return _extract_parity_order_intents(
         orders=list(order_by_cid.values()),
-        decisions=bundle.plan_gate.decisions,
+        decisions=decisions_by_cid,
         ts_init_overrides=order_bar_ts_by_cid,
     )
 

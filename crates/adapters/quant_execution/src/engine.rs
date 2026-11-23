@@ -11,7 +11,7 @@
 
 use std::{ collections::VecDeque, sync::Arc };
 
-use ahash::AHashMap;
+use ahash::{AHashMap, AHashSet};
 use parking_lot::RwLock;
 use rust_decimal::{Decimal, RoundingStrategy};
 use serde_json::json;
@@ -29,7 +29,26 @@ struct PlanGateMemoryState {
     items_by_symbol: AHashMap<String, RustPlanItemEnvelope>,
     reserved_qty_by_symbol: AHashMap<String, Decimal>,
     reserved_notional_by_symbol: AHashMap<String, Decimal>,
+    admitted_entry_reservations: AHashMap<String, (String, Decimal)>,
+    admitted_exit_cids: AHashSet<String>,
     pending_mutations: VecDeque<String>,
+}
+
+struct ValidatedEntryAdmission {
+    item_id: String,
+    plan_id: String,
+    derived_limit_price: Option<String>,
+    ref_price: Decimal,
+    projected_total_qty: Decimal,
+}
+
+enum BatchLegValidation<'a> {
+    Bypass {
+        client_order_id: &'a str,
+        item_id: Option<String>,
+        plan_id: Option<String>,
+    },
+    Admit(&'a RustPlanGateOrderRequest, ValidatedEntryAdmission),
 }
 
 /// Thread-safe, $O(1)$ in-memory pre-trade `PlanGate` admission engine with non-blocking audit queue.
@@ -135,6 +154,9 @@ impl RustPlanGateEngine {
         guard.items_by_symbol.remove(symbol);
         guard.reserved_qty_by_symbol.remove(symbol);
         guard.reserved_notional_by_symbol.remove(symbol);
+        guard
+            .admitted_entry_reservations
+            .retain(|_, (sym, _)| sym != symbol);
     }
 
     /// Clears all cached plan items.
@@ -143,6 +165,88 @@ impl RustPlanGateEngine {
         guard.items_by_symbol.clear();
         guard.reserved_qty_by_symbol.clear();
         guard.reserved_notional_by_symbol.clear();
+        guard.admitted_entry_reservations.clear();
+    }
+
+    /// Returns a cloned copy of the locked `RustPlanItemEnvelope` for `symbol`, if present.
+    #[must_use]
+    pub fn plan_item_for_symbol(&self, symbol: &str) -> Option<RustPlanItemEnvelope> {
+        self.state.read().items_by_symbol.get(symbol).cloned()
+    }
+
+    /// Returns whether an active reservation is currently tracked for `client_order_id`.
+    #[must_use]
+    pub fn has_admitted_reservation(&self, client_order_id: &str) -> bool {
+        self.state
+            .read()
+            .admitted_entry_reservations
+            .contains_key(client_order_id)
+    }
+
+    /// Records an admitted exit `client_order_id` so same-callback `OrderStatus::Initialized`
+    /// unlinked exit siblings are counted against position capacity.
+    pub fn record_admitted_exit(&self, client_order_id: &str) {
+        if client_order_id.is_empty() {
+            return;
+        }
+        self.state
+            .write()
+            .admitted_exit_cids
+            .insert(client_order_id.to_string());
+    }
+
+    /// Records multiple admitted exit `client_order_id`s atomically under a single write lock.
+    pub fn record_admitted_exits<'a>(&self, cids: impl IntoIterator<Item = &'a str>) {
+        let mut guard = self.state.write();
+        for cid in cids {
+            if !cid.is_empty() {
+                guard.admitted_exit_cids.insert(cid.to_string());
+            }
+        }
+    }
+
+    /// Returns whether `client_order_id` was previously admitted as an exit by this gate.
+    #[must_use]
+    pub fn is_admitted_exit(&self, client_order_id: &str) -> bool {
+        self.state
+            .read()
+            .admitted_exit_cids
+            .contains(client_order_id)
+    }
+
+    /// Retains only admitted exit `client_order_id`s for which `keep` returns `true`.
+    pub fn prune_non_initialized_exits<F>(&self, mut keep: F)
+    where
+        F: FnMut(&str) -> bool,
+    {
+        if self.state.read().admitted_exit_cids.is_empty() {
+            return;
+        }
+        let mut guard = self.state.write();
+        guard
+            .admitted_exit_cids
+            .retain(|cid| keep(cid.as_str()));
+    }
+
+    /// Returns `(client_order_id, reserved_qty)` snapshots for all active entry reservations
+    /// currently tracked for `symbol`.
+    #[must_use]
+    pub fn admitted_reservations_for_symbol(&self, symbol: &str) -> Vec<(String, Decimal)> {
+        let guard = self.state.read();
+        if guard.admitted_entry_reservations.is_empty() {
+            return Vec::new();
+        }
+        guard
+            .admitted_entry_reservations
+            .iter()
+            .filter_map(|(cid, (sym, qty))| {
+                if sym == symbol {
+                    Some((cid.clone(), *qty))
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     /// Returns the currently reserved/filled quantity for `symbol`.
@@ -169,6 +273,11 @@ impl RustPlanGateEngine {
         let plan_id_opt = item_opt.as_ref().map(|i| i.plan_id.clone());
 
         if request.is_reduce_only || request.is_exit_intent {
+            if !request.client_order_id.is_empty() {
+                guard
+                    .admitted_exit_cids
+                    .insert(request.client_order_id.clone());
+            }
             return RustPlanGateDecision {
                 allowed: true,
                 reason: None,
@@ -181,29 +290,236 @@ impl RustPlanGateEngine {
             };
         }
 
+        match Self::validate_entry_request_locked(&guard, request, Decimal::ZERO) {
+            Ok(admission) => Self::commit_entry_admission_locked(&mut guard, request, admission),
+            Err((reason, severity, err_item_id, err_plan_id)) => {
+                Self::enqueue_denied_mutation(
+                    &mut guard,
+                    request,
+                    &reason,
+                    severity,
+                    err_item_id.as_deref(),
+                    err_plan_id.as_deref(),
+                );
+                RustPlanGateDecision {
+                    allowed: false,
+                    reason: Some(reason),
+                    is_exit_bypass: false,
+                    derived_limit_price: None,
+                    item_id: err_item_id,
+                    plan_id: err_plan_id,
+                    new_reserved_qty: None,
+                    added_notional_usd: None,
+                }
+            }
+        }
+    }
+
+    /// Evaluates a multi-leg batch (e.g., `SubmitOrderList`) using two-phase atomic check-then-reserve.
+    ///
+    /// Phase 1 validates every leg without mutating any reservation or item state. Only if every
+    /// leg passes does Phase 2 atomically commit reservations across all entry legs.
+    ///
+    /// # Errors
+    ///
+    /// Returns the denial reason for the first failing leg, leaving reservations unchanged.
+    pub fn evaluate_and_reserve_batch(
+        &self,
+        requests: &[RustPlanGateOrderRequest],
+    ) -> Result<Vec<RustPlanGateDecision>, String> {
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut guard = self.state.write();
+        let mut batch_added_qty_by_symbol: AHashMap<String, Decimal> = AHashMap::new();
+        let mut validated = Vec::with_capacity(requests.len());
+
+        // Phase 1: Pure read-only validation across all legs.
+        for request in requests {
+            if request.is_reduce_only || request.is_exit_intent {
+                let item_opt = guard.items_by_symbol.get(&request.symbol);
+                validated.push(BatchLegValidation::Bypass {
+                    client_order_id: request.client_order_id.as_str(),
+                    item_id: item_opt.map(|i| i.item_id.clone()),
+                    plan_id: item_opt.map(|i| i.plan_id.clone()),
+                });
+                continue;
+            }
+
+            let extra_qty = batch_added_qty_by_symbol
+                .get(&request.symbol)
+                .copied()
+                .unwrap_or(Decimal::ZERO);
+
+            match Self::validate_entry_request_locked(&guard, request, extra_qty) {
+                Ok(admission) => {
+                    *batch_added_qty_by_symbol
+                        .entry(request.symbol.clone())
+                        .or_insert(Decimal::ZERO) += request.quantity;
+                    validated.push(BatchLegValidation::Admit(request, admission));
+                }
+                Err((reason, severity, err_item_id, err_plan_id)) => {
+                    Self::enqueue_denied_mutation(
+                        &mut guard,
+                        request,
+                        &reason,
+                        severity,
+                        err_item_id.as_deref(),
+                        err_plan_id.as_deref(),
+                    );
+                    return Err(reason);
+                }
+            }
+        }
+
+        // Phase 2: Atomic commit across all admitted legs.
+        let mut decisions = Vec::with_capacity(validated.len());
+        for leg in validated {
+            match leg {
+                BatchLegValidation::Bypass {
+                    client_order_id,
+                    item_id,
+                    plan_id,
+                } => {
+                    if !client_order_id.is_empty() {
+                        guard
+                            .admitted_exit_cids
+                            .insert(client_order_id.to_string());
+                    }
+                    decisions.push(RustPlanGateDecision {
+                        allowed: true,
+                        reason: None,
+                        is_exit_bypass: true,
+                        derived_limit_price: None,
+                        item_id,
+                        plan_id,
+                        new_reserved_qty: None,
+                        added_notional_usd: None,
+                    });
+                }
+                BatchLegValidation::Admit(req, admission) => {
+                    decisions.push(Self::commit_entry_admission_locked(
+                        &mut guard, req, admission,
+                    ));
+                }
+            }
+        }
+
+        Ok(decisions)
+    }
+
+    /// Validates an entry order modification (`!is_reduce_only`), denying any upward quantity
+    /// modification (`ENTRY_UPWARD_MODIFY_PROHIBITED`) and any limit price violating the collar.
+    ///
+    /// # Errors
+    ///
+    /// Returns the exact denial reason if the modification is prohibited.
+    #[expect(clippy::too_many_arguments)]
+    pub fn validate_entry_modify(
+        &self,
+        symbol: &str,
+        new_qty: Option<Decimal>,
+        current_qty: Decimal,
+        new_limit_price: Option<Decimal>,
+        reference_price: Option<Decimal>,
+        atr: Option<Decimal>,
+        evaluation_ts_ns: i64,
+        evaluation_ts_iso: &str,
+    ) -> Result<(), String> {
+        if let Some(nq) = new_qty {
+            if nq > current_qty {
+                return Err("ENTRY_UPWARD_MODIFY_PROHIBITED".to_string());
+            }
+            if nq <= Decimal::ZERO {
+                return Err(format!(
+                    "INVALID_QUANTITY: order quantity must be > 0, got {nq}"
+                ));
+            }
+        }
+
+        let Some(limit_px) = new_limit_price else {
+            return Ok(());
+        };
+
+        let guard = self.state.read();
+        if guard.backend_unavailable {
+            return Err(format!(
+                "BACKEND_UNAVAILABLE: {}",
+                guard.backend_unavailable_reason
+            ));
+        }
+        if guard.entry_freeze {
+            let detail = if guard.entry_freeze_reason.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", guard.entry_freeze_reason)
+            };
+            return Err(format!(
+                "ENTRY_FREEZE_ACTIVE: global ENTRY_FREEZE is active{detail}"
+            ));
+        }
+        let Some(plan_item) = guard.items_by_symbol.get(symbol) else {
+            return Err(format!(
+                "NO_LOCKED_PLAN_ITEM: no LOCKED PlanItemContract found for symbol {symbol}"
+            ));
+        };
+        if !ADMISSIBLE_STATUSES.contains(&plan_item.status.as_str()) {
+            return Err(format!(
+                "PLAN_ITEM_STATUS_NOT_ADMISSIBLE: PlanItem {} for {symbol} has status '{}' (must be in ('ARMED', 'TRIGGERED', 'PARTIALLY_FILLED'))",
+                plan_item.item_id, plan_item.status
+            ));
+        }
+        if evaluation_ts_ns > plan_item.valid_until_ns {
+            return Err(format!(
+                "PLAN_ITEM_EXPIRED: evaluation_ts ({evaluation_ts_iso}) > valid_until ({})",
+                plan_item.valid_until_iso
+            ));
+        }
+
+        let implied_plan_ref_price = if plan_item.target_qty > Decimal::ZERO {
+            plan_item.target_notional_usd / plan_item.target_qty
+        } else {
+            Decimal::ZERO
+        };
+        let ref_price = reference_price.unwrap_or(implied_plan_ref_price);
+        if ref_price <= Decimal::ZERO {
+            return Err(format!(
+                "INVALID_REFERENCE_PRICE: reference_price must be > 0, got {ref_price}"
+            ));
+        }
+
+        let worst_limit_px = plan_item.compute_worst_limit_price(ref_price, atr);
+        if plan_item.side.eq_ignore_ascii_case("LONG") && limit_px > worst_limit_px {
+            return Err(format!(
+                "COLLAR_LIMIT_VIOLATION: BUY limit_price ({limit_px}) exceeds worst_limit_price ({worst_limit_px}) from reference_price ({ref_price})"
+            ));
+        }
+        if plan_item.side.eq_ignore_ascii_case("SHORT") && limit_px < worst_limit_px {
+            return Err(format!(
+                "COLLAR_LIMIT_VIOLATION: SELL limit_price ({limit_px}) below worst_limit_price ({worst_limit_px}) from reference_price ({ref_price})"
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn validate_entry_request_locked(
+        guard: &PlanGateMemoryState,
+        request: &RustPlanGateOrderRequest,
+        extra_reserved_qty: Decimal,
+    ) -> Result<ValidatedEntryAdmission, (String, &'static str, Option<String>, Option<String>)>
+    {
+        let item_opt = guard.items_by_symbol.get(&request.symbol);
+        let item_id_opt = item_opt.map(|i| i.item_id.clone());
+        let plan_id_opt = item_opt.map(|i| i.plan_id.clone());
+
         if guard.backend_unavailable {
             let reason = format!(
                 "BACKEND_UNAVAILABLE: {}",
                 guard.backend_unavailable_reason
             );
-            Self::enqueue_denied_mutation(
-                &mut guard,
-                request,
-                &reason,
-                "CRITICAL",
-                item_id_opt.as_deref(),
-                plan_id_opt.as_deref(),
-            );
-            return RustPlanGateDecision {
-                allowed: false,
-                reason: Some(reason),
-                is_exit_bypass: false,
-                derived_limit_price: None,
-                item_id: item_id_opt,
-                plan_id: plan_id_opt,
-                new_reserved_qty: None,
-                added_notional_usd: None,
-            };
+            return Err((reason, "CRITICAL", item_id_opt, plan_id_opt));
         }
 
         if guard.entry_freeze {
@@ -213,24 +529,7 @@ impl RustPlanGateEngine {
                 format!(" ({})", guard.entry_freeze_reason)
             };
             let reason = format!("ENTRY_FREEZE_ACTIVE: global ENTRY_FREEZE is active{detail}");
-            Self::enqueue_denied_mutation(
-                &mut guard,
-                request,
-                &reason,
-                "CRITICAL",
-                item_id_opt.as_deref(),
-                plan_id_opt.as_deref(),
-            );
-            return RustPlanGateDecision {
-                allowed: false,
-                reason: Some(reason),
-                is_exit_bypass: false,
-                derived_limit_price: None,
-                item_id: item_id_opt,
-                plan_id: plan_id_opt,
-                new_reserved_qty: None,
-                added_notional_usd: None,
-            };
+            return Err((reason, "CRITICAL", item_id_opt, plan_id_opt));
         }
 
         let Some(plan_item) = item_opt else {
@@ -238,17 +537,7 @@ impl RustPlanGateEngine {
                 "NO_LOCKED_PLAN_ITEM: no LOCKED PlanItemContract found for symbol {}",
                 request.symbol
             );
-            Self::enqueue_denied_mutation(&mut guard, request, &reason, "WARN", None, None);
-            return RustPlanGateDecision {
-                allowed: false,
-                reason: Some(reason),
-                is_exit_bypass: false,
-                derived_limit_price: None,
-                item_id: None,
-                plan_id: None,
-                new_reserved_qty: None,
-                added_notional_usd: None,
-            };
+            return Err((reason, "WARN", None, None));
         };
 
         if !ADMISSIBLE_STATUSES.contains(&plan_item.status.as_str()) {
@@ -256,24 +545,7 @@ impl RustPlanGateEngine {
                 "PLAN_ITEM_STATUS_NOT_ADMISSIBLE: PlanItem {} for {} has status '{}' (must be in ('ARMED', 'TRIGGERED', 'PARTIALLY_FILLED'))",
                 plan_item.item_id, request.symbol, plan_item.status
             );
-            Self::enqueue_denied_mutation(
-                &mut guard,
-                request,
-                &reason,
-                "WARN",
-                Some(&plan_item.item_id),
-                Some(&plan_item.plan_id),
-            );
-            return RustPlanGateDecision {
-                allowed: false,
-                reason: Some(reason),
-                is_exit_bypass: false,
-                derived_limit_price: None,
-                item_id: Some(plan_item.item_id),
-                plan_id: Some(plan_item.plan_id),
-                new_reserved_qty: None,
-                added_notional_usd: None,
-            };
+            return Err((reason, "WARN", item_id_opt, plan_id_opt));
         }
 
         if request.evaluation_ts_ns > plan_item.valid_until_ns {
@@ -281,24 +553,7 @@ impl RustPlanGateEngine {
                 "PLAN_ITEM_EXPIRED: evaluation_ts ({}) > valid_until ({})",
                 request.evaluation_ts_iso, plan_item.valid_until_iso
             );
-            Self::enqueue_denied_mutation(
-                &mut guard,
-                request,
-                &reason,
-                "WARN",
-                Some(&plan_item.item_id),
-                Some(&plan_item.plan_id),
-            );
-            return RustPlanGateDecision {
-                allowed: false,
-                reason: Some(reason),
-                is_exit_bypass: false,
-                derived_limit_price: None,
-                item_id: Some(plan_item.item_id),
-                plan_id: Some(plan_item.plan_id),
-                new_reserved_qty: None,
-                added_notional_usd: None,
-            };
+            return Err((reason, "WARN", item_id_opt, plan_id_opt));
         }
 
         let expected_side = if plan_item.side.eq_ignore_ascii_case("LONG") {
@@ -319,24 +574,7 @@ impl RustPlanGateEngine {
                 "SIDE_MISMATCH: order side {} does not match plan side '{}'",
                 request.order_side, plan_item.side
             );
-            Self::enqueue_denied_mutation(
-                &mut guard,
-                request,
-                &reason,
-                "WARN",
-                Some(&plan_item.item_id),
-                Some(&plan_item.plan_id),
-            );
-            return RustPlanGateDecision {
-                allowed: false,
-                reason: Some(reason),
-                is_exit_bypass: false,
-                derived_limit_price: None,
-                item_id: Some(plan_item.item_id),
-                plan_id: Some(plan_item.plan_id),
-                new_reserved_qty: None,
-                added_notional_usd: None,
-            };
+            return Err((reason, "WARN", item_id_opt, plan_id_opt));
         }
 
         if request.quantity <= Decimal::ZERO {
@@ -344,24 +582,7 @@ impl RustPlanGateEngine {
                 "INVALID_QUANTITY: order quantity must be > 0, got {}",
                 request.quantity
             );
-            Self::enqueue_denied_mutation(
-                &mut guard,
-                request,
-                &reason,
-                "WARN",
-                Some(&plan_item.item_id),
-                Some(&plan_item.plan_id),
-            );
-            return RustPlanGateDecision {
-                allowed: false,
-                reason: Some(reason),
-                is_exit_bypass: false,
-                derived_limit_price: None,
-                item_id: Some(plan_item.item_id),
-                plan_id: Some(plan_item.plan_id),
-                new_reserved_qty: None,
-                added_notional_usd: None,
-            };
+            return Err((reason, "WARN", item_id_opt, plan_id_opt));
         }
 
         let prior_reserved = guard
@@ -370,7 +591,7 @@ impl RustPlanGateEngine {
             .copied()
             .unwrap_or(plan_item.filled_qty);
         let cache_total = request.cache_filled_entry_qty + request.cache_open_entry_qty;
-        let effective_prior_qty = prior_reserved.max(cache_total);
+        let effective_prior_qty = prior_reserved.max(cache_total) + extra_reserved_qty;
         let projected_total_qty = effective_prior_qty + request.quantity;
 
         if projected_total_qty > plan_item.approved_qty_cap {
@@ -381,24 +602,7 @@ impl RustPlanGateEngine {
                 projected_total_qty,
                 plan_item.approved_qty_cap
             );
-            Self::enqueue_denied_mutation(
-                &mut guard,
-                request,
-                &reason,
-                "WARN",
-                Some(&plan_item.item_id),
-                Some(&plan_item.plan_id),
-            );
-            return RustPlanGateDecision {
-                allowed: false,
-                reason: Some(reason),
-                is_exit_bypass: false,
-                derived_limit_price: None,
-                item_id: Some(plan_item.item_id),
-                plan_id: Some(plan_item.plan_id),
-                new_reserved_qty: None,
-                added_notional_usd: None,
-            };
+            return Err((reason, "WARN", item_id_opt, plan_id_opt));
         }
 
         let implied_plan_ref_price = if plan_item.target_qty > Decimal::ZERO {
@@ -411,24 +615,7 @@ impl RustPlanGateEngine {
             let reason = format!(
                 "INVALID_REFERENCE_PRICE: reference_price must be > 0, got {ref_price}"
             );
-            Self::enqueue_denied_mutation(
-                &mut guard,
-                request,
-                &reason,
-                "WARN",
-                Some(&plan_item.item_id),
-                Some(&plan_item.plan_id),
-            );
-            return RustPlanGateDecision {
-                allowed: false,
-                reason: Some(reason),
-                is_exit_bypass: false,
-                derived_limit_price: None,
-                item_id: Some(plan_item.item_id),
-                plan_id: Some(plan_item.plan_id),
-                new_reserved_qty: None,
-                added_notional_usd: None,
-            };
+            return Err((reason, "WARN", item_id_opt, plan_id_opt));
         }
 
         let worst_limit_px = plan_item.compute_worst_limit_price(ref_price, request.atr);
@@ -438,71 +625,20 @@ impl RustPlanGateEngine {
                 let reason = format!(
                     "COLLAR_LIMIT_VIOLATION: BUY limit_price ({limit_px}) exceeds worst_limit_price ({worst_limit_px}) from reference_price ({ref_price})"
                 );
-                Self::enqueue_denied_mutation(
-                    &mut guard,
-                    request,
-                    &reason,
-                    "WARN",
-                    Some(&plan_item.item_id),
-                    Some(&plan_item.plan_id),
-                );
-                return RustPlanGateDecision {
-                    allowed: false,
-                    reason: Some(reason),
-                    is_exit_bypass: false,
-                    derived_limit_price: None,
-                    item_id: Some(plan_item.item_id),
-                    plan_id: Some(plan_item.plan_id),
-                    new_reserved_qty: None,
-                    added_notional_usd: None,
-                };
+                return Err((reason, "WARN", item_id_opt, plan_id_opt));
             }
             if plan_item.side.eq_ignore_ascii_case("SHORT") && limit_px < worst_limit_px {
                 let reason = format!(
                     "COLLAR_LIMIT_VIOLATION: SELL limit_price ({limit_px}) below worst_limit_price ({worst_limit_px}) from reference_price ({ref_price})"
                 );
-                Self::enqueue_denied_mutation(
-                    &mut guard,
-                    request,
-                    &reason,
-                    "WARN",
-                    Some(&plan_item.item_id),
-                    Some(&plan_item.plan_id),
-                );
-                return RustPlanGateDecision {
-                    allowed: false,
-                    reason: Some(reason),
-                    is_exit_bypass: false,
-                    derived_limit_price: None,
-                    item_id: Some(plan_item.item_id),
-                    plan_id: Some(plan_item.plan_id),
-                    new_reserved_qty: None,
-                    added_notional_usd: None,
-                };
+                return Err((reason, "WARN", item_id_opt, plan_id_opt));
             }
             None
         } else if request.collar_market_order {
             Some(worst_limit_px.to_string())
         } else if request.order_type.to_ascii_uppercase().contains("MARKET") {
             let reason = "UNCOLLARED_MARKET_ENTRY_DENIED: uncollared MARKET entry orders are prohibited; enable collar_market_orders or submit a collared LIMIT order".to_string();
-            Self::enqueue_denied_mutation(
-                &mut guard,
-                request,
-                &reason,
-                "WARN",
-                Some(&plan_item.item_id),
-                Some(&plan_item.plan_id),
-            );
-            return RustPlanGateDecision {
-                allowed: false,
-                reason: Some(reason),
-                is_exit_bypass: false,
-                derived_limit_price: None,
-                item_id: Some(plan_item.item_id),
-                plan_id: Some(plan_item.plan_id),
-                new_reserved_qty: None,
-                added_notional_usd: None,
-            };
+            return Err((reason, "WARN", item_id_opt, plan_id_opt));
         } else {
             None
         };
@@ -521,48 +657,14 @@ impl RustPlanGateEngine {
                 let reason = format!(
                     "INVALID_STOP_LOSS_PRICE: stop_loss_price ({stop_px}) must be > 0"
                 );
-                Self::enqueue_denied_mutation(
-                    &mut guard,
-                    request,
-                    &reason,
-                    "WARN",
-                    Some(&plan_item.item_id),
-                    Some(&plan_item.plan_id),
-                );
-                return RustPlanGateDecision {
-                    allowed: false,
-                    reason: Some(reason),
-                    is_exit_bypass: false,
-                    derived_limit_price: None,
-                    item_id: Some(plan_item.item_id),
-                    plan_id: Some(plan_item.plan_id),
-                    new_reserved_qty: None,
-                    added_notional_usd: None,
-                };
+                return Err((reason, "WARN", item_id_opt, plan_id_opt));
             }
             if plan_item.side.eq_ignore_ascii_case("LONG") {
                 if stop_px >= entry_ref_price {
                     let reason = format!(
                         "INVALID_STOP_LOSS_PRICE: LONG stop_loss_price ({stop_px}) must be < entry_ref_price ({entry_ref_price})"
                     );
-                    Self::enqueue_denied_mutation(
-                        &mut guard,
-                        request,
-                        &reason,
-                        "WARN",
-                        Some(&plan_item.item_id),
-                        Some(&plan_item.plan_id),
-                    );
-                    return RustPlanGateDecision {
-                        allowed: false,
-                        reason: Some(reason),
-                        is_exit_bypass: false,
-                        derived_limit_price: None,
-                        item_id: Some(plan_item.item_id),
-                        plan_id: Some(plan_item.plan_id),
-                        new_reserved_qty: None,
-                        added_notional_usd: None,
-                    };
+                    return Err((reason, "WARN", item_id_opt, plan_id_opt));
                 }
                 let effective_stop_floor = if implied_plan_ref_price > plan_item.initial_stop_price
                     && entry_ref_price > Decimal::ZERO
@@ -579,48 +681,14 @@ impl RustPlanGateEngine {
                     let reason = format!(
                         "STOP_LOSS_FLOOR_VIOLATION (STOP_LOSS_BELOW_PLAN_FLOOR): LONG stop_loss_price ({stop_px}) < initial_stop_price ({effective_stop_floor})"
                     );
-                    Self::enqueue_denied_mutation(
-                        &mut guard,
-                        request,
-                        &reason,
-                        "WARN",
-                        Some(&plan_item.item_id),
-                        Some(&plan_item.plan_id),
-                    );
-                    return RustPlanGateDecision {
-                        allowed: false,
-                        reason: Some(reason),
-                        is_exit_bypass: false,
-                        derived_limit_price: None,
-                        item_id: Some(plan_item.item_id),
-                        plan_id: Some(plan_item.plan_id),
-                        new_reserved_qty: None,
-                        added_notional_usd: None,
-                    };
+                    return Err((reason, "WARN", item_id_opt, plan_id_opt));
                 }
             } else {
                 if stop_px <= entry_ref_price {
                     let reason = format!(
                         "INVALID_STOP_LOSS_PRICE: SHORT stop_loss_price ({stop_px}) must be > entry_ref_price ({entry_ref_price})"
                     );
-                    Self::enqueue_denied_mutation(
-                        &mut guard,
-                        request,
-                        &reason,
-                        "WARN",
-                        Some(&plan_item.item_id),
-                        Some(&plan_item.plan_id),
-                    );
-                    return RustPlanGateDecision {
-                        allowed: false,
-                        reason: Some(reason),
-                        is_exit_bypass: false,
-                        derived_limit_price: None,
-                        item_id: Some(plan_item.item_id),
-                        plan_id: Some(plan_item.plan_id),
-                        new_reserved_qty: None,
-                        added_notional_usd: None,
-                    };
+                    return Err((reason, "WARN", item_id_opt, plan_id_opt));
                 }
                 let effective_stop_ceiling = if implied_plan_ref_price > Decimal::ZERO
                     && implied_plan_ref_price < plan_item.initial_stop_price
@@ -637,24 +705,7 @@ impl RustPlanGateEngine {
                     let reason = format!(
                         "STOP_LOSS_FLOOR_VIOLATION (STOP_LOSS_ABOVE_PLAN_CEILING): SHORT stop_loss_price ({stop_px}) > initial_stop_price ({effective_stop_ceiling})"
                     );
-                    Self::enqueue_denied_mutation(
-                        &mut guard,
-                        request,
-                        &reason,
-                        "WARN",
-                        Some(&plan_item.item_id),
-                        Some(&plan_item.plan_id),
-                    );
-                    return RustPlanGateDecision {
-                        allowed: false,
-                        reason: Some(reason),
-                        is_exit_bypass: false,
-                        derived_limit_price: None,
-                        item_id: Some(plan_item.item_id),
-                        plan_id: Some(plan_item.plan_id),
-                        new_reserved_qty: None,
-                        added_notional_usd: None,
-                    };
+                    return Err((reason, "WARN", item_id_opt, plan_id_opt));
                 }
             }
         }
@@ -686,39 +737,42 @@ impl RustPlanGateEngine {
                     "RISK_BUDGET_EXCEEDED: single-trade risk (|{budget_ref_price} - {stop_px}| * {} = {trade_risk_usd}) exceeds max_risk_budget_usd ({})",
                     projected_total_qty, plan_item.max_risk_budget_usd
                 );
-                Self::enqueue_denied_mutation(
-                    &mut guard,
-                    request,
-                    &reason,
-                    "WARN",
-                    Some(&plan_item.item_id),
-                    Some(&plan_item.plan_id),
-                );
-                return RustPlanGateDecision {
-                    allowed: false,
-                    reason: Some(reason),
-                    is_exit_bypass: false,
-                    derived_limit_price: None,
-                    item_id: Some(plan_item.item_id),
-                    plan_id: Some(plan_item.plan_id),
-                    new_reserved_qty: None,
-                    added_notional_usd: None,
-                };
+                return Err((reason, "WARN", item_id_opt, plan_id_opt));
             }
         }
 
+        Ok(ValidatedEntryAdmission {
+            item_id: plan_item.item_id.clone(),
+            plan_id: plan_item.plan_id.clone(),
+            derived_limit_price,
+            ref_price,
+            projected_total_qty,
+        })
+    }
+
+    fn commit_entry_admission_locked(
+        guard: &mut PlanGateMemoryState,
+        request: &RustPlanGateOrderRequest,
+        admission: ValidatedEntryAdmission,
+    ) -> RustPlanGateDecision {
         // Atomically reserve capacity and transition ARMED -> TRIGGERED in O(1) memory
         guard
             .reserved_qty_by_symbol
-            .insert(request.symbol.clone(), projected_total_qty);
+            .insert(request.symbol.clone(), admission.projected_total_qty);
         if let Some(mut_item) = guard.items_by_symbol.get_mut(&request.symbol) {
-            mut_item.filled_qty = projected_total_qty;
+            mut_item.filled_qty = admission.projected_total_qty;
             if mut_item.status == "ARMED" {
                 mut_item.status = "TRIGGERED".to_string();
             }
         }
+        if !request.client_order_id.is_empty() {
+            guard.admitted_entry_reservations.insert(
+                request.client_order_id.clone(),
+                (request.symbol.clone(), request.quantity),
+            );
+        }
 
-        let added_notional = (request.quantity * ref_price)
+        let added_notional = (request.quantity * admission.ref_price)
             .round_dp_with_strategy(2, RoundingStrategy::MidpointNearestEven);
         let prev_notional = guard
             .reserved_notional_by_symbol
@@ -731,13 +785,13 @@ impl RustPlanGateEngine {
 
         let mutation = json!({
             "kind": "ORDER_ADMITTED",
-            "plan_id": plan_item.plan_id,
-            "item_id": plan_item.item_id,
+            "plan_id": admission.plan_id,
+            "item_id": admission.item_id,
             "symbol": request.symbol,
             "strategy_id": request.strategy_id,
             "client_order_id": request.client_order_id,
             "quantity": request.quantity.to_string(),
-            "new_reserved_qty": projected_total_qty.to_string(),
+            "new_reserved_qty": admission.projected_total_qty.to_string(),
             "added_notional_usd": added_notional.to_string(),
         });
         guard.pending_mutations.push_back(mutation.to_string());
@@ -746,12 +800,165 @@ impl RustPlanGateEngine {
             allowed: true,
             reason: None,
             is_exit_bypass: false,
-            derived_limit_price,
-            item_id: Some(plan_item.item_id),
-            plan_id: Some(plan_item.plan_id),
-            new_reserved_qty: Some(projected_total_qty.to_string()),
+            derived_limit_price: admission.derived_limit_price,
+            item_id: Some(admission.item_id),
+            plan_id: Some(admission.plan_id),
+            new_reserved_qty: Some(admission.projected_total_qty.to_string()),
             added_notional_usd: Some(added_notional.to_string()),
         }
+    }
+
+    /// Idempotently rolls back the reservation previously recorded for `client_order_id`
+    /// when a downstream `RiskEngine` check denies the order. Returns the released quantity.
+    pub fn on_order_denied_rollback(&self, client_order_id: &str) -> Decimal {
+        let mut guard = self.state.write();
+        guard.admitted_exit_cids.remove(client_order_id);
+        let Some((symbol, qty)) = guard.admitted_entry_reservations.remove(client_order_id) else {
+            return Decimal::ZERO;
+        };
+        if qty > Decimal::ZERO {
+            Self::release_reservation_locked(&mut guard, &symbol, qty);
+        }
+        qty
+    }
+
+    fn reserved_qty_for_symbol_lookup(
+        guard: &PlanGateMemoryState,
+        raw_symbol: &str,
+        norm_sym: &str,
+    ) -> Decimal {
+        if norm_sym.is_empty() {
+            Decimal::ZERO
+        } else {
+            guard
+                .reserved_qty_by_symbol
+                .get(raw_symbol)
+                .or_else(|| guard.reserved_qty_by_symbol.get(norm_sym))
+                .copied()
+                .unwrap_or(Decimal::ZERO)
+        }
+    }
+
+    /// Reconciles an active entry reservation downward when the venue confirms a quantity
+    /// reduction (`OrderUpdated`), releasing `(prior_qty - new_qty)` back to symbol capacity.
+    ///
+    /// Never inflates a reservation (`new_qty >= tracked_qty` is a no-op) and ignores
+    /// orders not currently tracked in `admitted_entry_reservations`.
+    pub fn reconcile_order_updated(
+        &self,
+        client_order_id: &str,
+        symbol: &str,
+        new_qty: Decimal,
+    ) -> Decimal {
+        let norm_sym = symbol.trim().to_ascii_uppercase();
+        let mut guard = self.state.write();
+        let Some((tracked_sym, tracked_qty)) =
+            guard.admitted_entry_reservations.get_mut(client_order_id)
+        else {
+            return Self::reserved_qty_for_symbol_lookup(&guard, symbol, &norm_sym);
+        };
+        if !norm_sym.is_empty() && !tracked_sym.eq_ignore_ascii_case(&norm_sym) {
+            return Self::reserved_qty_for_symbol_lookup(&guard, symbol, &norm_sym);
+        }
+        let target_qty = new_qty.max(Decimal::ZERO);
+        let sym = tracked_sym.clone();
+        if target_qty >= *tracked_qty {
+            return guard
+                .reserved_qty_by_symbol
+                .get(sym.as_str())
+                .copied()
+                .unwrap_or(Decimal::ZERO);
+        }
+        let delta = *tracked_qty - target_qty;
+        if target_qty <= Decimal::ZERO {
+            guard.admitted_entry_reservations.remove(client_order_id);
+        } else {
+            *tracked_qty = target_qty;
+        }
+        Self::release_reservation_locked(&mut guard, &sym, delta)
+    }
+
+    /// Reconciles a terminal entry order (`Canceled | Expired | Rejected | Denied`) by
+    /// removing it from `admitted_entry_reservations` and releasing only its unfilled
+    /// reserved capacity `(tracked_qty - filled_qty.min(tracked_qty)).max(Decimal::ZERO)`.
+    ///
+    /// Removing the order makes any subsequent `release_order_reservation` call an
+    /// idempotent no-op and prevents double-releasing filled shares.
+    pub fn reconcile_terminal_order(
+        &self,
+        client_order_id: &str,
+        symbol: &str,
+        filled_qty: Decimal,
+    ) -> Decimal {
+        let norm_sym = symbol.trim().to_ascii_uppercase();
+        let mut guard = self.state.write();
+        guard.admitted_exit_cids.remove(client_order_id);
+        let Some((tracked_sym, tracked_qty)) =
+            guard.admitted_entry_reservations.get(client_order_id).cloned()
+        else {
+            return Self::reserved_qty_for_symbol_lookup(&guard, symbol, &norm_sym);
+        };
+        if !norm_sym.is_empty() && !tracked_sym.eq_ignore_ascii_case(&norm_sym) {
+            return Self::reserved_qty_for_symbol_lookup(&guard, symbol, &norm_sym);
+        }
+        guard.admitted_entry_reservations.remove(client_order_id);
+        let bounded_tracked = tracked_qty.max(Decimal::ZERO);
+        let kept_filled = filled_qty.max(Decimal::ZERO).min(bounded_tracked);
+        let releasable = (bounded_tracked - kept_filled).max(Decimal::ZERO);
+        if releasable <= Decimal::ZERO {
+            return guard
+                .reserved_qty_by_symbol
+                .get(tracked_sym.as_str())
+                .copied()
+                .unwrap_or(Decimal::ZERO);
+        }
+        Self::release_reservation_locked(&mut guard, &tracked_sym, releasable)
+    }
+
+    /// Releases up to `quantity` for a specific `client_order_id` (removing or decrementing
+    /// the tracked per-order reservation so subsequent rollback/release calls never double-release).
+    pub fn release_order_reservation(
+        &self,
+        client_order_id: &str,
+        symbol: &str,
+        quantity: Decimal,
+    ) -> Decimal {
+        let norm_sym = symbol.trim().to_ascii_uppercase();
+        let mut guard = self.state.write();
+        guard.admitted_exit_cids.remove(client_order_id);
+        if quantity <= Decimal::ZERO {
+            return if norm_sym.is_empty() {
+                Decimal::ZERO
+            } else {
+                guard
+                    .reserved_qty_by_symbol
+                    .get(&norm_sym)
+                    .copied()
+                    .unwrap_or(Decimal::ZERO)
+            };
+        }
+        let Some((tracked_sym, tracked_qty)) =
+            guard.admitted_entry_reservations.get_mut(client_order_id)
+        else {
+            return Self::reserved_qty_for_symbol_lookup(&guard, symbol, &norm_sym);
+        };
+        if !norm_sym.is_empty() && !tracked_sym.eq_ignore_ascii_case(&norm_sym) {
+            return Self::reserved_qty_for_symbol_lookup(&guard, symbol, &norm_sym);
+        }
+        let target_sym = tracked_sym.clone();
+        let bounded = quantity.min(*tracked_qty);
+        *tracked_qty -= bounded;
+        if *tracked_qty <= Decimal::ZERO {
+            guard.admitted_entry_reservations.remove(client_order_id);
+        }
+        if bounded <= Decimal::ZERO {
+            return guard
+                .reserved_qty_by_symbol
+                .get(target_sym.as_str())
+                .copied()
+                .unwrap_or(Decimal::ZERO);
+        }
+        Self::release_reservation_locked(&mut guard, &target_sym, bounded)
     }
 
     /// Releases reserved entry quantity in $O(1)$ memory and enqueues an async DB update.
@@ -760,6 +967,20 @@ impl RustPlanGateEngine {
             return self.reserved_qty(symbol);
         }
         let mut guard = self.state.write();
+        let updated = Self::release_reservation_locked(&mut guard, symbol, quantity);
+        if updated == Decimal::ZERO {
+            guard
+                .admitted_entry_reservations
+                .retain(|_, (sym, _)| sym != symbol);
+        }
+        updated
+    }
+
+    fn release_reservation_locked(
+        guard: &mut PlanGateMemoryState,
+        symbol: &str,
+        quantity: Decimal,
+    ) -> Decimal {
         let current = guard
             .reserved_qty_by_symbol
             .get(symbol)
@@ -877,6 +1098,7 @@ mod tests {
             limit_collar_atr: dec!(0.5),
             initial_stop_price: dec!(95.00),
             max_risk_budget_usd: dec!(500.00),
+            daily_atr_14: None,
         }
     }
 

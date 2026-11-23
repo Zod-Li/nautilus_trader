@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+import math
+from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta, timezone
-from decimal import Decimal
+from decimal import ROUND_CEILING, ROUND_FLOOR, ROUND_HALF_EVEN, Decimal
 from enum import Enum
 from types import MappingProxyType
 from typing import Any, Dict, Mapping, Optional
@@ -12,6 +13,7 @@ from uuid import UUID
 from zoneinfo import ZoneInfo
 
 from evolution_engine.config_center.envelope import Envelope, load_envelope
+from evolution_engine.config_center.schema import SystemConfig
 
 NY_SESSION_TZ = ZoneInfo("America/New_York")
 
@@ -157,6 +159,180 @@ class PlanSide(str, Enum):
 
     LONG = "long"
     SHORT = "short"
+
+
+class TriggerPolicy(str, Enum):
+    """Intraday entry trigger policy persisted in `trading_plan_items.execution_spec`."""
+
+    FIRST_WINDOW_IMMEDIATE = "FIRST_WINDOW_IMMEDIATE"
+    HYBRID_15M_1M_BREAKOUT = "HYBRID_15M_1M_BREAKOUT"
+    INTRADAY_AVWAP_PULLBACK = "INTRADAY_AVWAP_PULLBACK"
+
+
+class ExecAlgorithm(str, Enum):
+    """Execution algorithm mode persisted in `trading_plan_items.execution_spec`."""
+
+    COLLARED_TWAP = "COLLARED_TWAP"
+    DIRECT_COLLARED_LIMIT = "DIRECT_COLLARED_LIMIT"
+
+
+SUB_PENNY_TICK_RULE_612 = Decimal("0.0001")
+PENNY_TICK_RULE_612 = Decimal("0.01")
+RULE_612_THRESHOLD_USD = Decimal("1.00")
+
+
+def rule_612_tick_size(price: Decimal) -> Decimal:
+    """Returns Reg NMS Rule 612 minimum pricing increment (`$0.0001` below `$1.00`, `$0.01` >= `$1.00`)."""
+    return SUB_PENNY_TICK_RULE_612 if price < RULE_612_THRESHOLD_USD else PENNY_TICK_RULE_612
+
+
+def quantize_price_rule_612(
+    price: Decimal,
+    *,
+    side: Optional[PlanSide | str] = None,
+    tick_size: Optional[Decimal] = None,
+) -> Decimal:
+    """Quantizes `price` per Reg NMS Rule 612 (or explicit `tick_size`).
+
+    When `side` is supplied, floors BUY (`LONG`) prices and ceils SELL (`SHORT`) prices
+    so directional collars never become more aggressive than the unrounded limit.
+    When `side` is omitted, uses `ROUND_HALF_EVEN` matching Rust `RustPlanItemEnvelope`.
+    """
+    px = _to_decimal(price, "price")
+    if tick_size is not None:
+        tick = _to_decimal(tick_size, "tick_size")
+        if tick <= Decimal("0"):
+            raise PlanContractValidationError(f"tick_size must be > 0, got {tick}")
+    else:
+        tick = rule_612_tick_size(px)
+
+    if side is None:
+        if tick_size is None:
+            if px < RULE_612_THRESHOLD_USD:
+                rounded = max(
+                    SUB_PENNY_TICK_RULE_612,
+                    px.quantize(SUB_PENNY_TICK_RULE_612, rounding=ROUND_HALF_EVEN),
+                )
+                if rounded >= RULE_612_THRESHOLD_USD:
+                    return max(
+                        PENNY_TICK_RULE_612,
+                        px.quantize(PENNY_TICK_RULE_612, rounding=ROUND_HALF_EVEN),
+                    )
+                return rounded
+            return max(
+                PENNY_TICK_RULE_612,
+                px.quantize(PENNY_TICK_RULE_612, rounding=ROUND_HALF_EVEN),
+            )
+        steps = (px / tick).to_integral_value(rounding=ROUND_HALF_EVEN)
+        return max(tick, steps * tick)
+
+    is_long = (
+        side == PlanSide.LONG
+        or str(getattr(side, "value", side)).strip().upper() in ("LONG", "BUY")
+    )
+    rounding_mode = ROUND_FLOOR if is_long else ROUND_CEILING
+    if tick_size is None and px < RULE_612_THRESHOLD_USD:
+        steps = (px / SUB_PENNY_TICK_RULE_612).to_integral_value(rounding=rounding_mode)
+        rounded = max(SUB_PENNY_TICK_RULE_612, steps * SUB_PENNY_TICK_RULE_612)
+        if rounded >= RULE_612_THRESHOLD_USD:
+            penny_steps = (px / PENNY_TICK_RULE_612).to_integral_value(rounding=rounding_mode)
+            return max(PENNY_TICK_RULE_612, penny_steps * PENNY_TICK_RULE_612)
+        return rounded
+
+    steps = (px / tick).to_integral_value(rounding=rounding_mode)
+    return max(tick, steps * tick)
+
+
+@dataclass(frozen=True)
+class ExecutionSpec:
+    """Isomorphic intraday execution specification (`TriggerPolicy x ExecAlgorithm`) persisted in PG `execution_spec`."""
+
+    trigger_policy: TriggerPolicy = TriggerPolicy.FIRST_WINDOW_IMMEDIATE
+    exec_algorithm: ExecAlgorithm = ExecAlgorithm.COLLARED_TWAP
+    window_quantile: Optional[Decimal] = None
+    bar_timeframe: str = "15m"
+
+    def __post_init__(self) -> None:
+        raw_tp = (
+            self.trigger_policy.value
+            if isinstance(self.trigger_policy, TriggerPolicy)
+            else str(self.trigger_policy or TriggerPolicy.FIRST_WINDOW_IMMEDIATE.value)
+        )
+        try:
+            norm_tp = TriggerPolicy(raw_tp.strip().upper())
+        except ValueError as exc:
+            raise PlanContractValidationError(
+                f"Invalid trigger_policy {self.trigger_policy!r}"
+            ) from exc
+        object.__setattr__(self, "trigger_policy", norm_tp)
+
+        raw_ea = (
+            self.exec_algorithm.value
+            if isinstance(self.exec_algorithm, ExecAlgorithm)
+            else str(self.exec_algorithm or ExecAlgorithm.COLLARED_TWAP.value)
+        )
+        try:
+            norm_ea = ExecAlgorithm(raw_ea.strip().upper())
+        except ValueError as exc:
+            raise PlanContractValidationError(
+                f"Invalid exec_algorithm {self.exec_algorithm!r}"
+            ) from exc
+        object.__setattr__(self, "exec_algorithm", norm_ea)
+
+        if self.window_quantile is not None and str(self.window_quantile).strip() != "":
+            wq = _to_decimal(self.window_quantile, "window_quantile")
+            if not (Decimal("0") < wq < Decimal("1")):
+                raise PlanContractValidationError(
+                    f"window_quantile ({wq}) must be in (0, 1)"
+                )
+            object.__setattr__(self, "window_quantile", wq)
+        else:
+            object.__setattr__(self, "window_quantile", None)
+
+        tf = str(self.bar_timeframe or "15m").strip()
+        if tf not in SUPPORTED_TIMEFRAMES:
+            raise PlanContractValidationError(
+                f"ExecutionSpec.bar_timeframe '{tf}' not in {SUPPORTED_TIMEFRAMES}"
+            )
+        object.__setattr__(self, "bar_timeframe", tf)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "trigger_policy": self.trigger_policy.value,
+            "exec_algorithm": self.exec_algorithm.value,
+            "window_quantile": (
+                float(self.window_quantile) if self.window_quantile is not None else None
+            ),
+            "bar_timeframe": self.bar_timeframe,
+        }
+
+    @classmethod
+    def from_dict(
+        cls,
+        data: Optional[Mapping[str, Any]],
+        *,
+        default_bar_timeframe: str = "15m",
+    ) -> ExecutionSpec:
+        if data is None:
+            return cls(bar_timeframe=default_bar_timeframe)
+        if not isinstance(data, Mapping):
+            raise PlanContractValidationError("ExecutionSpec data must be a mapping")
+        if not data:
+            return cls(bar_timeframe=default_bar_timeframe)
+        raw_tp = data.get("trigger_policy") or TriggerPolicy.FIRST_WINDOW_IMMEDIATE.value
+        raw_ea = data.get("exec_algorithm") or ExecAlgorithm.COLLARED_TWAP.value
+        raw_wq = data.get("window_quantile")
+        raw_tf = data.get("bar_timeframe") or default_bar_timeframe
+        return cls(
+            trigger_policy=TriggerPolicy(str(raw_tp).strip().upper()),
+            exec_algorithm=ExecAlgorithm(str(raw_ea).strip().upper()),
+            window_quantile=(
+                _to_decimal(raw_wq, "window_quantile")
+                if raw_wq is not None and str(raw_wq).strip() != ""
+                else None
+            ),
+            bar_timeframe=str(raw_tf).strip(),
+        )
 
 
 def _to_decimal(val: Any, field_name: str) -> Decimal:
@@ -320,25 +496,38 @@ class MarketableLimitCollar:
         side: PlanSide,
         reference_price: Decimal,
         atr: Optional[Decimal] = None,
+        *,
+        daily_atr_14: Optional[Decimal] = None,
+        tick_size: Optional[Decimal] = None,
     ) -> Decimal:
-        """Compute the worst permissible limit price for an entry order given reference price and optional ATR."""
+        """Compute the worst permissible limit price per Reg NMS Rule 612 (`$0.0001` < `$1.00`, `$0.01` >= `$1.00`)."""
         ref_px = _to_decimal(reference_price, "reference_price")
         if ref_px <= Decimal("0"):
             raise PlanContractValidationError(f"reference_price must be > 0, got {ref_px}")
 
         pct_offset = ref_px * (self.limit_collar_pct / Decimal("100"))
-        if atr is not None:
-            atr_dec = _to_decimal(atr, "atr")
+        eff_atr = atr
+        if eff_atr is None and daily_atr_14 is not None:
+            cand_daily = _to_decimal(daily_atr_14, "daily_atr_14")
+            if cand_daily > Decimal("0"):
+                eff_atr = cand_daily
+        if eff_atr is not None:
+            atr_dec = _to_decimal(eff_atr, "atr")
             if atr_dec < Decimal("0"):
                 raise PlanContractValidationError(f"atr must be >= 0, got {atr_dec}")
             atr_offset = atr_dec * self.limit_collar_atr
-            allowed_offset = min(pct_offset, atr_offset) if self.limit_collar_atr > Decimal("0") else pct_offset
+            allowed_offset = (
+                min(pct_offset, atr_offset)
+                if self.limit_collar_atr > Decimal("0")
+                else pct_offset
+            )
         else:
             allowed_offset = pct_offset
 
-        if side == PlanSide.LONG:
-            return (ref_px + allowed_offset).quantize(Decimal("0.01"))
-        return max(Decimal("0.01"), (ref_px - allowed_offset).quantize(Decimal("0.01")))
+        raw = (ref_px + allowed_offset) if side == PlanSide.LONG else (ref_px - allowed_offset)
+        if tick_size is not None:
+            return quantize_price_rule_612(raw, side=side, tick_size=tick_size)
+        return quantize_price_rule_612(raw, side=None, tick_size=None)
 
     def to_dict(self) -> Dict[str, str]:
         return {
@@ -358,18 +547,23 @@ class MarketableLimitCollar:
 
 def default_limit_collar_for_archetype(
     archetype_id: StrategyArchetypeId | str,
-    limit_collar_pct: Decimal | float | str = Decimal("0.35"),
+    limit_collar_pct: Optional[Decimal | float | str] = None,
 ) -> MarketableLimitCollar:
     """Constructs the canonical `MarketableLimitCollar` for `archetype_id`."""
+    eff_pct = (
+        limit_collar_pct
+        if limit_collar_pct is not None
+        else str(SystemConfig().execution.limit_collar_pct)
+    )
     return MarketableLimitCollar(
-        limit_collar_pct=_to_decimal(limit_collar_pct, "limit_collar_pct"),
+        limit_collar_pct=_to_decimal(eff_pct, "limit_collar_pct"),
         limit_collar_atr=default_limit_collar_atr_for_archetype(archetype_id),
     )
 
 
 @dataclass(frozen=True)
 class PlanRiskEnvelope:
-    """Authoritative pre-trade risk envelope enforced by `PlanGateExecAlgorithm`."""
+    """Authoritative pre-trade risk envelope enforced by `PreTradeRiskGate` (`RustPlanGateEngine`)."""
 
     side: PlanSide
     target_qty: Decimal
@@ -380,6 +574,8 @@ class PlanRiskEnvelope:
     take_profit_price: Optional[Decimal]
     collar: MarketableLimitCollar
     valid_until: datetime
+    daily_atr_14: Optional[Decimal] = None
+    execution_spec: ExecutionSpec = field(default_factory=ExecutionSpec)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "side", PlanSide(self.side))
@@ -407,6 +603,24 @@ class PlanRiskEnvelope:
                 self,
                 "take_profit_price",
                 _to_decimal(self.take_profit_price, "take_profit_price"),
+            )
+        if self.daily_atr_14 is not None and str(self.daily_atr_14).strip() != "":
+            atr_dec = _to_decimal(self.daily_atr_14, "daily_atr_14")
+            if atr_dec <= Decimal("0"):
+                raise PlanContractValidationError(
+                    f"daily_atr_14 must be > 0 when provided, got {atr_dec}"
+                )
+            object.__setattr__(self, "daily_atr_14", atr_dec)
+        else:
+            object.__setattr__(self, "daily_atr_14", None)
+
+        if self.execution_spec is None:
+            object.__setattr__(self, "execution_spec", ExecutionSpec())
+        elif isinstance(self.execution_spec, Mapping):
+            object.__setattr__(self, "execution_spec", ExecutionSpec.from_dict(self.execution_spec))
+        elif not isinstance(self.execution_spec, ExecutionSpec):
+            raise PlanContractValidationError(
+                f"execution_spec must be ExecutionSpec or mapping, got {type(self.execution_spec).__name__}"
             )
         if not isinstance(self.valid_until, datetime) or self.valid_until.tzinfo is None:
             raise PlanContractValidationError("valid_until must be a timezone-aware datetime")
@@ -557,6 +771,10 @@ class PlanRiskEnvelope:
             "limit_collar_atr": str(self.limit_collar_atr),
             "collar": collar_dict,
             "valid_until": self.valid_until.isoformat(),
+            "daily_atr_14": (
+                str(self.daily_atr_14) if self.daily_atr_14 is not None else None
+            ),
+            "execution_spec": self.execution_spec.to_dict(),
         }
 
 
@@ -565,7 +783,7 @@ class PlanItemContract:
     """The 1:1 Isomorphic Trading Plan Item Contract (`StrategyConfig + PlanRiskEnvelope`).
 
     Used identically by `IsomorphicBacktestRunner` (pre-market `nautilus-mcp` validation)
-    and `LiveNode` (`PlanGateExecAlgorithm` + `Strategy` live execution).
+    and `LiveNode` (`PreTradeRiskGate` + `CollaredTwapExecAlgorithm` + `Strategy` live execution).
     """
 
     item_id: UUID
@@ -582,6 +800,8 @@ class PlanItemContract:
     filled_qty: Decimal = Decimal("0")
     reserved_notional_usd: Decimal = Decimal("0")
     carry_over_status: Optional[str] = None
+    daily_atr_14: Optional[Decimal] = None
+    execution_spec: Optional[ExecutionSpec] = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.item_id, UUID):
@@ -604,6 +824,43 @@ class PlanItemContract:
             object.__setattr__(self, "carry_over_status", co_status)
             raw_trace.setdefault("carry_over_status", co_status)
         object.__setattr__(self, "sizing_trace", MappingProxyType(raw_trace))
+
+        # Synchronize daily_atr_14 between PlanItemContract and PlanRiskEnvelope
+        resolved_atr: Optional[Decimal] = self.risk_envelope.daily_atr_14
+        if self.daily_atr_14 is not None and str(self.daily_atr_14).strip() != "":
+            item_atr = _to_decimal(self.daily_atr_14, "daily_atr_14")
+            if item_atr <= Decimal("0"):
+                raise PlanContractValidationError(
+                    f"daily_atr_14 must be > 0 when provided, got {item_atr}"
+                )
+            if resolved_atr is not None and resolved_atr != item_atr:
+                raise PlanContractValidationError(
+                    f"PlanItemContract.daily_atr_14 ({item_atr}) != risk_envelope.daily_atr_14 ({resolved_atr})"
+                )
+            resolved_atr = item_atr
+        object.__setattr__(self, "daily_atr_14", resolved_atr)
+        updated_env = self.risk_envelope
+        if updated_env.daily_atr_14 != resolved_atr:
+            updated_env = replace(updated_env, daily_atr_14=resolved_atr)
+
+        # Synchronize execution_spec between PlanItemContract and PlanRiskEnvelope
+        if self.execution_spec is None:
+            resolved_spec = updated_env.execution_spec
+        elif isinstance(self.execution_spec, Mapping):
+            resolved_spec = ExecutionSpec.from_dict(
+                self.execution_spec,
+                default_bar_timeframe=self.strategy_config.bar_timeframe,
+            )
+        elif isinstance(self.execution_spec, ExecutionSpec):
+            resolved_spec = self.execution_spec
+        else:
+            raise PlanContractValidationError(
+                f"execution_spec must be ExecutionSpec or mapping, got {type(self.execution_spec).__name__}"
+            )
+        if updated_env.execution_spec != resolved_spec:
+            updated_env = replace(updated_env, execution_spec=resolved_spec)
+        object.__setattr__(self, "execution_spec", resolved_spec)
+        object.__setattr__(self, "risk_envelope", updated_env)
 
         sym = self.symbol.strip()
         ven = self.venue.strip()
@@ -653,22 +910,44 @@ class PlanItemContract:
         return replace(self, risk_envelope=updated_env)
 
     def to_trigger_spec_dict(self) -> Dict[str, Any]:
-        """Serialize the isomorphic `StrategyConfig` and `MarketableLimitCollar` into `trading_plan_items.trigger_spec`."""
+        """Serialize the isomorphic `StrategyConfig`, `MarketableLimitCollar`, and `ExecutionSpec` into `trigger_spec`."""
         ref_px = (
             float(self.risk_envelope.target_notional_usd / self.risk_envelope.target_qty)
             if self.risk_envelope.target_qty > Decimal("0")
             else 0.0
         )
-        atr_mult = float(self.strategy_config.atr_stop_multiplier)
-        stop_dist = abs(ref_px - float(self.risk_envelope.initial_stop_price))
-        est_atr = (stop_dist / atr_mult) if (ref_px > 0.0 and atr_mult > 0.0) else 0.0
+        daily_atr_val = float(self.daily_atr_14) if self.daily_atr_14 is not None else None
+        atr_val = daily_atr_val
+        if atr_val is None:
+            raw_trace_atr = self.sizing_trace.get("atr")
+            if raw_trace_atr is None:
+                raw_trace_atr = self.sizing_trace.get("stop_atr")
+            if raw_trace_atr is not None:
+                try:
+                    cand_trace_atr = float(raw_trace_atr)
+                    if cand_trace_atr > 0.0 and math.isfinite(cand_trace_atr):
+                        atr_val = cand_trace_atr
+                except (TypeError, ValueError):
+                    pass
+        if atr_val is None and ref_px > 0.0:
+            stop_px = float(self.risk_envelope.initial_stop_price)
+            atr_mult = max(1.0, float(self.strategy_config.atr_stop_multiplier))
+            if stop_px > 0.0 and abs(ref_px - stop_px) > 0.0:
+                atr_val = abs(ref_px - stop_px) / atr_mult
+        spec_dict = (
+            self.execution_spec.to_dict()
+            if self.execution_spec is not None
+            else ExecutionSpec(bar_timeframe=self.strategy_config.bar_timeframe).to_dict()
+        )
         return {
             "schema_version": 2,
             "venue": self.venue,
             "strategy_config": self.strategy_config.to_dict(),
             "collar": self.collar_dict(),
             "reference_price": round(ref_px, 4) if ref_px > 0.0 else None,
-            "atr": round(est_atr, 4) if est_atr > 0.0 else None,
+            "daily_atr_14": round(daily_atr_val, 6) if daily_atr_val is not None else None,
+            "atr": round(atr_val, 6) if atr_val is not None else None,
+            "execution_spec": spec_dict,
             "limit_collar_atr": float(self.risk_envelope.collar.limit_collar_atr),
             "limit_collar_pct": float(self.risk_envelope.collar.limit_collar_pct),
         }
@@ -679,10 +958,10 @@ class PlanItemContract:
     @classmethod
     def from_db_row(cls, row: Mapping[str, Any]) -> PlanItemContract:
         """Reconstruct a validated `PlanItemContract` from a `trading_plan_items` PostgreSQL row."""
+        import json
+
         trigger_spec = row["trigger_spec"]
         if isinstance(trigger_spec, str):
-            import json
-
             trigger_spec = json.loads(trigger_spec)
 
         if not isinstance(trigger_spec, Mapping) or "strategy_config" not in trigger_spec:
@@ -697,6 +976,32 @@ class PlanItemContract:
                 "trading_plan_items.trigger_spec missing 'collar' isomorphic payload"
             )
         collar = MarketableLimitCollar.from_dict(collar_data)
+
+        raw_daily_atr = row.get("daily_atr_14")
+        if raw_daily_atr is None or str(raw_daily_atr).strip() == "":
+            raw_daily_atr = trigger_spec.get("daily_atr_14")
+        daily_atr_14 = (
+            _to_decimal(raw_daily_atr, "daily_atr_14")
+            if raw_daily_atr is not None and str(raw_daily_atr).strip() != ""
+            else None
+        )
+        if daily_atr_14 is not None and daily_atr_14 <= Decimal("0"):
+            raise PlanContractValidationError(
+                f"daily_atr_14 must be > 0 when present, got {daily_atr_14}"
+            )
+
+        raw_exec_spec = row.get("execution_spec")
+        if isinstance(raw_exec_spec, str):
+            raw_exec_spec = json.loads(raw_exec_spec) if raw_exec_spec.strip() else {}
+        if not isinstance(raw_exec_spec, Mapping) or not raw_exec_spec:
+            fallback_exec = trigger_spec.get("execution_spec")
+            if isinstance(fallback_exec, str):
+                fallback_exec = json.loads(fallback_exec) if fallback_exec.strip() else {}
+            raw_exec_spec = fallback_exec if isinstance(fallback_exec, Mapping) else {}
+        execution_spec = ExecutionSpec.from_dict(
+            raw_exec_spec,
+            default_bar_timeframe=strat_cfg.bar_timeframe,
+        )
 
         symbol = str(row["symbol"]).strip()
         venue = str(
@@ -764,12 +1069,12 @@ class PlanItemContract:
             take_profit_price=tp_price,
             collar=collar,
             valid_until=valid_until,
+            daily_atr_14=daily_atr_14,
+            execution_spec=execution_spec,
         )
 
         sizing_trace = row.get("sizing_trace") or {}
         if isinstance(sizing_trace, str):
-            import json
-
             sizing_trace = json.loads(sizing_trace)
 
         return cls(
@@ -793,4 +1098,6 @@ class PlanItemContract:
                 if row.get("carry_over_status") is not None
                 else None
             ),
+            daily_atr_14=daily_atr_14,
+            execution_spec=execution_spec,
         )

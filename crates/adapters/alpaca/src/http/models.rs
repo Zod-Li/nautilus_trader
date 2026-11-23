@@ -308,4 +308,7 @@ pub struct AlpacaAssetResponse {
     /// Minimum price increment if specified.
     #[serde(default)]
     pub price_increment: Option<Decimal>,
+    /// Minimum trade quantity increment if specified.
+    #[serde(default)]
+    pub min_trade_increment: Option<Decimal>,
 }

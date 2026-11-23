@@ -506,44 +506,94 @@ pub fn build_fill_report_with_qty(
 ///
 /// # Errors
 ///
-/// Returns [`AlpacaError::Parse`] if symbol or increment fields are invalid.
+/// Returns [`AlpacaError::Parse`] if the asset is not an active tradable US equity or has invalid fields.
 pub fn parse_equity_instrument(
     asset: &AlpacaAssetResponse,
     venue_str: &str,
     ts_init: UnixNanos,
 ) -> AlpacaResult<InstrumentAny> {
+    parse_equity_instrument_with_ref_price(asset, venue_str, ts_init, None)
+}
+
+/// Converts an [`AlpacaAssetResponse`] into a Nautilus [`InstrumentAny::Equity`] using an
+/// optional reference price to enforce Reg NMS Rule 612 tick increments (`$0.0001` below `$1.00`,
+/// `$0.01` at or above `$1.00`), whole-share `lot_size = 1` / `size_precision = 0`, and
+/// fail-closed US equity / active / tradable validation.
+///
+/// # Errors
+///
+/// Returns [`AlpacaError::Parse`] if asset metadata is non-`us_equity`, inactive, non-tradable,
+/// or if symbol/reference-price/increment fields are invalid.
+pub fn parse_equity_instrument_with_ref_price(
+    asset: &AlpacaAssetResponse,
+    venue_str: &str,
+    ts_init: UnixNanos,
+    ref_price: Option<Decimal>,
+) -> AlpacaResult<InstrumentAny> {
+    if !asset.asset_class.trim().eq_ignore_ascii_case("us_equity") {
+        return Err(AlpacaError::Parse(format!(
+            "unsupported asset class '{}' for {}",
+            asset.asset_class, asset.symbol
+        )));
+    }
+    if !asset.status.trim().eq_ignore_ascii_case("active") {
+        return Err(AlpacaError::Parse(format!(
+            "asset {} is not active (status='{}')",
+            asset.symbol, asset.status
+        )));
+    }
+    if !asset.tradable {
+        return Err(AlpacaError::Parse(format!(
+            "asset {} is not tradable",
+            asset.symbol
+        )));
+    }
+
     let instrument_id = parse_instrument_id(&asset.symbol, venue_str)?;
     let currency = Currency::USD();
 
-    let (price_precision, price_increment) = match asset.price_increment {
-        Some(inc) if inc > Decimal::ZERO => {
-            let prec = u8::try_from(inc.scale())
-                .unwrap_or(DEFAULT_EQUITY_PRICE_PRECISION)
-                .clamp(1, 9);
-            let px = Price::from_decimal_dp(inc, prec)
-                .map_err(|e| AlpacaError::Parse(format!("invalid price_increment: {e}")))?;
-            (prec, px)
+    let (price_precision, price_increment) = if let Some(px) = ref_price {
+        if px <= Decimal::ZERO {
+            return Err(AlpacaError::Parse(format!(
+                "reference price for {} must be > 0, got {px}",
+                asset.symbol
+            )));
         }
-        _ => {
-            let inc = Decimal::new(1, u32::from(DEFAULT_EQUITY_PRICE_PRECISION));
-            let px = Price::from_decimal_dp(inc, DEFAULT_EQUITY_PRICE_PRECISION)
-                .map_err(|e| AlpacaError::Parse(format!("invalid default price_increment: {e}")))?;
-            (DEFAULT_EQUITY_PRICE_PRECISION, px)
+        let (prec, inc_dec) = if px < Decimal::ONE {
+            (4_u8, Decimal::new(1, 4))
+        } else {
+            (DEFAULT_EQUITY_PRICE_PRECISION, Decimal::new(1, 2))
+        };
+        let inc_px = Price::from_decimal_dp(inc_dec, prec)
+            .map_err(|e| AlpacaError::Parse(format!("invalid Rule 612 price_increment: {e}")))?;
+        (prec, inc_px)
+    } else {
+        match asset.price_increment {
+            Some(inc) if inc > Decimal::ZERO => {
+                let prec = u8::try_from(inc.scale())
+                    .unwrap_or(DEFAULT_EQUITY_PRICE_PRECISION)
+                    .clamp(1, 9);
+                let px = Price::from_decimal_dp(inc, prec)
+                    .map_err(|e| AlpacaError::Parse(format!("invalid price_increment: {e}")))?;
+                (prec, px)
+            }
+            _ => {
+                let inc = Decimal::new(1, u32::from(DEFAULT_EQUITY_PRICE_PRECISION));
+                let px = Price::from_decimal_dp(inc, DEFAULT_EQUITY_PRICE_PRECISION).map_err(
+                    |e| AlpacaError::Parse(format!("invalid default price_increment: {e}")),
+                )?;
+                (DEFAULT_EQUITY_PRICE_PRECISION, px)
+            }
         }
     };
 
     let min_qty_dec = asset
         .min_order_size
         .filter(|d| *d > Decimal::ZERO)
-        .unwrap_or(Decimal::ONE);
-    let size_precision = if asset.fractionable {
-        u8::try_from(min_qty_dec.scale()).unwrap_or(0).min(6)
-    } else {
-        0
-    };
-    let min_quantity = Quantity::from_decimal_dp(min_qty_dec, size_precision)
+        .map_or(Decimal::ONE, |d| d.ceil().max(Decimal::ONE));
+    let min_quantity = Quantity::from_decimal_dp(min_qty_dec, DEFAULT_EQUITY_SIZE_PRECISION)
         .map_err(|e| AlpacaError::Parse(format!("invalid min_quantity: {e}")))?;
-    let lot_size = Quantity::from_decimal_dp(Decimal::ONE, size_precision)
+    let lot_size = Quantity::from_decimal_dp(Decimal::ONE, DEFAULT_EQUITY_SIZE_PRECISION)
         .map_err(|e| AlpacaError::Parse(format!("invalid lot_size: {e}")))?;
 
     let equity = Equity::builder()

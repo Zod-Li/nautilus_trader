@@ -711,6 +711,19 @@ impl PyBacktestEngine {
         engine_portfolio(&self.0)
     }
 
+    /// Sets an optional external pre-trade risk gate on the engine's [`RiskEngine`].
+    #[pyo3(name = "set_pre_trade_risk_gate")]
+    fn py_set_pre_trade_risk_gate(
+        &self,
+        gate: Option<nautilus_risk::gate::PyPreTradeRiskGateHandle>,
+    ) {
+        self.0
+            .kernel()
+            .risk_engine()
+            .borrow_mut()
+            .set_pre_trade_gate(gate.map(|h| h.0));
+    }
+
     /// Generates an orders report as a pandas `DataFrame`.
     ///
     /// # Errors

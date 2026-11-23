@@ -458,6 +458,31 @@ impl AlpacaHttpClient {
             .await
     }
 
+    /// Queries `GET /v2/assets/{symbol}` for a single Alpaca asset.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`AlpacaError`] if `symbol` is invalid, the asset is missing (`404`),
+    /// or transport/deserialization fails.
+    pub async fn get_asset(&self, symbol: &str) -> AlpacaResult<AlpacaAssetResponse> {
+        let trimmed = symbol.trim();
+        if trimmed.is_empty()
+            || trimmed == "."
+            || trimmed.contains("..")
+            || !trimmed
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-'))
+        {
+            return Err(AlpacaError::Parse(format!(
+                "invalid Alpaca asset symbol '{symbol}'"
+            )));
+        }
+        let norm = trimmed.to_ascii_uppercase();
+        let path = format!("/v2/assets/{norm}");
+        self.request_json::<(), AlpacaAssetResponse>(Method::GET, &path, None, None)
+            .await
+    }
+
     async fn get_order_by_client_id_once(
         &self,
         client_order_id: &str,

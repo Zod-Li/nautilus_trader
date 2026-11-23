@@ -9,8 +9,12 @@ from nautilus_trader import model
 __all__ = [
     "FixedRiskSizer",
     "PositionSizer",
+    "PreTradeRiskGateHandle",
     "RiskEngineConfig",
 ]
+
+@typing.final
+class PreTradeRiskGateHandle: ...
 
 @typing.final
 class FixedRiskSizer(PositionSizer):

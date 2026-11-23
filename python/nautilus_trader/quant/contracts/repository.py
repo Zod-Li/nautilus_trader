@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from datetime import date, datetime, timezone
+from datetime import date
 from decimal import Decimal
 import json
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
@@ -15,15 +15,12 @@ from psycopg2.extras import RealDictCursor, register_uuid
 from evolution_engine.config_center.envelope import Envelope, load_envelope
 from evolution_engine.db.dsn import resolve_database_dsn
 from nautilus_trader.quant.contracts.models import (
-    ArchetypeStrategyConfig,
+    VALID_ITEM_STATUSES,
+    ExecutionSpec,
     PlanContractValidationError,
     PlanItemContract,
-    PlanRiskEnvelope,
     PlanSide,
-    StrategyArchetypeId,
     _to_decimal,
-    compute_intraday_entry_valid_until,
-    default_limit_collar_for_archetype,
 )
 
 register_uuid()
@@ -197,11 +194,17 @@ class PlanContractRepository:
                             raise PlanContractValidationError(
                                 f"Item {item.item_id} plan_id ({item.plan_id}) != resolved_plan_id ({resolved_plan_id})"
                             )
+                        exec_spec_obj = (
+                            item.execution_spec
+                            if item.execution_spec is not None
+                            else ExecutionSpec(bar_timeframe=item.strategy_config.bar_timeframe)
+                        )
                         cur.execute(
                             """
                             INSERT INTO trading_plan_items (
                                 item_id, plan_id, kind, symbol, broker, asset_class,
                                 strategy_id, archetype, side, trigger_spec,
+                                execution_spec, daily_atr_14,
                                 target_qty, target_notional_usd, risk_budget_usd,
                                 initial_stop_price, take_profit_price, valid_until,
                                 sizing_trace, status, reserved_notional_usd, filled_qty,
@@ -209,6 +212,7 @@ class PlanContractRepository:
                             ) VALUES (
                                 %s, %s, 'NEW_ENTRY', %s, %s, %s,
                                 %s, %s, %s, %s::jsonb,
+                                %s::jsonb, %s,
                                 %s, %s, %s,
                                 %s, %s, %s,
                                 %s::jsonb, %s, %s, %s,
@@ -225,6 +229,8 @@ class PlanContractRepository:
                                 item.strategy_config.archetype_id.value,
                                 item.risk_envelope.side.value,
                                 json.dumps(item.to_trigger_spec_dict()),
+                                json.dumps(exec_spec_obj.to_dict()),
+                                item.daily_atr_14,
                                 item.risk_envelope.target_qty,
                                 item.risk_envelope.target_notional_usd,
                                 item.risk_envelope.max_risk_budget_usd,
@@ -822,5 +828,256 @@ class PlanContractRepository:
                         ),
                     )
                     return updated_contract
+        finally:
+            conn.close()
+
+    @staticmethod
+    def update_item_status_in_tx(
+        cur: Any,
+        item_id: UUID | str,
+        new_status: str,
+        *,
+        actor: str = "system:telemetry_actor",
+        reason: str = "",
+    ) -> Optional[PlanItemContract]:
+        """Atomically transition a `trading_plan_items.status` inside an active transaction.
+
+        Idempotently preserves terminal states (`EXPIRED`, `CANCELLED`, `CLOSED`), records a
+        `trading_plan_events` audit entry, and notifies `nautilus_plan_gate_sync`.
+        """
+        norm_status = str(new_status or "").strip().upper()
+        if norm_status not in VALID_ITEM_STATUSES:
+            raise PlanContractValidationError(
+                f"Invalid plan item status {new_status!r}; expected one of {VALID_ITEM_STATUSES}"
+            )
+        item_uuid = item_id if isinstance(item_id, UUID) else UUID(str(item_id))
+
+        cur.execute(
+            "SELECT * FROM trading_plan_items WHERE item_id = %s FOR UPDATE",
+            (item_uuid,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+
+        current_contract = PlanItemContract.from_db_row(row)
+        cur_status = str(current_contract.status or "").strip().upper()
+        if cur_status in ("EXPIRED", "CANCELLED", "CLOSED"):
+            return current_contract
+        if cur_status == norm_status:
+            return current_contract
+
+        cur.execute(
+            """
+            UPDATE trading_plan_items
+            SET status = %s,
+                updated_at = NOW()
+            WHERE item_id = %s
+            """,
+            (norm_status, item_uuid),
+        )
+        cur.execute(
+            """
+            INSERT INTO trading_plan_events (
+                plan_id, item_id, event_type, actor, reason, payload
+            ) VALUES (
+                %s, %s, %s, %s, %s, %s::jsonb
+            )
+            """,
+            (
+                current_contract.plan_id,
+                item_uuid,
+                f"ITEM_{norm_status}",
+                actor,
+                reason or f"Plan item status transitioned {cur_status} -> {norm_status}",
+                json.dumps(
+                    {
+                        "symbol": current_contract.symbol,
+                        "old_status": cur_status,
+                        "new_status": norm_status,
+                    }
+                ),
+            ),
+        )
+        cur.execute("SELECT pg_notify('nautilus_plan_gate_sync', 'trading_plan_items')")
+        return replace(current_contract, status=norm_status)
+
+    def update_item_status(
+        self,
+        item_id: UUID | str,
+        new_status: str,
+        *,
+        actor: str = "system:telemetry_actor",
+        reason: str = "",
+    ) -> Optional[PlanItemContract]:
+        """Atomically update `trading_plan_items.status` with row-level lock and `pg_notify`."""
+        conn = psycopg2.connect(self._dsn, cursor_factory=RealDictCursor)
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    return self.update_item_status_in_tx(
+                        cur,
+                        item_id,
+                        new_status,
+                        actor=actor,
+                        reason=reason,
+                    )
+        finally:
+            conn.close()
+
+    def upsert_instrument_metadata_cache(
+        self,
+        records: Mapping[str, Any] | Sequence[Mapping[str, Any]],
+    ) -> int:
+        """Upsert authoritative Alpaca `/v2/assets/{symbol}` metadata into `instrument_metadata_cache`."""
+        items: List[Mapping[str, Any]] = (
+            [records] if isinstance(records, Mapping) else list(records)
+        )
+        if not items:
+            return 0
+
+        conn = psycopg2.connect(self._dsn, cursor_factory=RealDictCursor)
+        upserted = 0
+        try:
+            with conn:
+                with conn.cursor() as cur:
+                    if not self._table_exists(cur, "instrument_metadata_cache"):
+                        return 0
+                    for rec in items:
+                        sym = str(rec.get("symbol") or "").split(".", 1)[0].strip().upper()
+                        if not sym:
+                            raise PlanContractValidationError(
+                                "instrument_metadata_cache record missing symbol"
+                            )
+                        price_increment = _to_decimal(
+                            rec.get("price_increment", "0.01"), "price_increment"
+                        )
+                        if price_increment <= Decimal("0"):
+                            raise PlanContractValidationError(
+                                f"price_increment must be > 0 for {sym}, got {price_increment}"
+                            )
+                        price_precision = int(rec.get("price_precision", 2))
+                        if not (1 <= price_precision <= 9):
+                            raise PlanContractValidationError(
+                                f"price_precision must be in [1, 9] for {sym}, got {price_precision}"
+                            )
+                        min_order_size = _to_decimal(
+                            rec.get("min_order_size", "1"), "min_order_size"
+                        )
+                        if min_order_size <= Decimal("0"):
+                            raise PlanContractValidationError(
+                                f"min_order_size must be > 0 for {sym}, got {min_order_size}"
+                            )
+                        lot_size = _to_decimal(rec.get("lot_size", "1"), "lot_size")
+                        if lot_size <= Decimal("0"):
+                            raise PlanContractValidationError(
+                                f"lot_size must be > 0 for {sym}, got {lot_size}"
+                            )
+                        raw_payload = rec.get("raw_payload")
+                        if raw_payload is None:
+                            raw_payload = dict(rec)
+                        cur.execute(
+                            """
+                            INSERT INTO instrument_metadata_cache (
+                                symbol, asset_id, exchange, asset_class, name,
+                                status, tradable, marginable, shortable,
+                                easy_to_borrow, fractionable, min_order_size,
+                                price_increment, price_precision, lot_size,
+                                raw_payload, fetched_at, updated_at
+                            ) VALUES (
+                                %s, %s, %s, %s, %s,
+                                %s, %s, %s, %s,
+                                %s, %s, %s,
+                                %s, %s, %s,
+                                %s::jsonb, NOW(), NOW()
+                            )
+                            ON CONFLICT (symbol) DO UPDATE SET
+                                asset_id = EXCLUDED.asset_id,
+                                exchange = EXCLUDED.exchange,
+                                asset_class = EXCLUDED.asset_class,
+                                name = EXCLUDED.name,
+                                status = EXCLUDED.status,
+                                tradable = EXCLUDED.tradable,
+                                marginable = EXCLUDED.marginable,
+                                shortable = EXCLUDED.shortable,
+                                easy_to_borrow = EXCLUDED.easy_to_borrow,
+                                fractionable = EXCLUDED.fractionable,
+                                min_order_size = EXCLUDED.min_order_size,
+                                price_increment = EXCLUDED.price_increment,
+                                price_precision = EXCLUDED.price_precision,
+                                lot_size = EXCLUDED.lot_size,
+                                raw_payload = EXCLUDED.raw_payload,
+                                fetched_at = NOW(),
+                                updated_at = NOW()
+                            """,
+                            (
+                                sym,
+                                str(rec.get("asset_id") or ""),
+                                str(rec.get("exchange") or ""),
+                                str(rec.get("asset_class") or "us_equity"),
+                                str(rec.get("name") or ""),
+                                str(rec.get("status") or "active"),
+                                bool(rec.get("tradable", True)),
+                                bool(rec.get("marginable", False)),
+                                bool(rec.get("shortable", False)),
+                                bool(rec.get("easy_to_borrow", False)),
+                                bool(rec.get("fractionable", False)),
+                                min_order_size,
+                                price_increment,
+                                price_precision,
+                                lot_size,
+                                json.dumps(raw_payload, default=str),
+                            ),
+                        )
+                        upserted += 1
+        finally:
+            conn.close()
+        return upserted
+
+    def load_instrument_metadata_cache(
+        self,
+        symbols: Optional[Sequence[str]] = None,
+    ) -> Dict[str, Dict[str, Any]]:
+        """Load cached Alpaca instrument metadata from `instrument_metadata_cache` keyed by uppercase symbol."""
+        norm_symbols: Optional[List[str]] = None
+        if symbols is not None:
+            norm_symbols = [
+                str(s).split(".", 1)[0].strip().upper()
+                for s in symbols
+                if str(s).strip()
+            ]
+            if not norm_symbols:
+                return {}
+
+        conn = psycopg2.connect(self._dsn, cursor_factory=RealDictCursor)
+        try:
+            with conn.cursor() as cur:
+                if not self._table_exists(cur, "instrument_metadata_cache"):
+                    return {}
+                if norm_symbols is not None:
+                    cur.execute(
+                        """
+                        SELECT *
+                        FROM instrument_metadata_cache
+                        WHERE symbol = ANY(%s)
+                        ORDER BY symbol ASC
+                        """,
+                        (norm_symbols,),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        SELECT *
+                        FROM instrument_metadata_cache
+                        ORDER BY symbol ASC
+                        """
+                    )
+                rows = cur.fetchall() or []
+                out: Dict[str, Dict[str, Any]] = {}
+                for row in rows:
+                    sym = str(row.get("symbol") or "").strip().upper()
+                    if sym:
+                        out[sym] = dict(row)
+                return out
         finally:
             conn.close()

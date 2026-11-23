@@ -34,6 +34,7 @@ __all__ = [
     "AlpacaConfig",
     "AlpacaExecClientConfig",
     "AlpacaExecutionClientFactory",
+    "load_alpaca_equity_instruments",
 ]
 
 fixup_module_names(globals(), __name__)

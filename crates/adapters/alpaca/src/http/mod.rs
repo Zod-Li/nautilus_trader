@@ -28,6 +28,7 @@ pub use models::{
 pub use parse::{
     build_fill_report, build_fill_report_with_qty, decimal_to_money, decimal_to_price,
     decimal_to_quantity, derive_deterministic_fill_trade_id, parse_account_state,
-    parse_alpaca_trade_id, parse_equity_instrument, parse_instrument_id, parse_order_status_report,
-    parse_position_status_report, parse_rfc3339_to_unix_nanos,
+    parse_alpaca_trade_id, parse_equity_instrument, parse_equity_instrument_with_ref_price,
+    parse_instrument_id, parse_order_status_report, parse_position_status_report,
+    parse_rfc3339_to_unix_nanos,
 };

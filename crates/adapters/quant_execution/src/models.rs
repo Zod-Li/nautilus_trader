@@ -36,10 +36,13 @@ pub struct RustPlanItemEnvelope {
     pub initial_stop_price: Decimal,
     #[serde(default)]
     pub max_risk_budget_usd: Decimal,
+    #[serde(default)]
+    pub daily_atr_14: Option<Decimal>,
 }
 
 impl RustPlanItemEnvelope {
-    /// Computes the worst permissible limit price for an entry order given reference price and optional ATR.
+    /// Computes the worst permissible limit price for an entry order given reference price and optional ATR,
+    /// adhering to Reg NMS Rule 612 tick increments (`$0.0001` below `$1.00`, `$0.01` at or above `$1.00`).
     #[must_use]
     pub fn compute_worst_limit_price(
         &self,
@@ -48,7 +51,8 @@ impl RustPlanItemEnvelope {
     ) -> Decimal {
         let hundred = Decimal::from(100);
         let pct_offset = reference_price * (self.limit_collar_pct / hundred);
-        let allowed_offset = match atr {
+        let eff_atr = atr.or_else(|| self.daily_atr_14.filter(|a| *a > Decimal::ZERO));
+        let allowed_offset = match eff_atr {
             Some(atr_val) if self.limit_collar_atr > Decimal::ZERO => {
                 let atr_offset = atr_val * self.limit_collar_atr;
                 pct_offset.min(atr_offset)
@@ -56,14 +60,28 @@ impl RustPlanItemEnvelope {
             _ => pct_offset,
         };
 
-        let one_cent = Decimal::new(1, 2);
-        if self.side.eq_ignore_ascii_case("LONG") {
-            (reference_price + allowed_offset)
-                .round_dp_with_strategy(2, RoundingStrategy::MidpointNearestEven)
+        let raw = if self.side.eq_ignore_ascii_case("LONG") {
+            reference_price + allowed_offset
         } else {
-            let candidate = (reference_price - allowed_offset)
-                .round_dp_with_strategy(2, RoundingStrategy::MidpointNearestEven);
-            candidate.max(one_cent)
+            reference_price - allowed_offset
+        };
+
+        let sub_penny_tick = Decimal::new(1, 4);
+        let penny_tick = Decimal::new(1, 2);
+
+        if raw < Decimal::ONE {
+            let rounded = raw
+                .round_dp_with_strategy(4, RoundingStrategy::MidpointNearestEven)
+                .max(sub_penny_tick);
+            if rounded >= Decimal::ONE {
+                raw.round_dp_with_strategy(2, RoundingStrategy::MidpointNearestEven)
+                    .max(penny_tick)
+            } else {
+                rounded
+            }
+        } else {
+            raw.round_dp_with_strategy(2, RoundingStrategy::MidpointNearestEven)
+                .max(penny_tick)
         }
     }
 }

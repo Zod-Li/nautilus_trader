@@ -17,7 +17,7 @@
 
 pub mod config;
 
-use std::{cell::RefCell, fmt::Debug, rc::Rc};
+use std::{cell::RefCell, fmt::Debug, rc::Rc, sync::Arc};
 
 use ahash::AHashMap;
 use config::RiskEngineConfig;
@@ -61,6 +61,8 @@ use nautilus_portfolio::Portfolio;
 use rust_decimal::Decimal;
 use ustr::Ustr;
 
+use crate::gate::PreTradeRiskGate;
+
 type SubmitCommandFn = Box<dyn Fn(TradingCommand)>;
 type ModifyOrderFn = Box<dyn Fn(ModifyOrder)>;
 
@@ -81,6 +83,7 @@ pub struct RiskEngine {
     throttler_submit: Throttler<TradingCommand, SubmitCommandFn>,
     throttler_modify: Throttler<ModifyOrder, ModifyOrderFn>,
     reservations: Vec<Reservation>,
+    pre_trade_gate: Rc<RefCell<Option<Arc<dyn PreTradeRiskGate>>>>,
     command_count: u64,
     event_count: u64,
 }
@@ -107,8 +110,13 @@ impl RiskEngine {
         clock: Rc<RefCell<dyn Clock>>,
         cache: Rc<RefCell<Cache>>,
     ) -> Self {
-        let throttler_submit =
-            Self::create_submit_throttler(&config, Rc::clone(&clock), Rc::clone(&cache));
+        let pre_trade_gate = Rc::new(RefCell::new(None));
+        let throttler_submit = Self::create_submit_throttler(
+            &config,
+            Rc::clone(&clock),
+            Rc::clone(&cache),
+            Rc::clone(&pre_trade_gate),
+        );
         let throttler_modify =
             Self::create_modify_throttler(&config, Rc::clone(&clock), Rc::clone(&cache));
         let max_notional_per_order = config.max_notional_per_order.clone();
@@ -123,6 +131,7 @@ impl RiskEngine {
             throttler_submit,
             throttler_modify,
             reservations: Vec::new(),
+            pre_trade_gate,
             command_count: 0,
             event_count: 0,
         }
@@ -207,6 +216,7 @@ impl RiskEngine {
         config: &RiskEngineConfig,
         clock: Rc<RefCell<dyn Clock>>,
         cache: Rc<RefCell<Cache>>,
+        pre_trade_gate: Rc<RefCell<Option<Arc<dyn PreTradeRiskGate>>>>,
     ) -> Throttler<TradingCommand, SubmitCommandFn> {
         let success_handler = {
             Box::new(move |command: TradingCommand| {
@@ -218,8 +228,10 @@ impl RiskEngine {
         let failure_handler = {
             let cache = cache;
             let clock = Rc::clone(&clock);
+            let pre_trade_gate = pre_trade_gate;
             Box::new(move |command: TradingCommand| {
                 let reason = OrderDeniedReason::RateLimitExceeded.to_string();
+                let gate = pre_trade_gate.borrow().as_ref().map(Arc::clone);
 
                 match command {
                     TradingCommand::SubmitOrder(submit_order) => {
@@ -229,6 +241,9 @@ impl RiskEngine {
                         );
 
                         Self::handle_submit_order_cache(&cache, &submit_order);
+                        if let Some(gate) = gate.as_ref() {
+                            gate.on_order_denied(&submit_order.client_order_id);
+                        }
 
                         let denied = Self::create_order_denied(&submit_order, &reason, &clock);
 
@@ -250,6 +265,9 @@ impl RiskEngine {
 
                         for order in &orders {
                             if order.status() == OrderStatus::Initialized {
+                                if let Some(gate) = gate.as_ref() {
+                                    gate.on_order_denied(&order.client_order_id());
+                                }
                                 let denied = OrderEventAny::Denied(OrderDenied::new(
                                     order.trader_id(),
                                     order.strategy_id(),
@@ -388,10 +406,28 @@ impl RiskEngine {
         ))
     }
 
+    /// Sets an optional external pre-trade risk gate evaluated at the top of [`Self::execute`].
+    pub fn set_pre_trade_gate(&mut self, gate: Option<Arc<dyn PreTradeRiskGate>>) {
+        *self.pre_trade_gate.borrow_mut() = gate;
+    }
+
     /// Executes a trading command through the risk management pipeline.
     // Required by message bus dispatch
     pub fn execute(&mut self, command: TradingCommand) {
         self.command_count += 1;
+
+        let gate = self.pre_trade_gate.borrow().as_ref().map(Arc::clone);
+        if let Some(gate) = gate {
+            let ts_now = self.clock.borrow().timestamp_ns();
+            let gate_result = {
+                let cache = self.cache.borrow();
+                gate.check_command(&command, &cache, ts_now)
+            };
+            if let Err(reason) = gate_result {
+                self.reject_pre_trade_gate_command(command, &reason);
+                return;
+            }
+        }
 
         // This will extend to other commands such as `RiskCommand`
         self.handle_command(command);
@@ -1801,7 +1837,45 @@ impl RiskEngine {
         None
     }
 
+    fn reject_pre_trade_gate_command(&self, command: TradingCommand, reason: &str) {
+        match command {
+            TradingCommand::SubmitOrder(_) | TradingCommand::SubmitOrderList(_) => {
+                self.deny_command_with_notify(command, reason, false);
+            }
+            TradingCommand::ModifyOrder(ref modify) => {
+                let order = self.cache.borrow().order_owned(&modify.client_order_id);
+                if let Some(order) = order {
+                    self.reject_modify_order(&order, reason);
+                }
+            }
+            TradingCommand::ModifyOrders(ref batch) => {
+                let orders: Vec<OrderAny> = {
+                    let cache = self.cache.borrow();
+                    batch
+                        .modifies
+                        .iter()
+                        .filter_map(|m| cache.order_owned(&m.client_order_id))
+                        .collect()
+                };
+                for (index, order) in orders.iter().enumerate() {
+                    if orders[..index]
+                        .iter()
+                        .any(|previous| previous.client_order_id() == order.client_order_id())
+                    {
+                        continue;
+                    }
+                    self.reject_modify_order(order, reason);
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn deny_command(&self, command: TradingCommand, reason: &str) {
+        self.deny_command_with_notify(command, reason, true);
+    }
+
+    fn deny_command_with_notify(&self, command: TradingCommand, reason: &str, notify_gate: bool) {
         match command {
             TradingCommand::SubmitOrder(command) => {
                 let order = {
@@ -1810,7 +1884,7 @@ impl RiskEngine {
                 };
 
                 if let Some(ref order) = order {
-                    self.deny_order(order, reason);
+                    self.deny_order_with_notify(order, reason, notify_gate);
                 } else {
                     log::error!(
                         "Cannot deny order: not found in cache for {}",
@@ -1823,7 +1897,7 @@ impl RiskEngine {
                     .cache
                     .borrow()
                     .orders_for_ids(&command.order_list.client_order_ids, &command);
-                self.deny_order_list(&orders, reason);
+                self.deny_order_list_with_notify(&orders, reason, notify_gate);
             }
             _ => {
                 log::error!("Cannot deny command {command}");
@@ -1832,6 +1906,10 @@ impl RiskEngine {
     }
 
     fn deny_order(&self, order: &OrderAny, reason: &str) {
+        self.deny_order_with_notify(order, reason, true);
+    }
+
+    fn deny_order_with_notify(&self, order: &OrderAny, reason: &str, notify_gate: bool) {
         log::warn!(
             "SubmitOrder for {} DENIED: {}",
             order.client_order_id(),
@@ -1860,6 +1938,13 @@ impl RiskEngine {
             }
         }
 
+        if notify_gate {
+            let gate = self.pre_trade_gate.borrow().as_ref().map(Arc::clone);
+            if let Some(gate) = gate {
+                gate.on_order_denied(&order.client_order_id());
+            }
+        }
+
         let denied = OrderEventAny::Denied(OrderDenied::new(
             order.trader_id(),
             order.strategy_id(),
@@ -1876,9 +1961,13 @@ impl RiskEngine {
     }
 
     fn deny_order_list(&self, orders: &[OrderAny], reason: &str) {
+        self.deny_order_list_with_notify(orders, reason, true);
+    }
+
+    fn deny_order_list_with_notify(&self, orders: &[OrderAny], reason: &str, notify_gate: bool) {
         for order in orders {
             if !order.is_closed() {
-                self.deny_order(order, reason);
+                self.deny_order_with_notify(order, reason, notify_gate);
             }
         }
     }
@@ -1989,6 +2078,12 @@ impl RiskEngine {
     }
 
     fn handle_event(&self, event: &OrderEventAny) {
+        if let OrderEventAny::Updated(updated) = event {
+            let gate = self.pre_trade_gate.borrow().as_ref().map(Arc::clone);
+            if let Some(gate) = gate {
+                gate.on_order_updated(&updated.client_order_id, updated.quantity.as_decimal());
+            }
+        }
         // We intend to extend the risk engine to be able to handle additional events.
         // For now we just log.
         if self.config.debug {

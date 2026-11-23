@@ -12,6 +12,8 @@ from typing import Any, Dict, List, Type
 from nautilus_trader.quant.contracts.models import (
     SUPPORTED_TIMEFRAMES,
     ArchetypeStrategyConfig,
+    ExecAlgorithm,
+    ExecutionSpec,
     PlanItemContract,
     StrategyArchetypeId,
 )
@@ -89,7 +91,7 @@ def _default_parameter_bounds() -> Dict[str, Dict[str, Any]]:
             "min": str(MIN_ATR_STOP_MULTIPLIER),
             "max": str(MAX_ATR_STOP_MULTIPLIER),
             "default": "2.0",
-            "description": "Rolling ATR multiplier for adaptive volatility-scaled stop placement.",
+            "description": "daily_atr_14 multiplier for initial stop placement and intraday 1m Chandelier ratchet.",
         },
     }
 
@@ -107,13 +109,20 @@ class ArchetypeDescriptor:
 
     def to_schema_dict(self) -> Dict[str, Any]:
         """Returns a JSON-serializable reflection schema for MCP discovery and validation."""
+        default_spec = ExecutionSpec()
+        default_exec_algo_id = (
+            ExecAlgorithm.COLLARED_TWAP.value
+            if default_spec.exec_algorithm == ExecAlgorithm.COLLARED_TWAP
+            else None
+        )
         return {
             "archetype_id": self.archetype_id.value,
             "name": self.name,
             "description": self.description,
             "config_class": f"{self.config_cls.__module__}.{self.config_cls.__qualname__}",
             "strategy_class": f"{self.strategy_cls.__module__}.{self.strategy_cls.__qualname__}",
-            "exec_algorithm_id": "PLAN_GATE",
+            "exec_algorithm_id": default_exec_algo_id,
+            "execution_spec_defaults": default_spec.to_dict(),
             "parameter_bounds": dict(self.parameter_bounds),
         }
 

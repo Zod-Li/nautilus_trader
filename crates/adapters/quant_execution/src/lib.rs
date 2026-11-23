@@ -21,6 +21,7 @@
 
 pub mod engine;
 pub mod models;
+pub mod risk_gate;
 
 #[cfg(feature = "python")]
 pub mod python;

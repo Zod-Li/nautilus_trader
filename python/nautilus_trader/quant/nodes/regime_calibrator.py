@@ -15,47 +15,125 @@ regime calibration across 3x2 volatility-liquidity buckets:
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+import concurrent.futures
+from dataclasses import dataclass, field, replace
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from enum import Enum
 import json
 import math
+import multiprocessing
+import os
 import statistics
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 import uuid
+from zoneinfo import ZoneInfo
 
 import psycopg2
 from psycopg2.extras import Json
 
+from evolution_engine.alpha.stats_gates import (
+    MAX_BY_FDR_Q,
+    apply_benjamini_yekutieli_fdr_gate,
+    compute_newey_west_t_stat,
+)
 from evolution_engine.config_center.envelope import load_envelope
 from evolution_engine.config_center.schema import SystemConfig
 from evolution_engine.db.dsn import resolve_database_dsn
 from market_data_service.pipeline.us_equity_universe import get_gics_sector_map
+from market_data_service.store.clickhouse_store import _MIN_TRADABLE_RAW_PRICE
 from nautilus_trader.model import Bar, BarType, Price, Quantity
 from nautilus_trader.quant.contracts.models import (
+    PENNY_TICK_RULE_612,
     ArchetypeStrategyConfig,
-    BREAKOUT_LIMIT_COLLAR_ATR,
+    ExecAlgorithm,
+    ExecutionSpec,
     MarketableLimitCollar,
     PlanItemContract,
     PlanRiskEnvelope,
     PlanSide,
     StrategyArchetypeId,
+    TriggerPolicy,
     default_limit_collar_atr_for_archetype,
+    rule_612_tick_size,
 )
 from nautilus_trader.quant.nodes.backtest_runner import (
     MAX_LIMIT_COLLAR_MISSED_FILL_RATE,
     IsomorphicBacktestRunner,
     StressFalsificationReport,
     StressFalsifier,
+    _bar_step_ns,
+    _normal_cdf,
+    _normal_ppf,
+    _sort_bars_deterministic,
+    compute_per_period_deflated_sharpe_ratio,
 )
-from nautilus_trader.quant.strategies.empirical import rolling_atr
+from nautilus_trader.quant.strategies.empirical import (
+    empirical_rank_quantile,
+    rolling_atr,
+    rolling_linear_slope,
+    rolling_mad_zscore,
+    rolling_mean,
+    rolling_std,
+    rolling_vwap,
+)
 
+ET_TZ = ZoneInfo("America/New_York")
 MIN_POOLED_REGIME_SAMPLE_TRADES: int = 100
 VOL_BUCKET_LOWER_TERTILE: float = 1.0 / 3.0
 VOL_BUCKET_UPPER_TERTILE: float = 2.0 / 3.0
 LIQ_BUCKET_MEDIAN_QUANTILE: float = 0.50
-MIN_EQUITY_TICK_USD: float = 0.01
+MIN_EQUITY_TICK_USD: float = float(PENNY_TICK_RULE_612)
+MIN_TRADABLE_STOCK_PRICE_USD: float = float(_MIN_TRADABLE_RAW_PRICE)
+DEFAULT_SWING_HORIZON_SESSIONS: int = 5
+ONE_SIDED_ALPHA_005_CRITICAL_T: float = _normal_ppf(0.95)
+TOTAL_3X2_REGIME_CELLS: int = 3 * 2 * len(StrategyArchetypeId)
+
+
+def _default_limit_collar_pct() -> Decimal:
+    return Decimal(str(SystemConfig().execution.limit_collar_pct)).quantize(Decimal("0.0001"))
+
+
+H0_EXECUTION_SPEC: ExecutionSpec = ExecutionSpec(
+    trigger_policy=TriggerPolicy.FIRST_WINDOW_IMMEDIATE,
+    exec_algorithm=ExecAlgorithm.COLLARED_TWAP,
+    window_quantile=None,
+    bar_timeframe="15m",
+)
+
+DEFAULT_EXECUTION_SPEC_GRID: Tuple[ExecutionSpec, ...] = (
+    H0_EXECUTION_SPEC,
+    ExecutionSpec(
+        trigger_policy=TriggerPolicy.HYBRID_15M_1M_BREAKOUT,
+        exec_algorithm=ExecAlgorithm.DIRECT_COLLARED_LIMIT,
+        window_quantile=Decimal("0.50"),
+        bar_timeframe="15m",
+    ),
+    ExecutionSpec(
+        trigger_policy=TriggerPolicy.HYBRID_15M_1M_BREAKOUT,
+        exec_algorithm=ExecAlgorithm.DIRECT_COLLARED_LIMIT,
+        window_quantile=Decimal("0.75"),
+        bar_timeframe="15m",
+    ),
+    ExecutionSpec(
+        trigger_policy=TriggerPolicy.HYBRID_15M_1M_BREAKOUT,
+        exec_algorithm=ExecAlgorithm.COLLARED_TWAP,
+        window_quantile=Decimal("0.50"),
+        bar_timeframe="15m",
+    ),
+    ExecutionSpec(
+        trigger_policy=TriggerPolicy.HYBRID_15M_1M_BREAKOUT,
+        exec_algorithm=ExecAlgorithm.COLLARED_TWAP,
+        window_quantile=Decimal("0.75"),
+        bar_timeframe="15m",
+    ),
+    ExecutionSpec(
+        trigger_policy=TriggerPolicy.INTRADAY_AVWAP_PULLBACK,
+        exec_algorithm=ExecAlgorithm.DIRECT_COLLARED_LIMIT,
+        window_quantile=None,
+        bar_timeframe="15m",
+    ),
+)
 
 
 class VolBucket(str, Enum):
@@ -460,13 +538,35 @@ class FrozenRegimeParamRecord:
     pooled_dsr: Decimal
     stress_passed: bool
     stress_missed_fill_rate: Decimal
-    limit_collar_pct: Decimal = Decimal("0.3500")
+    limit_collar_pct: Decimal = field(default_factory=_default_limit_collar_pct)
     pooled_expectancy_r: Decimal = Decimal("0.0000")
     is_active: bool = True
     stress_report_json: Dict[str, Any] = field(default_factory=dict)
     calibrated_at: datetime = field(
         default_factory=lambda: datetime.now(tz=timezone.utc)
     )
+    execution_spec: ExecutionSpec = field(default_factory=ExecutionSpec)
+    h0_paired_delta_r: float = 0.0
+    h0_paired_nw_t_stat: float = 0.0
+    by_fdr_q_value: float = 1.0
+    oos_event_count: int = 0
+
+    def __post_init__(self) -> None:
+        raw_spec = self.execution_spec
+        if raw_spec is None:
+            norm_spec = ExecutionSpec(bar_timeframe=str(self.bar_timeframe or "15m"))
+        elif isinstance(raw_spec, Mapping):
+            norm_spec = ExecutionSpec.from_dict(
+                raw_spec,
+                default_bar_timeframe=str(self.bar_timeframe or "15m"),
+            )
+        elif isinstance(raw_spec, ExecutionSpec):
+            norm_spec = raw_spec
+        else:
+            raise ValueError(
+                f"execution_spec must be ExecutionSpec or mapping, got {type(raw_spec).__name__}"
+            )
+        object.__setattr__(self, "execution_spec", norm_spec)
 
     def validate(self) -> None:
         if not isinstance(self.vol_bucket, VolBucket):
@@ -495,6 +595,15 @@ class FrozenRegimeParamRecord:
             raise ValueError(
                 f"limit_collar_atr_mult must be in (0, 0.50], got {self.limit_collar_atr_mult}"
             )
+        if not isinstance(self.execution_spec, ExecutionSpec):
+            raise ValueError(f"Invalid execution_spec: {self.execution_spec!r}")
+        for fname, fval in (
+            ("h0_paired_delta_r", self.h0_paired_delta_r),
+            ("h0_paired_nw_t_stat", self.h0_paired_nw_t_stat),
+            ("by_fdr_q_value", self.by_fdr_q_value),
+        ):
+            if not math.isfinite(float(fval)):
+                raise ValueError(f"{fname} must be finite, got {fval!r}")
         # Validate underlying strategy parameters via ArchetypeStrategyConfig
         self.to_strategy_config("SPY.ALPACA").validate()
 
@@ -541,6 +650,7 @@ class FrozenRegimeParamRecord:
             "atr_stop_multiplier": str(self.atr_stop_multiplier),
             "limit_collar_atr_mult": str(self.limit_collar_atr_mult),
             "limit_collar_pct": str(self.limit_collar_pct),
+            "execution_spec": self.execution_spec.to_dict(),
         }
 
     @property
@@ -571,6 +681,11 @@ class FrozenRegimeParamRecord:
             "atr_stop_multiplier": str(self.atr_stop_multiplier),
             "limit_collar_atr_mult": str(self.limit_collar_atr_mult),
             "limit_collar_pct": str(self.limit_collar_pct),
+            "execution_spec": self.execution_spec.to_dict(),
+            "h0_paired_delta_r": float(self.h0_paired_delta_r),
+            "h0_paired_nw_t_stat": float(self.h0_paired_nw_t_stat),
+            "by_fdr_q_value": float(self.by_fdr_q_value),
+            "oos_event_count": int(self.oos_event_count),
             "pooled_sample_trades": int(self.pooled_sample_trades),
             "pooled_expectancy_r": str(self.pooled_expectancy_r),
             "pooled_sharpe": str(self.pooled_sharpe),
@@ -599,6 +714,13 @@ class FrozenRegimeParamTable:
     def upsert_record(self, record: FrozenRegimeParamRecord) -> None:
         """Validates and atomically upserts a `FrozenRegimeParamRecord` into `frozen_regime_param_table`."""
         record.validate()
+        eff_stress_json = dict(record.stress_report_json or {})
+        eff_stress_json.setdefault("execution_spec", record.execution_spec.to_dict())
+        eff_stress_json.setdefault("h0_paired_delta_r", float(record.h0_paired_delta_r))
+        eff_stress_json.setdefault("h0_paired_nw_t_stat", float(record.h0_paired_nw_t_stat))
+        eff_stress_json.setdefault("by_fdr_q_value", float(record.by_fdr_q_value))
+        eff_stress_json.setdefault("oos_event_count", int(record.oos_event_count))
+
         conn = self._connect()
         try:
             with conn:
@@ -682,7 +804,7 @@ class FrozenRegimeParamTable:
                             float(record.pooled_dsr),
                             bool(record.stress_passed),
                             float(record.stress_missed_fill_rate),
-                            Json(record.stress_report_json),
+                            Json(eff_stress_json),
                             record.calibrated_at,
                             bool(record.is_active),
                         ),
@@ -736,7 +858,7 @@ class FrozenRegimeParamTable:
         liq_bucket: LiqBucket | str,
         dominant_style: str | StrategyArchetypeId,
     ) -> int:
-        """Mark any active records (canonical or alias style) for `(vol_bucket, liq_bucket, archetype)` inactive."""
+        """Mark records (canonical or alias style) for `(vol_bucket, liq_bucket, archetype)` inactive and stamp `calibrated_at = NOW()`."""
         vb, lb, style_str, arch_id = self._normalize_cell_lookup_keys(
             vol_bucket,
             liq_bucket,
@@ -749,10 +871,10 @@ class FrozenRegimeParamTable:
                     cur.execute(
                         """
                         UPDATE frozen_regime_param_table
-                        SET is_active = FALSE
+                        SET is_active = FALSE,
+                            calibrated_at = NOW()
                         WHERE vol_bucket = %s
                           AND liq_bucket = %s
-                          AND is_active = TRUE
                           AND (dominant_style = %s OR dominant_style = %s OR archetype_id = %s)
                         """,
                         (vb, lb, style_str, arch_id.value, arch_id.value),
@@ -775,15 +897,39 @@ class FrozenRegimeParamTable:
             cal_at = datetime.now(tz=timezone.utc)
         elif cal_at.tzinfo is None:
             cal_at = cal_at.replace(tzinfo=timezone.utc)
-        collar_pct = Decimal(str(row[19])) if len(row) > 19 and row[19] is not None else Decimal("0.3500")
+        bar_tf = str(row[4])
+        collar_pct = (
+            Decimal(str(row[19]))
+            if len(row) > 19 and row[19] is not None
+            else _default_limit_collar_pct()
+        )
         exp_r = Decimal(f"{float(row[20]):.4f}") if len(row) > 20 and row[20] is not None else Decimal("0.0000")
         is_act = bool(row[21]) if len(row) > 21 and row[21] is not None else True
+
+        cfg_json: Dict[str, Any] = {}
+        if len(row) > 22 and row[22] is not None:
+            raw_cfg = row[22]
+            if isinstance(raw_cfg, str):
+                cfg_json = json.loads(raw_cfg) if raw_cfg.strip() else {}
+            elif isinstance(raw_cfg, Mapping):
+                cfg_json = dict(raw_cfg)
+
+        raw_exec = cfg_json.get("execution_spec") or report_dict.get("execution_spec")
+        exec_spec = ExecutionSpec.from_dict(
+            raw_exec if isinstance(raw_exec, Mapping) else None,
+            default_bar_timeframe=bar_tf,
+        )
+        h0_delta_r = float(report_dict.get("h0_paired_delta_r", 0.0) or 0.0)
+        h0_nw_t = float(report_dict.get("h0_paired_nw_t_stat", 0.0) or 0.0)
+        by_q = float(report_dict.get("by_fdr_q_value", 1.0) if report_dict.get("by_fdr_q_value") is not None else 1.0)
+        oos_cnt = int(report_dict.get("oos_event_count", 0) or 0)
+
         return FrozenRegimeParamRecord(
             vol_bucket=VolBucket(str(row[0])),
             liq_bucket=LiqBucket(str(row[1])),
             dominant_style=str(row[2]),
             archetype_id=StrategyArchetypeId(str(row[3])),
-            bar_timeframe=str(row[4]),
+            bar_timeframe=bar_tf,
             lookback_window=int(row[5]),
             fast_window=int(row[6]),
             slow_window=int(row[7]),
@@ -801,6 +947,11 @@ class FrozenRegimeParamTable:
             limit_collar_pct=collar_pct,
             pooled_expectancy_r=exp_r,
             is_active=is_act,
+            execution_spec=exec_spec,
+            h0_paired_delta_r=h0_delta_r,
+            h0_paired_nw_t_stat=h0_nw_t,
+            by_fdr_q_value=by_q,
+            oos_event_count=oos_cnt,
         )
 
     def get_frozen_params(
@@ -843,7 +994,8 @@ class FrozenRegimeParamTable:
                         calibrated_at,
                         limit_collar_pct,
                         pooled_expectancy_r,
-                        is_active
+                        is_active,
+                        strategy_config_json
                     FROM frozen_regime_param_table
                     WHERE vol_bucket = %s
                       AND liq_bucket = %s
@@ -888,7 +1040,8 @@ class FrozenRegimeParamTable:
                         calibrated_at,
                         limit_collar_pct,
                         pooled_expectancy_r,
-                        is_active
+                        is_active,
+                        strategy_config_json
                     FROM frozen_regime_param_table
                     {where_clause}
                     ORDER BY vol_bucket, liq_bucket, dominant_style
@@ -916,6 +1069,11 @@ class RegimeCandidateEvaluation:
     failure_reasons: Tuple[str, ...]
     stress_reports: Tuple[StressFalsificationReport, ...]
     frozen_record: Optional[FrozenRegimeParamRecord] = None
+    execution_spec: ExecutionSpec = field(default_factory=ExecutionSpec)
+    h0_paired_delta_r: float = 0.0
+    h0_paired_nw_t_stat: float = 0.0
+    by_fdr_q_value: float = 1.0
+    oos_event_count: int = 0
 
 
 @dataclass(frozen=True)
@@ -929,6 +1087,476 @@ class RegimeCellCalibrationResult:
     selected_record: Optional[FrozenRegimeParamRecord]
     evaluated_candidates: Tuple[RegimeCandidateEvaluation, ...]
     persisted: bool
+
+
+@dataclass(frozen=True)
+class ConditionalSwingEvent:
+    """A single conditional Top-K swing event window `[tau, tau + h]`."""
+
+    symbol: str
+    start_ns: int
+    end_ns: int
+    horizon_sessions: int = DEFAULT_SWING_HORIZON_SESSIONS
+    score: float = 0.0
+
+
+@dataclass(frozen=True)
+class _PanelCalibrationContext:
+    """Internal context forwarded from `calibrate_from_panel_matrices` without altering `calibrate_regime_cell` call signature."""
+
+    execution_spec_grid: Tuple[ExecutionSpec, ...]
+    bars_1m_by_symbol: Optional[Mapping[str, Sequence[Bar]]] = None
+    bars_1d_by_symbol: Optional[Mapping[str, Sequence[Bar]]] = None
+    alpha_scores_by_symbol: Optional[Mapping[str, Sequence[Tuple[int, float]]]] = None
+    total_family_trials: Optional[int] = None
+    holding_horizon_sessions: int = DEFAULT_SWING_HORIZON_SESSIONS
+
+
+class CausalMarketMicrostructureEstimator:
+    """Computes strictly causal `daily_atr_14` (from `1d` bars) and empirical `MarketImpactSpec`."""
+
+    @staticmethod
+    def _ny_date_from_ns(ts_ns: int) -> date:
+        if ts_ns > 100_000_000_000_000_000:
+            return datetime.fromtimestamp(ts_ns / 1e9, tz=timezone.utc).astimezone(ET_TZ).date()
+        return datetime(1970, 1, 1, tzinfo=timezone.utc).date()
+
+    @classmethod
+    def _aggregate_daily_ohlcv(
+        cls,
+        bars: Sequence[Bar],
+        cutoff_ts_ns: Optional[int] = None,
+    ) -> List[Tuple[date, float, float, float, float, float]]:
+        sorted_b = sorted(
+            [
+                b
+                for b in bars
+                if cutoff_ts_ns is None or int(b.ts_init) <= int(cutoff_ts_ns)
+            ],
+            key=lambda b: int(b.ts_init),
+        )
+        if not sorted_b:
+            return []
+        by_day: Dict[date, List[float]] = {}
+        order_days: List[date] = []
+        for b in sorted_b:
+            d_key = cls._ny_date_from_ns(int(b.ts_init))
+            o_px = float(b.open)
+            h_px = float(b.high)
+            l_px = float(b.low)
+            c_px = float(b.close)
+            v_qty = max(0.0, float(b.volume))
+            if d_key not in by_day:
+                order_days.append(d_key)
+                by_day[d_key] = [o_px, h_px, l_px, c_px, v_qty]
+            else:
+                agg = by_day[d_key]
+                agg[1] = max(agg[1], h_px)
+                agg[2] = min(agg[2], l_px)
+                agg[3] = c_px
+                agg[4] += v_qty
+        return [(d, *by_day[d]) for d in order_days]
+
+    @classmethod
+    def compute_daily_atr_14(
+        cls,
+        primary_bars: Sequence[Bar],
+        *,
+        bars_1d: Optional[Sequence[Bar]] = None,
+        cutoff_ts_ns: Optional[int] = None,
+    ) -> Optional[Decimal]:
+        """Computes `ATR_14` strictly from `1d` bars (or NY-session `1d` aggregates — NEVER `15m` bar ATR)."""
+        if bars_1d:
+            d_bars = sorted(
+                [
+                    b
+                    for b in bars_1d
+                    if cutoff_ts_ns is None or int(b.ts_init) <= int(cutoff_ts_ns)
+                ],
+                key=lambda b: int(b.ts_init),
+            )
+            if len(d_bars) >= 2:
+                atr_val = rolling_atr(
+                    [float(b.high) for b in d_bars],
+                    [float(b.low) for b in d_bars],
+                    [float(b.close) for b in d_bars],
+                    min(14, len(d_bars)),
+                )
+                if math.isfinite(atr_val) and atr_val > 0.0:
+                    return Decimal(f"{atr_val:.6f}")
+
+        daily_ohlcv = cls._aggregate_daily_ohlcv(primary_bars, cutoff_ts_ns=cutoff_ts_ns)
+        if len(daily_ohlcv) >= 2:
+            atr_val = rolling_atr(
+                [row[2] for row in daily_ohlcv],
+                [row[3] for row in daily_ohlcv],
+                [row[4] for row in daily_ohlcv],
+                min(14, len(daily_ohlcv)),
+            )
+            if math.isfinite(atr_val) and atr_val > 0.0:
+                return Decimal(f"{atr_val:.6f}")
+        return None
+
+    @classmethod
+    def estimate_market_impact(
+        cls,
+        primary_bars: Sequence[Bar],
+        *,
+        bars_1d: Optional[Sequence[Bar]] = None,
+        cutoff_ts_ns: Optional[int] = None,
+        ref_px: float = 100.0,
+        daily_atr_14: Optional[Decimal] = None,
+    ) -> Dict[str, float]:
+        """Estimates empirical `(half_spread_bps, impact_coefficient_y, adv_20_shares, daily_sigma)` strictly causally."""
+        causal_bars = sorted(
+            [
+                b
+                for b in primary_bars
+                if cutoff_ts_ns is None or int(b.ts_init) <= int(cutoff_ts_ns)
+            ],
+            key=lambda b: int(b.ts_init),
+        )
+        eff_ref = ref_px if (math.isfinite(ref_px) and ref_px > 0.0) else 100.0
+        if causal_bars and eff_ref <= 0.0:
+            eff_ref = float(causal_bars[-1].close)
+
+        if bars_1d:
+            d_bars = sorted(
+                [
+                    b
+                    for b in bars_1d
+                    if cutoff_ts_ns is None or int(b.ts_init) <= int(cutoff_ts_ns)
+                ],
+                key=lambda b: int(b.ts_init),
+            )
+            day_vols = [max(0.0, float(b.volume)) for b in d_bars if float(b.volume) > 0.0]
+        else:
+            daily_ohlcv = cls._aggregate_daily_ohlcv(causal_bars, cutoff_ts_ns=cutoff_ts_ns)
+            day_vols = [row[5] for row in daily_ohlcv if row[5] > 0.0]
+
+        if day_vols:
+            adv_20_shares = max(1.0, float(statistics.fmean(day_vols[-20:])))
+        elif causal_bars:
+            bar_vols = [max(0.0, float(b.volume)) for b in causal_bars if float(b.volume) > 0.0]
+            bars_per_day = max(
+                1.0,
+                86_400_000_000_000.0 / float(max(1, _bar_step_ns(causal_bars[0]))) / 2.5,
+            )
+            adv_20_shares = max(1.0, float(statistics.fmean(bar_vols)) * bars_per_day) if bar_vols else 100_000.0
+        else:
+            adv_20_shares = 100_000.0
+
+        tick_sz = float(rule_612_tick_size(Decimal(f"{max(eff_ref, 0.0):.6f}")))
+        tick_half_bps = (tick_sz / (2.0 * max(eff_ref, tick_sz))) * 10_000.0
+
+        if daily_atr_14 is not None and float(daily_atr_14) > 0.0 and eff_ref > 0.0:
+            daily_sigma = float(daily_atr_14) / eff_ref
+        elif len(causal_bars) >= 3:
+            rets = [
+                (float(causal_bars[i].close) / float(causal_bars[i - 1].close)) - 1.0
+                for i in range(1, len(causal_bars))
+                if float(causal_bars[i - 1].close) > 0.0
+            ]
+            step_ns = _bar_step_ns(causal_bars[0])
+            bars_per_day = 1.0 if step_ns >= 86_400_000_000_000 else max(1.0, (6.5 * 3600.0 * 1e9) / float(step_ns))
+            range_sigma = (
+                max(
+                    tick_sz / max(eff_ref, tick_sz),
+                    (float(causal_bars[-1].high) - float(causal_bars[-1].low)) / max(eff_ref, tick_sz),
+                )
+                if causal_bars
+                else tick_sz / max(eff_ref, tick_sz)
+            )
+            daily_sigma = (
+                max(tick_sz / max(eff_ref, tick_sz), statistics.stdev(rets) * math.sqrt(bars_per_day))
+                if len(rets) >= 2
+                else range_sigma
+            )
+        else:
+            daily_sigma = (
+                max(
+                    tick_sz / max(eff_ref, tick_sz),
+                    (float(causal_bars[-1].high) - float(causal_bars[-1].low)) / max(eff_ref, tick_sz),
+                )
+                if causal_bars
+                else tick_sz / max(eff_ref, tick_sz)
+            )
+
+        if causal_bars:
+            rel_ranges = [
+                ((float(b.high) - float(b.low)) / float(b.close)) * 10_000.0
+                for b in causal_bars[-min(len(causal_bars), 260) :]
+                if float(b.close) > 0.0
+            ]
+            step_ns = _bar_step_ns(causal_bars[0])
+            bars_per_day = 1.0 if step_ns >= 86_400_000_000_000 else max(1.0, (6.5 * 3600.0 * 1e9) / float(step_ns))
+            emp_half_bps = (
+                0.5 * float(statistics.median(rel_ranges)) / math.sqrt(bars_per_day)
+                if rel_ranges
+                else tick_half_bps
+            )
+            half_spread_bps = max(tick_half_bps, emp_half_bps)
+        else:
+            half_spread_bps = tick_half_bps
+
+        kyle_ratios: List[float] = []
+        if len(causal_bars) >= 3 and daily_sigma > 0.0 and adv_20_shares > 0.0:
+            for idx in range(1, len(causal_bars)):
+                prev_c = float(causal_bars[idx - 1].close)
+                curr_c = float(causal_bars[idx].close)
+                curr_v = max(1.0, float(causal_bars[idx].volume))
+                if prev_c <= 0.0:
+                    continue
+                abs_ret = abs(curr_c / prev_c - 1.0)
+                part_sqrt = math.sqrt(curr_v / adv_20_shares)
+                denom = daily_sigma * part_sqrt
+                if abs_ret > 0.0 and denom > 1e-12:
+                    kyle_ratios.append(abs_ret / denom)
+        if kyle_ratios:
+            impact_y = max(tick_half_bps * 1e-4, float(statistics.median(kyle_ratios)))
+        else:
+            impact_y = max(tick_half_bps * 1e-4, 1.0)
+
+        return {
+            "half_spread_bps": round(float(half_spread_bps), 4),
+            "impact_coefficient_y": round(float(impact_y), 4),
+            "adv_20_shares": round(float(adv_20_shares), 2),
+            "daily_sigma": round(float(daily_sigma), 6),
+        }
+
+
+class ConditionalSwingEventExtractor:
+    """Extracts chronological conditional Top-K swing event windows `[tau, tau + h]` strictly causally."""
+
+    @staticmethod
+    def _causal_archetype_score(
+        bars_before: Sequence[Bar],
+        archetype_id: StrategyArchetypeId,
+    ) -> float:
+        if len(bars_before) < 6:
+            return 0.0
+        closes = [float(b.close) for b in bars_before[-60:]]
+        highs = [float(b.high) for b in bars_before[-60:]]
+        lows = [float(b.low) for b in bars_before[-60:]]
+        vols = [float(b.volume) for b in bars_before[-60:]]
+        if archetype_id == StrategyArchetypeId.TREND_MOMENTUM:
+            fast_n = min(5, len(closes))
+            slow_n = min(15, len(closes))
+            scale = max(rolling_std(closes[-slow_n:]), 1e-6)
+            slope_diff = rolling_linear_slope(closes[-fast_n:]) - rolling_linear_slope(closes[-slow_n:])
+            return ((rolling_mean(closes[-fast_n:]) - rolling_mean(closes[-slow_n:])) + slope_diff * fast_n) / scale
+        if archetype_id == StrategyArchetypeId.VOLATILITY_BREAKOUT:
+            win_n = min(len(closes), len(vols), 20)
+            q_px = empirical_rank_quantile(closes[-win_n:], closes[-1])
+            q_vol = empirical_rank_quantile(vols[-win_n:], vols[-1])
+            return q_px + q_vol
+        # MEAN_REVERSION: higher score for deeper oversold residual
+        slow_n = min(15, len(closes))
+        typ = [(h + lo + c) / 3.0 for h, lo, c in zip(highs[-slow_n:], lows[-slow_n:], closes[-slow_n:])]
+        anchor = rolling_vwap(typ, vols[-slow_n:], slow_n)
+        res = [c - anchor for c in closes[-min(len(closes), 20) :]]
+        mad_z = rolling_mad_zscore(res, closes[-1] - anchor)
+        return -mad_z
+
+    @classmethod
+    def extract_events(
+        cls,
+        *,
+        primary_bars_by_symbol: Mapping[str, Sequence[Bar]],
+        archetype_id: StrategyArchetypeId,
+        warmup_bars_min: int,
+        horizon_sessions: int = DEFAULT_SWING_HORIZON_SESSIONS,
+        alpha_scores_by_symbol: Optional[Mapping[str, Sequence[Tuple[int, float]]]] = None,
+        min_required_events: int = MIN_POOLED_REGIME_SAMPLE_TRADES,
+    ) -> List[ConditionalSwingEvent]:
+        if not primary_bars_by_symbol:
+            return []
+
+        # Partition each symbol's primary bars into chronological session buckets
+        session_bars_by_sym: Dict[str, List[Tuple[int, int, List[Bar]]]] = {}
+        all_session_keys: set[date] = set()
+        for sym, seq in primary_bars_by_symbol.items():
+            sorted_seq = sorted(seq, key=lambda b: int(b.ts_init))
+            if not sorted_seq:
+                continue
+            by_date: Dict[date, List[Bar]] = {}
+            for b in sorted_seq:
+                d_key = CausalMarketMicrostructureEstimator._ny_date_from_ns(int(b.ts_init))
+                by_date.setdefault(d_key, []).append(b)
+                all_session_keys.add(d_key)
+            if len(by_date) >= 4:
+                sess_list = [
+                    (int(by_date[d][0].ts_init), int(by_date[d][-1].ts_init), by_date[d])
+                    for d in sorted(by_date.keys())
+                ]
+            else:
+                step_b = max(4, min(26, max(4, len(sorted_seq) // 12)))
+                sess_list = [
+                    (int(sorted_seq[i].ts_init), int(sorted_seq[min(len(sorted_seq) - 1, i + step_b - 1)].ts_init), sorted_seq[i : i + step_b])
+                    for i in range(0, len(sorted_seq), step_b)
+                ]
+            session_bars_by_sym[sym] = sess_list
+
+        if not session_bars_by_sym:
+            return []
+
+        alpha_lookup: Dict[str, List[Tuple[int, float]]] = {}
+        if alpha_scores_by_symbol:
+            for sym, seq in alpha_scores_by_symbol.items():
+                norm_s = str(sym).strip().upper().split(".", 1)[0]
+                alpha_lookup[norm_s] = sorted(
+                    [(int(ts), float(sc)) for ts, sc in seq if math.isfinite(float(sc))],
+                    key=lambda item: item[0],
+                )
+
+        # Align decision sessions on a common ordered timeline
+        all_sess_starts: List[int] = sorted(
+            {
+                sess[0]
+                for sess_list in session_bars_by_sym.values()
+                for sess in sess_list
+            }
+        )
+        if len(all_sess_starts) < 3:
+            return []
+
+        max_sess_len = max(len(v) for v in session_bars_by_sym.values())
+        eff_h = min(max(1, int(horizon_sessions)), max(1, max_sess_len // 4))
+
+        # Estimate warmup sessions needed before first event
+        sample_sym_sess = next(iter(session_bars_by_sym.values()))
+        avg_bars_per_sess = max(1, int(round(sum(len(s[2]) for s in sample_sym_sess) / max(1, len(sample_sym_sess)))))
+        warmup_sess = min(
+            max(1, len(all_sess_starts) // 4),
+            max(1, math.ceil(max(2, int(warmup_bars_min)) / float(avg_bars_per_sess))),
+        )
+
+        # Index symbol bars up to each timestamp for causal scoring
+        sym_all_bars: Dict[str, List[Bar]] = {
+            sym: [b for _, _, bl in sess_list for b in bl]
+            for sym, sess_list in session_bars_by_sym.items()
+        }
+        sym_ts_index: Dict[str, List[int]] = {
+            sym: [int(b.ts_init) for b in bl]
+            for sym, bl in sym_all_bars.items()
+        }
+
+        import bisect
+
+        session_candidates: List[List[ConditionalSwingEvent]] = []
+        for s_idx in range(warmup_sess, max(warmup_sess + 1, len(all_sess_starts) - eff_h)):
+            tau_ns = all_sess_starts[s_idx]
+            day_scored: List[Tuple[float, str, int, int]] = []
+            for sym, sess_list in session_bars_by_sym.items():
+                # Find session starting at or right around tau_ns and ending eff_h sessions later
+                sym_starts = [s[0] for s in sess_list]
+                pos = bisect.bisect_left(sym_starts, tau_ns)
+                if pos >= len(sess_list) or abs(sess_list[pos][0] - tau_ns) > 86_400_000_000_000:
+                    continue
+                end_pos = min(len(sess_list) - 1, pos + eff_h - 1)
+                if end_pos < pos:
+                    continue
+                win_start = sess_list[pos][0]
+                win_end = sess_list[end_pos][1]
+
+                bar_cut = bisect.bisect_left(sym_ts_index[sym], win_start)
+                if bar_cut < 6:
+                    continue
+                if sym in alpha_lookup and alpha_lookup[sym]:
+                    a_seq = alpha_lookup[sym]
+                    a_pos = bisect.bisect_left([x[0] for x in a_seq], win_start) - 1
+                    score = a_seq[a_pos][1] if a_pos >= 0 else 0.0
+                else:
+                    score = cls._causal_archetype_score(sym_all_bars[sym][:bar_cut], archetype_id)
+                day_scored.append((score, sym, win_start, win_end))
+
+            if not day_scored:
+                continue
+            day_scored.sort(key=lambda item: (item[0], item[1]), reverse=True)
+            session_candidates.append(
+                [
+                    ConditionalSwingEvent(
+                        symbol=sym,
+                        start_ns=ws,
+                        end_ns=we,
+                        horizon_sessions=eff_h,
+                        score=sc,
+                    )
+                    for sc, sym, ws, we in day_scored
+                ]
+            )
+
+        if not session_candidates:
+            return []
+
+        n_sessions = len(session_candidates)
+        max_avail = max(len(day_list) for day_list in session_candidates)
+        # Default Top-K = top quartile capped at 4 (matching L1 HARD_MAX_CANDIDATES)
+        k_top = min(max_avail, max(1, min(4, math.ceil(max_avail * 0.25))))
+        target_total_with_is = math.ceil(float(min_required_events) / 0.70)
+        if k_top * n_sessions < target_total_with_is and max_avail > k_top:
+            # Expand strictly within the top half of the cross-section if needed to meet OOS depth
+            k_cap = max(k_top, max_avail // 2)
+            k_top = min(k_cap, max(k_top, math.ceil(target_total_with_is / max(1, n_sessions))))
+
+        extracted: List[ConditionalSwingEvent] = []
+        for day_list in session_candidates:
+            extracted.extend(day_list[:k_top])
+        extracted.sort(key=lambda ev: (ev.start_ns, ev.symbol))
+        return extracted
+
+
+def _run_panel_cell_calibration_task(
+    task: Mapping[str, Any],
+) -> Tuple[VolBucket, LiqBucket, str, StrategyArchetypeId, Optional[FrozenRegimeParamRecord]]:
+    """Spawned worker entrypoint for parallel 3x2 `(vol_bucket, liq_bucket, archetype_id)` cell calibration."""
+    runner_cfg = task["runner_config"]
+    worker_runner = IsomorphicBacktestRunner(
+        dsn=None,
+        starting_capital_usd=runner_cfg["starting_capital_usd"],
+        effective_trials=runner_cfg["effective_trials"],
+        venue_name=task["venue_name"],
+        fee_schedule=runner_cfg["fee_schedule"],
+        market_impact_spec=runner_cfg["market_impact_spec"],
+        half_spread_bps=runner_cfg["explicit_half_spread_bps"],
+        impact_coefficient_y=runner_cfg["explicit_impact_y"],
+        system_config=runner_cfg["system_config"],
+    )
+    worker_falsifier = StressFalsifier(
+        worker_runner,
+        max_missed_fill_rate=task["max_missed_fill_rate"],
+    )
+    worker_calibrator = OfflineRegimePanelCalibrator(
+        dsn=None,
+        runner=worker_runner,
+        falsifier=worker_falsifier,
+        param_table=None,
+        min_pooled_sample_trades=task["min_pooled_sample_trades"],
+        max_missed_fill_rate=task["max_missed_fill_rate"],
+        venue_name=task["venue_name"],
+    )
+    res = worker_calibrator.calibrate_regime_cell(
+        vol_bucket=task["vol_bucket"],
+        liq_bucket=task["liq_bucket"],
+        dominant_style=task["arch_id"],
+        symbol_bars=task["symbol_bars"],
+        candidate_param_grid=task["candidate_param_grid"],
+        raw_low_by_symbol_ts_ns=task["raw_low_by_symbol_ts_ns"],
+        persist=False,
+        execution_spec_grid=task["execution_spec_grid"],
+        bars_1m_by_symbol=task["bars_1m_by_symbol"],
+        bars_1d_by_symbol=task["bars_1d_by_symbol"],
+        alpha_scores_by_symbol=task["alpha_scores_by_symbol"],
+        total_family_trials=task["total_family_trials"],
+        holding_horizon_sessions=task["holding_horizon_sessions"],
+    )
+    return (
+        res.vol_bucket,
+        res.liq_bucket,
+        res.dominant_style,
+        res.archetype_id,
+        res.selected_record,
+    )
 
 
 class OfflineRegimePanelCalibrator:
@@ -964,10 +1592,27 @@ class OfflineRegimePanelCalibrator:
         self._min_pooled_sample_trades = max(1, int(min_pooled_sample_trades))
         self._max_missed_fill_rate = min(1.0, max(0.0, float(max_missed_fill_rate)))
         self._venue_name = str(venue_name or "ALPACA").strip().upper()
+        self._pending_panel_context: Optional[_PanelCalibrationContext] = None
 
     @property
     def param_table(self) -> Optional[FrozenRegimeParamTable]:
         return self._param_table
+
+    def _clear_runner_last_refs(self) -> None:
+        """Clears retained disposed PyO3/actor references on `_runner` after calibration."""
+        seen: set[int] = set()
+        for runner_obj in (self._runner, getattr(self._falsifier, "_runner", None)):
+            if runner_obj is None or id(runner_obj) in seen:
+                continue
+            seen.add(id(runner_obj))
+            for attr in (
+                "_last_plan_gate_backend",
+                "_last_oco_monitor",
+                "_last_telemetry_actor",
+                "_last_strategy",
+            ):
+                if hasattr(runner_obj, attr):
+                    setattr(runner_obj, attr, None)
 
     def _build_calibration_plan_item(
         self,
@@ -976,6 +1621,9 @@ class OfflineRegimePanelCalibrator:
         archetype_id: StrategyArchetypeId,
         params: Mapping[str, Any],
         bars: Sequence[Bar],
+        bars_1d: Optional[Sequence[Bar]] = None,
+        execution_spec: Optional[ExecutionSpec | Mapping[str, Any]] = None,
+        cutoff_ts_ns: Optional[int] = None,
     ) -> Tuple[PlanItemContract, Decimal]:
         sym = str(symbol).strip().upper().split(".", 1)[0]
         inst_id = str(params.get("instrument_id") or f"{sym}.{self._venue_name}").strip()
@@ -997,7 +1645,23 @@ class OfflineRegimePanelCalibrator:
                 )
             )
         )
-        collar_pct = Decimal(str(params.get("limit_collar_pct", "0.35")))
+        collar_pct = Decimal(str(params.get("limit_collar_pct", _default_limit_collar_pct())))
+
+        if execution_spec is not None:
+            resolved_exec_spec = (
+                execution_spec
+                if isinstance(execution_spec, ExecutionSpec)
+                else ExecutionSpec.from_dict(execution_spec, default_bar_timeframe=bar_tf)
+            )
+        elif params.get("execution_spec") is not None:
+            raw_es = params["execution_spec"]
+            resolved_exec_spec = (
+                raw_es
+                if isinstance(raw_es, ExecutionSpec)
+                else ExecutionSpec.from_dict(raw_es, default_bar_timeframe=bar_tf)
+            )
+        else:
+            resolved_exec_spec = ExecutionSpec(bar_timeframe=bar_tf)
 
         strat_cfg = ArchetypeStrategyConfig(
             archetype_id=archetype_id,
@@ -1011,23 +1675,57 @@ class OfflineRegimePanelCalibrator:
             atr_stop_multiplier=atr_mult,
         )
 
-        sorted_bars = sorted(bars, key=lambda b: int(b.ts_init))
-        closes = [float(b.close) for b in sorted_bars]
-        highs = [float(b.high) for b in sorted_bars]
-        lows = [float(b.low) for b in sorted_bars]
+        primary_step_ns = _TF_BAR_SPECS.get(bar_tf.strip().lower(), _TF_BAR_SPECS["15m"])[2]
+        sorted_all = sorted(bars, key=lambda b: int(b.ts_init))
+        primary_all = [b for b in sorted_all if _bar_step_ns(b) == primary_step_ns] or sorted_all
+        if cutoff_ts_ns is not None:
+            causal_primary = [b for b in primary_all if int(b.ts_init) <= int(cutoff_ts_ns)]
+            if not causal_primary:
+                causal_primary = primary_all[:1]
+            # Anchor on trailing causal slice right before event cutoff
+            init_n = min(max(lookback_window, 14), len(causal_primary))
+            anchor_slice = causal_primary[-init_n:]
+            eff_cutoff_ts_ns: Optional[int] = (
+                int(cutoff_ts_ns)
+                if any(int(b.ts_init) <= int(cutoff_ts_ns) for b in primary_all)
+                else (int(anchor_slice[-1].ts_init) if anchor_slice else int(cutoff_ts_ns))
+            )
+            causal_est_bars = causal_primary
+        else:
+            causal_primary = primary_all
+            # Anchor sizing and stop loss strictly on the initial causal warmup slice so later
+            # prices never leak into the plan envelope and `initial_stop_price` cannot sit
+            # artificially below the full-window low.
+            init_n = min(max(lookback_window, 14), len(causal_primary))
+            anchor_slice = causal_primary[:init_n]
+            eff_cutoff_ts_ns = int(anchor_slice[-1].ts_init) if anchor_slice else None
+            causal_est_bars = anchor_slice
 
-        # Anchor sizing and stop loss strictly on the initial causal warmup slice so later
-        # prices never leak into the plan envelope and `initial_stop_price` cannot sit
-        # artificially below the full-window low.
-        init_n = min(max(lookback_window, 14), len(closes))
-        init_closes = closes[:init_n]
-        init_highs = highs[:init_n]
-        init_lows = lows[:init_n]
+        init_closes = [float(b.close) for b in anchor_slice]
+        init_highs = [float(b.high) for b in anchor_slice]
+        init_lows = [float(b.low) for b in anchor_slice]
         ref_px = init_closes[-1] if init_closes else 100.0
-        emp_atr = (
-            rolling_atr(init_highs, init_lows, init_closes, min(14, len(init_closes)))
-            if len(init_closes) >= 2
-            else max(0.5, ref_px * 0.01)
+        tick_floor = float(rule_612_tick_size(Decimal(f"{max(ref_px, 0.0):.6f}")))
+        px_prec = 4 if tick_floor < float(PENNY_TICK_RULE_612) else 2
+
+        daily_atr_14 = CausalMarketMicrostructureEstimator.compute_daily_atr_14(
+            causal_est_bars,
+            bars_1d=bars_1d,
+            cutoff_ts_ns=eff_cutoff_ts_ns,
+        )
+        if len(init_closes) >= 2:
+            emp_atr = rolling_atr(init_highs, init_lows, init_closes, min(14, len(init_closes)))
+        elif init_highs and init_lows:
+            emp_atr = max(init_highs[0] - init_lows[0], tick_floor)
+        else:
+            emp_atr = tick_floor
+
+        impact_meta = CausalMarketMicrostructureEstimator.estimate_market_impact(
+            causal_est_bars,
+            bars_1d=bars_1d,
+            cutoff_ts_ns=eff_cutoff_ts_ns,
+            ref_px=ref_px,
+            daily_atr_14=daily_atr_14,
         )
 
         sys_cfg = SystemConfig()
@@ -1040,12 +1738,23 @@ class OfflineRegimePanelCalibrator:
         single_name_pct_cap = float(env_num["risk.max_single_name_pct"]["max"]) / 100.0
         starting_equity = float(getattr(self._runner, "_starting_capital_usd", 100_000.0))
 
-        eff_atr = max(emp_atr, MIN_EQUITY_TICK_USD)
-        stop_dist = max(float(atr_mult) * eff_atr, ref_px * min_stop_frac, MIN_EQUITY_TICK_USD)
+        use_daily_atr_for_sizing = (
+            daily_atr_14 is not None
+            and (
+                bars_1d is not None
+                or cutoff_ts_ns is not None
+                or primary_step_ns >= 86_400_000_000_000
+            )
+        )
+        eff_atr = max(
+            float(daily_atr_14) if use_daily_atr_for_sizing else emp_atr,
+            tick_floor,
+        )
+        stop_dist = max(float(atr_mult) * eff_atr, ref_px * min_stop_frac, tick_floor)
         stop_px = (
-            max(MIN_EQUITY_TICK_USD, min(ref_px - MIN_EQUITY_TICK_USD, ref_px - stop_dist))
-            if ref_px > 2.0 * MIN_EQUITY_TICK_USD
-            else MIN_EQUITY_TICK_USD
+            max(tick_floor, min(ref_px - tick_floor, ref_px - stop_dist))
+            if ref_px > 2.0 * tick_floor
+            else tick_floor
         )
 
         max_pos_usd = min(max_notional_usd, starting_equity * single_name_pct_cap)
@@ -1066,23 +1775,23 @@ class OfflineRegimePanelCalibrator:
         else:
             min_qty_for_notional = max(
                 1,
-                math.ceil(min_notional_usd / max(ref_px, MIN_EQUITY_TICK_USD)),
+                math.ceil(min_notional_usd / max(ref_px, tick_floor)),
             )
             max_qty_for_pos = max(
                 1,
-                int(max_pos_usd // max(ref_px, MIN_EQUITY_TICK_USD)),
+                int(max_pos_usd // max(ref_px, tick_floor)),
             )
             risk_sized_qty = int(
                 min(
-                    unit_risk_usd / max(stop_dist, MIN_EQUITY_TICK_USD),
-                    target_pos_usd / max(ref_px, MIN_EQUITY_TICK_USD),
+                    unit_risk_usd / max(stop_dist, tick_floor),
+                    target_pos_usd / max(ref_px, tick_floor),
                 )
             )
             target_qty = Decimal(
                 str(max(1, min(max_qty_for_pos, max(min_qty_for_notional, risk_sized_qty))))
             )
 
-        raw_notional = float(target_qty) * max(ref_px, MIN_EQUITY_TICK_USD)
+        raw_notional = float(target_qty) * max(ref_px, tick_floor)
         bounded_notional = min(
             max_pos_usd,
             max(min_notional_usd, raw_notional),
@@ -1099,7 +1808,7 @@ class OfflineRegimePanelCalibrator:
             if params.get("take_profit_price") is not None
             else None
         )
-        last_ts_ns = int(sorted_bars[-1].ts_init) if sorted_bars else 0
+        last_ts_ns = int(sorted_all[-1].ts_init) if sorted_all else 0
         valid_until = (
             datetime.fromtimestamp(last_ts_ns / 1e9, tz=timezone.utc) + timedelta(days=5)
             if last_ts_ns > 100_000_000_000_000_000
@@ -1111,13 +1820,15 @@ class OfflineRegimePanelCalibrator:
             approved_qty_cap=target_qty,
             target_notional_usd=target_notional,
             max_risk_budget_usd=max_risk_budget,
-            initial_stop_price=Decimal(f"{stop_px:.2f}"),
+            initial_stop_price=Decimal(f"{stop_px:.{px_prec}f}"),
             take_profit_price=take_profit_dec,
             collar=MarketableLimitCollar(
                 limit_collar_pct=collar_pct,
                 limit_collar_atr=collar_atr,
             ),
             valid_until=valid_until,
+            daily_atr_14=daily_atr_14,
+            execution_spec=resolved_exec_spec,
         )
         item = PlanItemContract(
             item_id=uuid.uuid4(),
@@ -1129,7 +1840,12 @@ class OfflineRegimePanelCalibrator:
             strategy_id=f"{archetype_id.value}-CAL-{sym}",
             strategy_config=strat_cfg,
             risk_envelope=env,
-            sizing_trace={"calibration": "offline_3x2_regime_panel"},
+            sizing_trace={
+                "calibration": "offline_3x2_regime_panel",
+                **impact_meta,
+            },
+            daily_atr_14=daily_atr_14,
+            execution_spec=resolved_exec_spec,
         )
         return item, collar_atr
 
@@ -1143,6 +1859,13 @@ class OfflineRegimePanelCalibrator:
         candidate_param_grid: Optional[Sequence[Mapping[str, Any]]] = None,
         raw_low_by_symbol_ts_ns: Optional[Mapping[str, Mapping[int, float]]] = None,
         persist: bool = True,
+        execution_spec_grid: Optional[Sequence[ExecutionSpec | Mapping[str, Any]]] = None,
+        bars_1m_by_symbol: Optional[Mapping[str, Sequence[Bar]]] = None,
+        bars_1d_by_symbol: Optional[Mapping[str, Sequence[Bar]]] = None,
+        alpha_scores_by_symbol: Optional[Mapping[str, Sequence[Tuple[int, float]]]] = None,
+        conditional_events: Optional[Sequence[ConditionalSwingEvent | Tuple[Any, ...]]] = None,
+        total_family_trials: Optional[int] = None,
+        holding_horizon_sessions: int = DEFAULT_SWING_HORIZON_SESSIONS,
     ) -> RegimeCellCalibrationResult:
         """Calibrates a single `(vol_bucket, liq_bucket, dominant_style)` cell and persists the winner."""
         vb = (
@@ -1164,7 +1887,7 @@ class OfflineRegimePanelCalibrator:
 
         if isinstance(symbol_bars, Mapping):
             bars_by_symbol: Dict[str, List[Bar]] = {
-                str(sym).strip().upper(): list(b_seq)
+                str(sym).strip().upper().split(".", 1)[0]: list(b_seq)
                 for sym, b_seq in symbol_bars.items()
                 if b_seq
             }
@@ -1190,129 +1913,193 @@ class OfflineRegimePanelCalibrator:
         if not grid:
             raise ValueError(f"Empty candidate_param_grid for {arch_id.value}")
 
+        pending_ctx = self._pending_panel_context
+        eff_exec_grid = execution_spec_grid or (
+            pending_ctx.execution_spec_grid if pending_ctx is not None else None
+        )
+        eff_bars_1m = bars_1m_by_symbol or (
+            pending_ctx.bars_1m_by_symbol if pending_ctx is not None else None
+        )
+        eff_bars_1d = bars_1d_by_symbol or (
+            pending_ctx.bars_1d_by_symbol if pending_ctx is not None else None
+        )
+        eff_alpha = alpha_scores_by_symbol or (
+            pending_ctx.alpha_scores_by_symbol if pending_ctx is not None else None
+        )
+        eff_family_trials = total_family_trials if total_family_trials is not None else (
+            pending_ctx.total_family_trials if pending_ctx is not None else None
+        )
+        eff_horizon_sess = (
+            pending_ctx.holding_horizon_sessions
+            if pending_ctx is not None and holding_horizon_sessions == DEFAULT_SWING_HORIZON_SESSIONS
+            else holding_horizon_sessions
+        )
+
+        has_custom_exec_in_grid = any("execution_spec" in cand for cand in grid)
+        use_legacy_direct_grid = (
+            not hasattr(self._falsifier, "run_conditional_swing_falsification")
+            or (
+                candidate_param_grid is not None
+                and eff_exec_grid is None
+                and conditional_events is None
+                and eff_bars_1m is None
+                and eff_bars_1d is None
+                and eff_alpha is None
+                and pending_ctx is None
+                and not has_custom_exec_in_grid
+            )
+        )
+        if not use_legacy_direct_grid:
+            return self._calibrate_cell_walk_forward_counterfactual(
+                vb=vb,
+                lb=lb,
+                style_key=style_key,
+                arch_id=arch_id,
+                bars_by_symbol=bars_by_symbol,
+                grid=grid,
+                raw_low_by_symbol_ts_ns=raw_low_by_symbol_ts_ns,
+                persist=persist,
+                execution_spec_grid=eff_exec_grid,
+                bars_1m_by_symbol=eff_bars_1m,
+                bars_1d_by_symbol=eff_bars_1d,
+                alpha_scores_by_symbol=eff_alpha,
+                conditional_events=conditional_events,
+                total_family_trials=eff_family_trials,
+                holding_horizon_sessions=eff_horizon_sess,
+            )
+
         evaluations: List[RegimeCandidateEvaluation] = []
         effective_trials = max(1, len(grid))
 
-        for raw_params in grid:
-            params = dict(raw_params)
-            reports: List[StressFalsificationReport] = []
-            plan_items_by_sym: Dict[str, PlanItemContract] = {}
-            raw_filled_trades = 0
-            resolved_collar_atr = default_limit_collar_atr_for_archetype(arch_id)
+        try:
+            for raw_params in grid:
+                params = dict(raw_params)
+                reports: List[StressFalsificationReport] = []
+                plan_items_by_sym: Dict[str, PlanItemContract] = {}
+                raw_filled_trades = 0
+                resolved_collar_atr = default_limit_collar_atr_for_archetype(arch_id)
 
-            for sym, sym_bars in bars_by_symbol.items():
-                plan_item, resolved_collar_atr = self._build_calibration_plan_item(
-                    symbol=sym,
-                    archetype_id=arch_id,
-                    params=params,
-                    bars=sym_bars,
-                )
-                plan_items_by_sym[sym] = plan_item
-                sym_raw_lows = (
-                    raw_low_by_symbol_ts_ns.get(sym)
-                    if raw_low_by_symbol_ts_ns is not None
-                    else None
-                )
-                report = self._falsifier.run_falsification(
-                    plan_item,
-                    bars=sym_bars,
-                    raw_low_by_ts_ns=sym_raw_lows,
-                    effective_trials=effective_trials,
-                )
-                reports.append(report)
-                raw_filled_trades += max(
-                    int(report.baseline_metrics.total_positions),
-                    int(report.baseline_metrics.filled_orders) // 2,
-                    1 if report.baseline_metrics.filled_orders > 0 else 0,
-                )
+                for sym, sym_bars in bars_by_symbol.items():
+                    sym_1d = eff_bars_1d.get(sym) if eff_bars_1d is not None else None
+                    plan_item, resolved_collar_atr = self._build_calibration_plan_item(
+                        symbol=sym,
+                        archetype_id=arch_id,
+                        params=params,
+                        bars=sym_bars,
+                        bars_1d=sym_1d,
+                    )
+                    plan_items_by_sym[sym] = plan_item
+                    sym_raw_lows = (
+                        raw_low_by_symbol_ts_ns.get(sym)
+                        if raw_low_by_symbol_ts_ns is not None
+                        else None
+                    )
+                    report = self._falsifier.run_falsification(
+                        plan_item,
+                        bars=sym_bars,
+                        raw_low_by_ts_ns=sym_raw_lows,
+                        effective_trials=effective_trials,
+                    )
+                    reports.append(report)
+                    raw_filled_trades += max(
+                        int(report.baseline_metrics.total_positions),
+                        int(report.baseline_metrics.filled_orders) // 2,
+                        1 if report.baseline_metrics.filled_orders > 0 else 0,
+                    )
 
-            eff_pooled_trades = int(raw_filled_trades)
-            failures, sharpes, dsrs, missed_rates, expectancies_r = self._evaluate_cell_reports(
-                sym_count=len(bars_by_symbol),
-                reports=reports,
-                plan_items_by_sym=plan_items_by_sym,
-            )
-
-            if eff_pooled_trades < self._min_pooled_sample_trades:
-                failures.append(
-                    f"Insufficient pooled_sample_trades={eff_pooled_trades} < {self._min_pooled_sample_trades}"
+                eff_pooled_trades = int(raw_filled_trades)
+                failures, sharpes, dsrs, missed_rates, expectancies_r = self._evaluate_cell_reports(
+                    sym_count=len(bars_by_symbol),
+                    reports=reports,
+                    plan_items_by_sym=plan_items_by_sym,
                 )
 
-            avg_missed_rate = (
-                statistics.fmean(missed_rates) if missed_rates else 1.0
-            )
-            if avg_missed_rate > self._max_missed_fill_rate + 1e-9:
-                failures.append(
-                    f"Pooled missed_fill_rate={avg_missed_rate:.4f} > {self._max_missed_fill_rate:.2f}"
+                if eff_pooled_trades < self._min_pooled_sample_trades:
+                    failures.append(
+                        f"Insufficient pooled_sample_trades={eff_pooled_trades} < {self._min_pooled_sample_trades}"
+                    )
+
+                avg_missed_rate = (
+                    statistics.fmean(missed_rates) if missed_rates else 1.0
                 )
+                if avg_missed_rate > self._max_missed_fill_rate + 1e-9:
+                    failures.append(
+                        f"Pooled missed_fill_rate={avg_missed_rate:.4f} > {self._max_missed_fill_rate:.2f}"
+                    )
 
-            avg_sharpe = statistics.fmean(sharpes) if sharpes else 0.0
-            avg_dsr = statistics.fmean(dsrs) if dsrs else 0.0
-            avg_expectancy_r = (
-                statistics.fmean(expectancies_r) if expectancies_r else 0.0
-            )
-            passed = len(failures) == 0
+                avg_sharpe = statistics.fmean(sharpes) if sharpes else 0.0
+                avg_dsr = statistics.fmean(dsrs) if dsrs else 0.0
+                avg_expectancy_r = (
+                    statistics.fmean(expectancies_r) if expectancies_r else 0.0
+                )
+                passed = len(failures) == 0
 
-            frozen_rec: Optional[FrozenRegimeParamRecord] = None
-            if passed:
-                frozen_rec = FrozenRegimeParamRecord(
-                    vol_bucket=vb,
-                    liq_bucket=lb,
-                    dominant_style=style_key,
-                    archetype_id=arch_id,
-                    bar_timeframe=str(params.get("bar_timeframe", "15m")),
-                    lookback_window=int(params.get("lookback_window", 20)),
-                    fast_window=int(params.get("fast_window", 5)),
-                    slow_window=int(params.get("slow_window", 15)),
-                    entry_quantile_threshold=Decimal(
-                        str(params.get("entry_quantile_threshold", "0.80"))
-                    ).quantize(Decimal("0.0001")),
-                    exit_quantile_threshold=Decimal(
-                        str(params.get("exit_quantile_threshold", "0.35"))
-                    ).quantize(Decimal("0.0001")),
-                    atr_stop_multiplier=Decimal(
-                        str(params.get("atr_stop_multiplier", "2.00"))
-                    ).quantize(Decimal("0.0001")),
-                    limit_collar_atr_mult=Decimal(str(resolved_collar_atr)).quantize(
-                        Decimal("0.0001")
-                    ),
-                    limit_collar_pct=Decimal(
-                        str(params.get("limit_collar_pct", "0.35"))
-                    ).quantize(Decimal("0.0001")),
-                    pooled_sample_trades=int(eff_pooled_trades),
-                    pooled_expectancy_r=Decimal(f"{avg_expectancy_r:.4f}"),
-                    pooled_sharpe=Decimal(f"{avg_sharpe:.4f}"),
-                    pooled_dsr=Decimal(f"{avg_dsr:.6f}"),
-                    stress_passed=True,
-                    stress_missed_fill_rate=Decimal(f"{avg_missed_rate:.4f}"),
-                    stress_report_json={
-                        "symbol_count": len(bars_by_symbol),
-                        "active_symbol_count": sum(
-                            1 for r in reports if r.baseline_metrics.filled_orders > 0
+                frozen_rec: Optional[FrozenRegimeParamRecord] = None
+                if passed:
+                    bar_tf = str(params.get("bar_timeframe", "15m"))
+                    rec_exec_spec = ExecutionSpec(bar_timeframe=bar_tf)
+                    frozen_rec = FrozenRegimeParamRecord(
+                        vol_bucket=vb,
+                        liq_bucket=lb,
+                        dominant_style=style_key,
+                        archetype_id=arch_id,
+                        bar_timeframe=bar_tf,
+                        lookback_window=int(params.get("lookback_window", 20)),
+                        fast_window=int(params.get("fast_window", 5)),
+                        slow_window=int(params.get("slow_window", 15)),
+                        entry_quantile_threshold=Decimal(
+                            str(params.get("entry_quantile_threshold", "0.80"))
+                        ).quantize(Decimal("0.0001")),
+                        exit_quantile_threshold=Decimal(
+                            str(params.get("exit_quantile_threshold", "0.35"))
+                        ).quantize(Decimal("0.0001")),
+                        atr_stop_multiplier=Decimal(
+                            str(params.get("atr_stop_multiplier", "2.00"))
+                        ).quantize(Decimal("0.0001")),
+                        limit_collar_atr_mult=Decimal(str(resolved_collar_atr)).quantize(
+                            Decimal("0.0001")
                         ),
-                        "bar_timeframe": str(params.get("bar_timeframe", "15m")),
-                        "reports": [r.to_dict() for r in reports],
-                    },
-                    calibrated_at=datetime.now(tz=timezone.utc),
-                )
+                        limit_collar_pct=Decimal(
+                            str(params.get("limit_collar_pct", _default_limit_collar_pct()))
+                        ).quantize(Decimal("0.0001")),
+                        pooled_sample_trades=int(eff_pooled_trades),
+                        pooled_expectancy_r=Decimal(f"{avg_expectancy_r:.4f}"),
+                        pooled_sharpe=Decimal(f"{avg_sharpe:.4f}"),
+                        pooled_dsr=Decimal(f"{avg_dsr:.6f}"),
+                        stress_passed=True,
+                        stress_missed_fill_rate=Decimal(f"{avg_missed_rate:.4f}"),
+                        stress_report_json={
+                            "symbol_count": len(bars_by_symbol),
+                            "active_symbol_count": sum(
+                                1 for r in reports if r.baseline_metrics.filled_orders > 0
+                            ),
+                            "bar_timeframe": bar_tf,
+                            "execution_spec": rec_exec_spec.to_dict(),
+                            "reports": [r.to_dict() for r in reports],
+                        },
+                        calibrated_at=datetime.now(tz=timezone.utc),
+                        execution_spec=rec_exec_spec,
+                    )
 
-            evaluations.append(
-                RegimeCandidateEvaluation(
-                    vol_bucket=vb,
-                    liq_bucket=lb,
-                    dominant_style=style_key,
-                    archetype_id=arch_id,
-                    params=params,
-                    passed=passed,
-                    pooled_sample_trades=eff_pooled_trades,
-                    pooled_sharpe=avg_sharpe,
-                    pooled_dsr=avg_dsr,
-                    stress_missed_fill_rate=avg_missed_rate,
-                    failure_reasons=tuple(failures),
-                    stress_reports=tuple(reports),
-                    frozen_record=frozen_rec,
+                evaluations.append(
+                    RegimeCandidateEvaluation(
+                        vol_bucket=vb,
+                        liq_bucket=lb,
+                        dominant_style=style_key,
+                        archetype_id=arch_id,
+                        params=params,
+                        passed=passed,
+                        pooled_sample_trades=eff_pooled_trades,
+                        pooled_sharpe=avg_sharpe,
+                        pooled_dsr=avg_dsr,
+                        stress_missed_fill_rate=avg_missed_rate,
+                        failure_reasons=tuple(failures),
+                        stress_reports=tuple(reports),
+                        frozen_record=frozen_rec,
+                    )
                 )
-            )
+        finally:
+            self._clear_runner_last_refs()
 
         survivors = [ev for ev in evaluations if ev.passed and ev.frozen_record is not None]
         survivors.sort(
@@ -1338,6 +2125,578 @@ class OfflineRegimePanelCalibrator:
             dominant_style=style_key,
             archetype_id=arch_id,
             selected_record=selected,
+            evaluated_candidates=tuple(evaluations),
+            persisted=persisted,
+        )
+
+    def _calibrate_cell_walk_forward_counterfactual(
+        self,
+        *,
+        vb: VolBucket,
+        lb: LiqBucket,
+        style_key: str,
+        arch_id: StrategyArchetypeId,
+        bars_by_symbol: Mapping[str, Sequence[Bar]],
+        grid: Sequence[Mapping[str, Any]],
+        raw_low_by_symbol_ts_ns: Optional[Mapping[str, Mapping[int, float]]],
+        persist: bool,
+        execution_spec_grid: Optional[Sequence[ExecutionSpec | Mapping[str, Any]]],
+        bars_1m_by_symbol: Optional[Mapping[str, Sequence[Bar]]],
+        bars_1d_by_symbol: Optional[Mapping[str, Sequence[Bar]]],
+        alpha_scores_by_symbol: Optional[Mapping[str, Sequence[Tuple[int, float]]]],
+        conditional_events: Optional[Sequence[ConditionalSwingEvent | Tuple[Any, ...]]],
+        total_family_trials: Optional[int],
+        holding_horizon_sessions: int,
+    ) -> RegimeCellCalibrationResult:
+        """Executes 3x2 Walk-Forward counterfactual calibration on conditional Top-K swing events vs `H_0`."""
+        bar_tf = str(grid[0].get("bar_timeframe", "15m")).strip() or "15m"
+        primary_step_ns = _TF_BAR_SPECS.get(bar_tf.lower(), _TF_BAR_SPECS["15m"])[2]
+
+        # Build separated primary (15m), dual-stream (15m+1m), and daily (1d) bars per symbol
+        primary_bars_map: Dict[str, List[Bar]] = {}
+        dual_bars_map: Dict[str, List[Bar]] = {}
+        daily_bars_map: Dict[str, List[Bar]] = {}
+
+        for sym, seq in bars_by_symbol.items():
+            norm_sym = str(sym).strip().upper().split(".", 1)[0]
+            all_b: List[Bar] = list(seq)
+            if bars_1m_by_symbol and norm_sym in bars_1m_by_symbol:
+                all_b.extend(bars_1m_by_symbol[norm_sym])
+            prim = [b for b in all_b if _bar_step_ns(b) == primary_step_ns]
+            if not prim:
+                prim = [b for b in seq if _bar_step_ns(b) != 60_000_000_000] or list(seq)
+            d_bars = [b for b in all_b if _bar_step_ns(b) == 86_400_000_000_000 and primary_step_ns != 86_400_000_000_000]
+            if bars_1d_by_symbol and norm_sym in bars_1d_by_symbol:
+                d_bars = list(bars_1d_by_symbol[norm_sym])
+            if d_bars:
+                daily_bars_map[norm_sym] = sorted(d_bars, key=lambda b: int(b.ts_init))
+            primary_bars_map[norm_sym] = sorted(prim, key=lambda b: int(b.ts_init))
+            dual_bars_map[norm_sym] = _sort_bars_deterministic(
+                [b for b in all_b if _bar_step_ns(b) in (primary_step_ns, 60_000_000_000)] or prim
+            )
+
+        # Normalize ExecutionSpec grid, always anchoring H0 = FIRST_WINDOW_IMMEDIATE x COLLARED_TWAP
+        h0_spec = ExecutionSpec(
+            trigger_policy=TriggerPolicy.FIRST_WINDOW_IMMEDIATE,
+            exec_algorithm=ExecAlgorithm.COLLARED_TWAP,
+            window_quantile=None,
+            bar_timeframe=bar_tf,
+        )
+        raw_exec_list: List[ExecutionSpec] = [h0_spec]
+        for es in (execution_spec_grid or DEFAULT_EXECUTION_SPEC_GRID):
+            norm_es = (
+                replace(es, bar_timeframe=bar_tf)
+                if isinstance(es, ExecutionSpec)
+                else ExecutionSpec.from_dict(es, default_bar_timeframe=bar_tf)
+            )
+            if norm_es not in raw_exec_list:
+                raw_exec_list.append(norm_es)
+
+        # Extract or normalize conditional Top-K swing events [tau, tau + h]
+        events: List[ConditionalSwingEvent] = []
+        if conditional_events is not None:
+            for item_ev in conditional_events:
+                if isinstance(item_ev, ConditionalSwingEvent):
+                    ev_sym = item_ev.symbol.strip().upper().split(".", 1)[0]
+                    if ev_sym in dual_bars_map and item_ev.end_ns >= item_ev.start_ns:
+                        events.append(replace(item_ev, symbol=ev_sym))
+                elif isinstance(item_ev, (tuple, list)):
+                    if len(item_ev) == 3:
+                        ev_sym = str(item_ev[0]).strip().upper().split(".", 1)[0]
+                        s_ns = _to_epoch_ns(item_ev[1], 0)
+                        e_ns = _to_epoch_ns(item_ev[2], 0)
+                        if ev_sym in dual_bars_map and e_ns >= s_ns > 0:
+                            events.append(
+                                ConditionalSwingEvent(
+                                    symbol=ev_sym,
+                                    start_ns=s_ns,
+                                    end_ns=e_ns,
+                                    horizon_sessions=max(1, int(holding_horizon_sessions)),
+                                )
+                            )
+                    elif len(item_ev) == 2:
+                        s_ns = _to_epoch_ns(item_ev[0], 0)
+                        e_ns = _to_epoch_ns(item_ev[1], 0)
+                        if e_ns >= s_ns > 0:
+                            for ev_sym in dual_bars_map:
+                                events.append(
+                                    ConditionalSwingEvent(
+                                        symbol=ev_sym,
+                                        start_ns=s_ns,
+                                        end_ns=e_ns,
+                                        horizon_sessions=max(1, int(holding_horizon_sessions)),
+                                    )
+                                )
+            events.sort(key=lambda e: (e.start_ns, e.symbol))
+        else:
+            max_lookback = max(int(cand.get("lookback_window", 20)) for cand in grid)
+            events = ConditionalSwingEventExtractor.extract_events(
+                primary_bars_by_symbol=primary_bars_map,
+                archetype_id=arch_id,
+                warmup_bars_min=max_lookback,
+                horizon_sessions=max(1, int(holding_horizon_sessions)),
+                alpha_scores_by_symbol=alpha_scores_by_symbol,
+                min_required_events=self._min_pooled_sample_trades,
+            )
+
+        if len(events) < self._min_pooled_sample_trades:
+            fail_reason = (
+                f"Insufficient conditional Top-K OOS events: {len(events)} < {self._min_pooled_sample_trades}"
+            )
+            ev_fail = RegimeCandidateEvaluation(
+                vol_bucket=vb,
+                liq_bucket=lb,
+                dominant_style=style_key,
+                archetype_id=arch_id,
+                params={**dict(grid[0]), "execution_spec": h0_spec.to_dict()},
+                passed=False,
+                pooled_sample_trades=len(events),
+                pooled_sharpe=0.0,
+                pooled_dsr=0.0,
+                stress_missed_fill_rate=1.0,
+                failure_reasons=(fail_reason,),
+                stress_reports=(),
+                frozen_record=None,
+                execution_spec=h0_spec,
+                oos_event_count=len(events),
+            )
+            if persist and self._param_table is not None and hasattr(self._param_table, "deactivate_cell"):
+                self._param_table.deactivate_cell(vb, lb, style_key)
+            return RegimeCellCalibrationResult(
+                vol_bucket=vb,
+                liq_bucket=lb,
+                dominant_style=style_key,
+                archetype_id=arch_id,
+                selected_record=None,
+                evaluated_candidates=(ev_fail,),
+                persisted=False,
+            )
+
+        # Anchored chronological Walk-Forward IS/OOS splits
+        n_total = len(events)
+        min_req = self._min_pooled_sample_trades
+        if n_total == min_req:
+            is_init = 0
+        else:
+            is_init = min(n_total - min_req, max(4, int(round(n_total * 0.30))))
+        oos_span = n_total - is_init
+        n_folds = min(4, max(2 if is_init == 0 else 1, oos_span // max(5, min_req // 4)))
+        fold_step = max(1, oos_span // n_folds)
+        fold_ranges: List[Tuple[int, int]] = []
+        for f_idx in range(n_folds):
+            f_start = is_init + f_idx * fold_step
+            f_end = n_total if f_idx == n_folds - 1 else min(n_total, is_init + (f_idx + 1) * fold_step)
+            if f_start < f_end:
+                fold_ranges.append((f_start, f_end))
+
+        eff_family_trials = max(
+            int(total_family_trials or 0),
+            TOTAL_3X2_REGIME_CELLS * len(grid) * len(raw_exec_list),
+            len(grid) * len(raw_exec_list),
+        )
+
+        def _spec_key(es: ExecutionSpec) -> Tuple[str, str, Optional[str], str]:
+            return (
+                es.trigger_policy.value,
+                es.exec_algorithm.value,
+                str(es.window_quantile) if es.window_quantile is not None else None,
+                es.bar_timeframe,
+            )
+
+        def _run_single_event(
+            ev: ConditionalSwingEvent,
+            params_dict: Mapping[str, Any],
+            es: ExecutionSpec,
+        ) -> Tuple[PlanItemContract, float, bool]:
+            sym_dual = dual_bars_map[ev.symbol]
+            sym_prim = primary_bars_map[ev.symbol]
+            sym_1d = daily_bars_map.get(ev.symbol)
+            sym_raw_low = (
+                raw_low_by_symbol_ts_ns.get(ev.symbol)
+                if raw_low_by_symbol_ts_ns is not None
+                else None
+            )
+            base_item, _ = self._build_calibration_plan_item(
+                symbol=ev.symbol,
+                archetype_id=arch_id,
+                params=params_dict,
+                bars=sym_prim,
+                bars_1d=sym_1d,
+                execution_spec=es,
+                cutoff_ts_ns=max(0, int(ev.start_ns) - 1),
+            )
+            win_valid_dt = datetime.fromtimestamp(
+                ev.end_ns / 1_000_000_000.0, tz=timezone.utc
+            ) + timedelta(days=1)
+            win_item = replace(
+                base_item,
+                risk_envelope=replace(base_item.risk_envelope, valid_until=win_valid_dt),
+            )
+            max_warmup_prim = max(int(win_item.strategy_config.lookback_window) * 3, 120)
+            pre_prim = [b for b in sym_prim if int(b.ts_init) < ev.start_ns]
+            if len(pre_prim) > max_warmup_prim:
+                cutoff_warm_ns = int(pre_prim[-max_warmup_prim].ts_init)
+                warmup_prim = [b for b in pre_prim if int(b.ts_init) >= cutoff_warm_ns]
+            else:
+                warmup_prim = pre_prim
+            ev_start_date = CausalMarketMicrostructureEstimator._ny_date_from_ns(ev.start_ns)
+            same_day_pre_1m = [
+                b
+                for b in sym_dual
+                if _bar_step_ns(b) == 60_000_000_000
+                and int(b.ts_init) < ev.start_ns
+                and CausalMarketMicrostructureEstimator._ny_date_from_ns(int(b.ts_init)) == ev_start_date
+            ]
+            warmup_slice = _sort_bars_deterministic(warmup_prim + same_day_pre_1m)
+            window_slice = [
+                b for b in sym_dual if ev.start_ns <= int(b.ts_init) <= ev.end_ns
+            ]
+            if not any(_bar_step_ns(b) == primary_step_ns for b in window_slice):
+                return win_item, 0.0, False
+            m = self._runner.run_backtest(
+                win_item,
+                bars=window_slice,
+                warmup_bars=warmup_slice,
+                raw_low_by_ts_ns=sym_raw_low,
+                effective_trials=eff_family_trials,
+            )
+            filled = m.filled_orders > 0
+            budget = max(1.0, float(win_item.risk_envelope.max_risk_budget_usd))
+            r_val = (float(m.net_pnl_usd) / budget) if filled else 0.0
+            return win_item, r_val, filled
+
+        oos_events_all: List[ConditionalSwingEvent] = []
+        oos_r_by_spec: Dict[Tuple[str, str, Optional[str], str], List[float]] = {
+            _spec_key(es): [] for es in raw_exec_list
+        }
+        oos_filled_by_spec: Dict[Tuple[str, str, Optional[str], str], List[bool]] = {
+            _spec_key(es): [] for es in raw_exec_list
+        }
+        oos_items_by_spec: Dict[Tuple[str, str, Optional[str], str], List[PlanItemContract]] = {
+            _spec_key(es): [] for es in raw_exec_list
+        }
+        fold_selected_params: List[Dict[str, Any]] = []
+
+        try:
+            for f_start, f_end in fold_ranges:
+                is_events = events[:f_start]
+                oos_events = events[f_start:f_end]
+
+                # Screen indicator parameter grid strictly on In-Sample events
+                best_params = dict(grid[0])
+                if is_events and len(grid) > 1:
+                    is_sample = is_events[-min(len(is_events), 12) :]
+                    best_is_score: Optional[Tuple[float, float]] = None
+                    for cand_p in grid:
+                        cand_dict = dict(cand_p)
+                        is_rs = [_run_single_event(ev, cand_dict, h0_spec)[1] for ev in is_sample]
+                        m_is = statistics.fmean(is_rs) if is_rs else 0.0
+                        s_is = statistics.stdev(is_rs) if len(is_rs) >= 2 else 0.0
+                        sh_is = (m_is / s_is) if s_is > 1e-12 else 0.0
+                        sc_tuple = (m_is, sh_is)
+                        if best_is_score is None or sc_tuple > best_is_score:
+                            best_is_score = sc_tuple
+                            best_params = cand_dict
+                fold_selected_params.append(best_params)
+
+                # Evaluate H0 and all candidate ExecutionSpecs strictly Out-Of-Sample
+                for ev in oos_events:
+                    oos_events_all.append(ev)
+                    for es in raw_exec_list:
+                        s_key = _spec_key(es)
+                        w_item, r_val, filled = _run_single_event(ev, best_params, es)
+                        oos_r_by_spec[s_key].append(r_val)
+                        oos_filled_by_spec[s_key].append(filled)
+                        oos_items_by_spec[s_key].append(w_item)
+
+            n_oos = len(oos_events_all)
+            h_lags = max(
+                1,
+                int(round(statistics.fmean([e.horizon_sessions for e in oos_events_all])))
+                if oos_events_all
+                else 1,
+            )
+            h0_key = _spec_key(h0_spec)
+            h0_rs = oos_r_by_spec[h0_key]
+
+            p_values_by_spec_name: Dict[str, float] = {}
+            delta_series_by_spec_name: Dict[str, List[float]] = {}
+            stats_by_spec_key: Dict[Tuple[str, str, Optional[str], str], Dict[str, Any]] = {}
+
+            for es in raw_exec_list:
+                s_key = _spec_key(es)
+                s_name = (
+                    f"{es.trigger_policy.value}:{es.exec_algorithm.value}"
+                    f":{es.window_quantile if es.window_quantile is not None else 'NONE'}"
+                )
+                pi_rs = oos_r_by_spec[s_key]
+                pi_fills = oos_filled_by_spec[s_key]
+                deltas = [pi_rs[i] - h0_rs[i] for i in range(n_oos)]
+                mean_delta = statistics.fmean(deltas) if deltas else 0.0
+                if s_key != h0_key:
+                    t_nw = compute_newey_west_t_stat(deltas, horizon_bars=h_lags)
+                    p_val = max(0.0, min(1.0, 1.0 - _normal_cdf(t_nw)))
+                    p_values_by_spec_name[s_name] = p_val
+                    delta_series_by_spec_name[s_name] = deltas
+                else:
+                    t_nw = 0.0
+                    p_val = 1.0
+                mean_r = statistics.fmean(pi_rs) if pi_rs else 0.0
+                std_r = statistics.stdev(pi_rs) if len(pi_rs) >= 2 else 0.0
+                sharpe_r = (
+                    (mean_r / std_r) * math.sqrt(252.0 / float(h_lags))
+                    if std_r > 1e-12
+                    else 0.0
+                )
+                dsr_r = compute_per_period_deflated_sharpe_ratio(
+                    pi_rs,
+                    effective_trials=eff_family_trials,
+                )
+                missed_rate = (
+                    1.0 - (sum(1 for fl in pi_fills if fl) / float(n_oos))
+                    if n_oos > 0
+                    else 1.0
+                )
+                stats_by_spec_key[s_key] = {
+                    "spec": es,
+                    "spec_name": s_name,
+                    "mean_r": mean_r,
+                    "sharpe_r": sharpe_r,
+                    "dsr_r": dsr_r,
+                    "mean_delta_r": mean_delta,
+                    "t_nw": t_nw,
+                    "p_val": p_val,
+                    "missed_rate": missed_rate,
+                }
+
+            by_fdr_results = (
+                apply_benjamini_yekutieli_fdr_gate(
+                    p_values_by_spec_name,
+                    q=MAX_BY_FDR_Q,
+                    total_family_trials=eff_family_trials,
+                    candidate_series_map=delta_series_by_spec_name,
+                )
+                if p_values_by_spec_name
+                else {}
+            )
+
+            rep_params = fold_selected_params[-1] if fold_selected_params else dict(grid[0])
+            collar_atr_val = Decimal(
+                str(
+                    rep_params.get(
+                        "limit_collar_atr_mult",
+                        default_limit_collar_atr_for_archetype(arch_id),
+                    )
+                )
+            ).quantize(Decimal("0.0001"))
+            collar_pct_val = Decimal(
+                str(rep_params.get("limit_collar_pct", _default_limit_collar_pct()))
+            ).quantize(Decimal("0.0001"))
+
+            def _run_conditional_stress_for_spec(es: ExecutionSpec) -> StressFalsificationReport:
+                s_key = _spec_key(es)
+                return self._falsifier.run_conditional_swing_falsification(
+                    symbol=oos_events_all[0].symbol,
+                    bars_by_symbol=dual_bars_map,
+                    conditional_event_windows=[
+                        (e.symbol, e.start_ns, e.end_ns) for e in oos_events_all
+                    ],
+                    plan_items_by_window=oos_items_by_spec[s_key],
+                    execution_spec=es,
+                    raw_low_by_symbol_ts_ns=raw_low_by_symbol_ts_ns,
+                    effective_trials=eff_family_trials,
+                )
+
+            # Identify statistically significant non-H0 timing candidates
+            qualifying_non_h0: List[Dict[str, Any]] = []
+            for es in raw_exec_list:
+                s_key = _spec_key(es)
+                st = stats_by_spec_key[s_key]
+                by_passed, by_q = by_fdr_results.get(st["spec_name"], (False, 1.0))
+                st["by_passed"] = bool(by_passed)
+                st["by_q"] = float(by_q)
+                if s_key == h0_key:
+                    st["by_passed"] = True
+                    st["by_q"] = 1.0
+                    continue
+                if (
+                    n_oos >= self._min_pooled_sample_trades
+                    and st["mean_r"] > 0.0
+                    and st["mean_delta_r"] > 0.0
+                    and st["t_nw"] >= ONE_SIDED_ALPHA_005_CRITICAL_T
+                    and st["by_passed"]
+                    and st["missed_rate"] <= self._max_missed_fill_rate + 1e-9
+                ):
+                    qualifying_non_h0.append(st)
+
+            qualifying_non_h0.sort(
+                key=lambda s: (s["dsr_r"], s["mean_delta_r"], s["t_nw"]),
+                reverse=True,
+            )
+
+            chosen_stat: Optional[Dict[str, Any]] = None
+            chosen_stress_report: Optional[StressFalsificationReport] = None
+            stress_reports_by_key: Dict[Tuple[str, str, Optional[str], str], StressFalsificationReport] = {}
+
+            for cand_st in qualifying_non_h0:
+                es = cand_st["spec"]
+                s_key = _spec_key(es)
+                rep = _run_conditional_stress_for_spec(es)
+                stress_reports_by_key[s_key] = rep
+                rep_missed = (
+                    float(rep.limit_collar_missed_fill_result.observed_value)
+                    if rep.limit_collar_missed_fill_result is not None
+                    else cand_st["missed_rate"]
+                )
+                if rep.passed and rep_missed <= self._max_missed_fill_rate + 1e-9:
+                    chosen_stat = cand_st
+                    chosen_stress_report = rep
+                    break
+
+            # Fallback to H0 if no intraday timing policy beat H0 significantly and passed stress
+            if chosen_stat is None:
+                h0_st = stats_by_spec_key[h0_key]
+                h0_rep = _run_conditional_stress_for_spec(h0_spec)
+                stress_reports_by_key[h0_key] = h0_rep
+                h0_rep_missed = (
+                    float(h0_rep.limit_collar_missed_fill_result.observed_value)
+                    if h0_rep.limit_collar_missed_fill_result is not None
+                    else h0_st["missed_rate"]
+                )
+                if (
+                    h0_rep.passed
+                    and n_oos >= self._min_pooled_sample_trades
+                    and h0_st["mean_r"] > 0.0
+                    and h0_rep_missed <= self._max_missed_fill_rate + 1e-9
+                ):
+                    chosen_stat = h0_st
+                    chosen_stress_report = h0_rep
+
+            evaluations: List[RegimeCandidateEvaluation] = []
+            selected_record: Optional[FrozenRegimeParamRecord] = None
+            for es in raw_exec_list:
+                s_key = _spec_key(es)
+                st = stats_by_spec_key[s_key]
+                rep = stress_reports_by_key.get(s_key)
+                is_chosen = chosen_stat is not None and _spec_key(chosen_stat["spec"]) == s_key
+                eff_missed = (
+                    float(rep.limit_collar_missed_fill_result.observed_value)
+                    if rep is not None and rep.limit_collar_missed_fill_result is not None
+                    else float(st["missed_rate"])
+                )
+                fail_list: List[str] = []
+                if n_oos < self._min_pooled_sample_trades:
+                    fail_list.append(
+                        f"Insufficient OOS events={n_oos} < {self._min_pooled_sample_trades}"
+                    )
+                if st["mean_r"] <= 0.0:
+                    fail_list.append(f"Non-positive OOS mean_r={st['mean_r']:.4f}")
+                if s_key != h0_key:
+                    if st["mean_delta_r"] <= 0.0:
+                        fail_list.append(f"delta_vs_H0={st['mean_delta_r']:.4f} <= 0.0")
+                    if st["t_nw"] < ONE_SIDED_ALPHA_005_CRITICAL_T:
+                        fail_list.append(
+                            f"t_NW={st['t_nw']:.3f} < {ONE_SIDED_ALPHA_005_CRITICAL_T:.3f}"
+                        )
+                    if not st["by_passed"]:
+                        fail_list.append(f"BY-FDR q={st['by_q']:.4f} > {MAX_BY_FDR_Q:.2f}")
+                if eff_missed > self._max_missed_fill_rate + 1e-9:
+                    fail_list.append(
+                        f"missed_fill_rate={eff_missed:.4f} > {self._max_missed_fill_rate:.2f}"
+                    )
+                if rep is not None and not rep.passed:
+                    fail_list.extend(rep.failure_reasons)
+
+                frozen_rec: Optional[FrozenRegimeParamRecord] = None
+                if is_chosen and chosen_stress_report is not None:
+                    frozen_rec = FrozenRegimeParamRecord(
+                        vol_bucket=vb,
+                        liq_bucket=lb,
+                        dominant_style=style_key,
+                        archetype_id=arch_id,
+                        bar_timeframe=bar_tf,
+                        lookback_window=int(rep_params.get("lookback_window", 20)),
+                        fast_window=int(rep_params.get("fast_window", 5)),
+                        slow_window=int(rep_params.get("slow_window", 15)),
+                        entry_quantile_threshold=Decimal(
+                            str(rep_params.get("entry_quantile_threshold", "0.80"))
+                        ).quantize(Decimal("0.0001")),
+                        exit_quantile_threshold=Decimal(
+                            str(rep_params.get("exit_quantile_threshold", "0.35"))
+                        ).quantize(Decimal("0.0001")),
+                        atr_stop_multiplier=Decimal(
+                            str(rep_params.get("atr_stop_multiplier", "2.00"))
+                        ).quantize(Decimal("0.0001")),
+                        limit_collar_atr_mult=collar_atr_val,
+                        limit_collar_pct=collar_pct_val,
+                        pooled_sample_trades=int(n_oos),
+                        pooled_expectancy_r=Decimal(f"{st['mean_r']:.4f}"),
+                        pooled_sharpe=Decimal(f"{st['sharpe_r']:.4f}"),
+                        pooled_dsr=Decimal(f"{st['dsr_r']:.6f}"),
+                        stress_passed=True,
+                        stress_missed_fill_rate=Decimal(f"{eff_missed:.4f}"),
+                        stress_report_json={
+                            "symbol_count": len(bars_by_symbol),
+                            "active_symbol_count": sum(
+                                1 for fl in oos_filled_by_spec[s_key] if fl
+                            ),
+                            "bar_timeframe": bar_tf,
+                            "execution_spec": es.to_dict(),
+                            "h0_paired_delta_r": round(float(st["mean_delta_r"]), 6),
+                            "h0_paired_nw_t_stat": round(float(st["t_nw"]), 6),
+                            "by_fdr_q_value": round(float(st["by_q"]), 6),
+                            "oos_event_count": int(n_oos),
+                            "effective_trials": int(eff_family_trials),
+                            "reports": [chosen_stress_report.to_dict()],
+                        },
+                        calibrated_at=datetime.now(tz=timezone.utc),
+                        execution_spec=es,
+                        h0_paired_delta_r=float(st["mean_delta_r"]),
+                        h0_paired_nw_t_stat=float(st["t_nw"]),
+                        by_fdr_q_value=float(st["by_q"]),
+                        oos_event_count=int(n_oos),
+                    )
+                    selected_record = frozen_rec
+
+                evaluations.append(
+                    RegimeCandidateEvaluation(
+                        vol_bucket=vb,
+                        liq_bucket=lb,
+                        dominant_style=style_key,
+                        archetype_id=arch_id,
+                        params={**dict(rep_params), "execution_spec": es.to_dict()},
+                        passed=is_chosen,
+                        pooled_sample_trades=int(n_oos),
+                        pooled_sharpe=float(st["sharpe_r"]),
+                        pooled_dsr=float(st["dsr_r"]),
+                        stress_missed_fill_rate=eff_missed,
+                        failure_reasons=tuple(fail_list) if not is_chosen else (),
+                        stress_reports=(rep,) if rep is not None else (),
+                        frozen_record=frozen_rec,
+                        execution_spec=es,
+                        h0_paired_delta_r=float(st["mean_delta_r"]),
+                        h0_paired_nw_t_stat=float(st["t_nw"]),
+                        by_fdr_q_value=float(st["by_q"]),
+                        oos_event_count=int(n_oos),
+                    )
+                )
+        finally:
+            self._clear_runner_last_refs()
+
+        persisted = False
+        if persist and self._param_table is not None:
+            if selected_record is not None:
+                self._param_table.upsert_record(selected_record)
+                persisted = True
+            elif hasattr(self._param_table, "deactivate_cell"):
+                self._param_table.deactivate_cell(vb, lb, style_key)
+
+        return RegimeCellCalibrationResult(
+            vol_bucket=vb,
+            liq_bucket=lb,
+            dominant_style=style_key,
+            archetype_id=arch_id,
+            selected_record=selected_record,
             evaluated_candidates=tuple(evaluations),
             persisted=persisted,
         )
@@ -1531,7 +2890,93 @@ class OfflineRegimePanelCalibrator:
                 ):
                     self._param_table.deactivate_cell(vb, lb, arch_id)
 
-    def calibrate_from_panel_matrices(
+    def _build_symbol_bars_from_matrices(
+        self,
+        *,
+        panel_matrices: Mapping[str, Any],
+        symbols: Sequence[str],
+        timestamps: Sequence[Any],
+        target_symbols: Sequence[str],
+        bar_timeframe: str,
+        max_bars: Optional[int] = None,
+    ) -> Tuple[Dict[str, List[Bar]], Dict[str, Dict[int, float]]]:
+        import numpy as np
+
+        tf_norm = str(bar_timeframe or "15m").strip().lower()
+        if tf_norm not in _TF_BAR_SPECS or "close" not in panel_matrices:
+            return {}, {}
+        bar_spec_str, _, step_ns = _TF_BAR_SPECS[tf_norm]
+        closes_full = np.asarray(panel_matrices["close"], dtype=np.float64)
+        if closes_full.ndim != 2 or closes_full.shape[0] == 0 or closes_full.shape[1] == 0:
+            return {}, {}
+        t_len, n_sym = closes_full.shape
+        bar_slice = min(t_len, len(timestamps))
+        if max_bars is not None and int(max_bars) > 0:
+            bar_slice = min(bar_slice, int(max_bars))
+        if bar_slice <= 0:
+            return {}, {}
+
+        closes = closes_full[-bar_slice:]
+        opens = np.asarray(panel_matrices.get("open", closes_full), dtype=np.float64)[-bar_slice:]
+        highs = np.asarray(panel_matrices.get("high", closes_full), dtype=np.float64)[-bar_slice:]
+        lows = np.asarray(panel_matrices.get("low", closes_full), dtype=np.float64)[-bar_slice:]
+        volumes = np.asarray(panel_matrices.get("volume", np.ones_like(closes_full)), dtype=np.float64)[-bar_slice:]
+        raw_lows_mat = panel_matrices.get("raw_low")
+        raw_lows = (
+            np.asarray(raw_lows_mat, dtype=np.float64)[-bar_slice:]
+            if raw_lows_mat is not None
+            else lows
+        )
+
+        sym_to_col: Dict[str, int] = {}
+        for idx, s in enumerate(symbols[:n_sym]):
+            norm_s = str(s).strip().upper().split(".", 1)[0]
+            if norm_s and norm_s not in sym_to_col:
+                sym_to_col[norm_s] = idx
+
+        ts_ns_arr = _build_monotonic_ts_ns(list(timestamps)[-bar_slice:], step_ns=step_ns)
+        bars_out: Dict[str, List[Bar]] = {}
+        raw_low_out: Dict[str, Dict[int, float]] = {}
+
+        for sym in target_symbols:
+            norm_s = str(sym).strip().upper().split(".", 1)[0]
+            j = sym_to_col.get(norm_s)
+            if j is None:
+                continue
+            bt = BarType.from_str(f"{norm_s}.{self._venue_name}-{bar_spec_str}")
+            sym_bar_list: List[Bar] = []
+            sym_raw_low_map: Dict[int, float] = {}
+            for t_idx in range(bar_slice):
+                c_px = float(closes[t_idx, j])
+                if not np.isfinite(c_px) or c_px <= 0.0:
+                    continue
+                px_tick = float(rule_612_tick_size(Decimal(f"{c_px:.6f}")))
+                px_prec = 4 if px_tick < float(PENNY_TICK_RULE_612) else 2
+                o_px = float(opens[t_idx, j]) if np.isfinite(opens[t_idx, j]) else c_px
+                h_px = max(o_px, c_px, float(highs[t_idx, j]) if np.isfinite(highs[t_idx, j]) else c_px)
+                l_px = max(px_tick, min(o_px, c_px, float(lows[t_idx, j]) if np.isfinite(lows[t_idx, j]) else c_px))
+                v_qty = max(1, int(round(float(volumes[t_idx, j])))) if np.isfinite(volumes[t_idx, j]) else 100
+                ts_ns = ts_ns_arr[t_idx]
+                sym_bar_list.append(
+                    Bar(
+                        bar_type=bt,
+                        open=Price(o_px, px_prec),
+                        high=Price(h_px, px_prec),
+                        low=Price(l_px, px_prec),
+                        close=Price(c_px, px_prec),
+                        volume=Quantity.from_int(v_qty),
+                        ts_event=ts_ns,
+                        ts_init=ts_ns,
+                    )
+                )
+                r_lo = float(raw_lows[t_idx, j]) if np.isfinite(raw_lows[t_idx, j]) else l_px
+                sym_raw_low_map[ts_ns] = min(l_px, max(px_tick, r_lo))
+            if sym_bar_list:
+                bars_out[norm_s] = sym_bar_list
+                raw_low_out[norm_s] = sym_raw_low_map
+        return bars_out, raw_low_out
+
+    def _partition_panel_bucket_candidates(
         self,
         panel_matrices: Mapping[str, Any],
         symbols: Sequence[str],
@@ -1539,13 +2984,24 @@ class OfflineRegimePanelCalibrator:
         *,
         bar_timeframe: str = "15m",
         sector_map: Optional[Mapping[str, str]] = None,
-        max_symbols_per_bucket: int = 16,
         max_bars: int = 520,
-        persist: bool = True,
-    ) -> int:
-        """Partitions a 2D panel `(T, N)` into 3x2 `(VolBucket, LiqBucket)` buckets and calibrates frozen parameters."""
+    ) -> Optional[
+        Tuple[
+            Dict[Tuple[VolBucket, LiqBucket], List[Tuple[int, str, float, float, str]]],
+            int,
+            str,
+            int,
+            Any,
+            Any,
+            Any,
+            Any,
+            Any,
+            Any,
+        ]
+    ]:
+        """Classify eligible panel columns into `3x2` `(VolBucket, LiqBucket)` candidate lists."""
         if not symbols or not timestamps or "close" not in panel_matrices:
-            return 0
+            return None
         import warnings
         import numpy as np
 
@@ -1554,7 +3010,7 @@ class OfflineRegimePanelCalibrator:
 
         closes_full = np.asarray(panel_matrices["close"], dtype=np.float64)
         if closes_full.ndim != 2 or closes_full.shape[0] < 30 or closes_full.shape[1] == 0:
-            return 0
+            return None
         tf_norm = str(bar_timeframe or "15m").strip().lower()
         if tf_norm not in _TF_BAR_SPECS:
             raise ValueError(f"Unsupported bar_timeframe {bar_timeframe!r}; expected one of {sorted(_TF_BAR_SPECS)}")
@@ -1563,7 +3019,7 @@ class OfflineRegimePanelCalibrator:
         t_len, n_sym = closes_full.shape
         bar_slice = min(t_len, len(timestamps), max(30, int(max_bars)))
         if bar_slice < 30:
-            return 0
+            return None
         hist_slice = min(t_len, 252 * bars_per_day)
 
         raw_c_hist = closes_full[-hist_slice:]
@@ -1590,7 +3046,7 @@ class OfflineRegimePanelCalibrator:
             np.where(
                 valid_counts > 1,
                 (less_or_eq_counts - 1.0) / np.maximum(valid_counts - 1.0, 1.0),
-                0.5,
+                LIQ_BUCKET_MEDIAN_QUANTILE,
             ),
             0.0,
             1.0,
@@ -1615,9 +3071,7 @@ class OfflineRegimePanelCalibrator:
             dtype=np.int64,
         )
         if eligible_indices.size == 0:
-            if persist:
-                self._deactivate_all_cells(all_vol_buckets, all_liq_buckets)
-            return 0
+            return ({}, bar_slice, bar_spec_str, step_ns, closes, opens, highs, lows, volumes, raw_lows)
 
         adv_win = min(bar_slice, 60 * bars_per_day)
         spread_win = min(bar_slice, 14 * bars_per_day)
@@ -1654,7 +3108,23 @@ class OfflineRegimePanelCalibrator:
         adv_ranks = _rank_eligible(adv_60)
         spread_ranks = _rank_eligible(rel_spread)
 
-        apply_micro_floor = int(eligible_indices.size) >= 40
+        min_universe_for_micro = TOTAL_3X2_REGIME_CELLS * 2
+        apply_micro_floor = int(eligible_indices.size) >= min_universe_for_micro
+        liq_floor_quantile = 1.0 / float(len(all_vol_buckets) + len(all_liq_buckets))
+        sys_collar_bps_cap = float(SystemConfig().execution.limit_collar_pct) * 100.0
+        elig_tick_bps: List[float] = []
+        for j_np in eligible_indices:
+            med_px = float(median_closes[int(j_np)])
+            if math.isfinite(med_px) and med_px >= MIN_TRADABLE_STOCK_PRICE_USD:
+                tick_sz = float(rule_612_tick_size(Decimal(f"{med_px:.6f}")))
+                elig_tick_bps.append((tick_sz / med_px) * 10_000.0)
+        emp_tick_p95 = (
+            float(np.quantile(np.asarray(elig_tick_bps, dtype=np.float64), 0.95))
+            if elig_tick_bps
+            else sys_collar_bps_cap
+        )
+        max_tick_spread_bps = min(emp_tick_p95, sys_collar_bps_cap)
+
         eligible_syms = [norm_syms[int(j)] for j in eligible_indices]
         if sector_map is not None:
             eff_sector_map = {
@@ -1668,10 +3138,13 @@ class OfflineRegimePanelCalibrator:
         for j_np in eligible_indices:
             j = int(j_np)
             sym = norm_syms[j]
+            med_px = float(median_closes[j])
+            if not math.isfinite(med_px) or med_px < MIN_TRADABLE_STOCK_PRICE_USD:
+                continue
             if apply_micro_floor:
-                med_px = float(median_closes[j])
-                tick_bps = (MIN_EQUITY_TICK_USD / med_px * 10_000.0) if (math.isfinite(med_px) and med_px > 0.0) else float("inf")
-                if tick_bps > 20.0 or float(adv_ranks[j]) < 0.20:
+                tick_sz = float(rule_612_tick_size(Decimal(f"{med_px:.6f}")))
+                tick_bps = (tick_sz / med_px) * 10_000.0
+                if tick_bps > max_tick_spread_bps or float(adv_ranks[j]) < liq_floor_quantile:
                     continue
             comp_vol_q = compute_composite_vol_quantile(float(hist_vol_q[j]), float(vol_ranks[j]))
             vb = classify_vol_bucket(comp_vol_q)
@@ -1683,12 +3156,126 @@ class OfflineRegimePanelCalibrator:
             candidates_by_cell.setdefault((vb, lb), []).append(
                 (j, sym, comp_vol_q, float(adv_ranks[j]), sector)
             )
+        return (
+            candidates_by_cell,
+            bar_slice,
+            bar_spec_str,
+            step_ns,
+            closes,
+            opens,
+            highs,
+            lows,
+            volumes,
+            raw_lows,
+        )
+
+    def select_stratified_bucket_symbols(
+        self,
+        panel_matrices: Mapping[str, Any],
+        symbols: Sequence[str],
+        timestamps: Sequence[Any],
+        *,
+        bar_timeframe: str = "15m",
+        sector_map: Optional[Mapping[str, str]] = None,
+        max_symbols_per_bucket: int = 16,
+        max_bars: int = 520,
+    ) -> List[str]:
+        """Return the exact sorted list of sector-stratified symbols selected across all 3x2 regime buckets."""
+        partitioned = self._partition_panel_bucket_candidates(
+            panel_matrices,
+            symbols,
+            timestamps,
+            bar_timeframe=bar_timeframe,
+            sector_map=sector_map,
+            max_bars=max_bars,
+        )
+        if partitioned is None:
+            return []
+        candidates_by_cell = partitioned[0]
+        selected: set[str] = set()
+        cap = max(1, int(max_symbols_per_bucket))
+        for cell_cands in candidates_by_cell.values():
+            for _j, sym in _select_sector_stratified_candidates(cell_cands, cap):
+                selected.add(sym)
+        return sorted(selected)
+
+    def calibrate_from_panel_matrices(
+        self,
+        panel_matrices: Mapping[str, Any],
+        symbols: Sequence[str],
+        timestamps: Sequence[Any],
+        *,
+        bar_timeframe: str = "15m",
+        sector_map: Optional[Mapping[str, str]] = None,
+        max_symbols_per_bucket: int = 16,
+        max_bars: int = 520,
+        persist: bool = True,
+        panel_matrices_1m: Optional[Mapping[str, Any]] = None,
+        timestamps_1m: Optional[Sequence[Any]] = None,
+        symbols_1m: Optional[Sequence[str]] = None,
+        panel_matrices_1d: Optional[Mapping[str, Any]] = None,
+        timestamps_1d: Optional[Sequence[Any]] = None,
+        symbols_1d: Optional[Sequence[str]] = None,
+        alpha_scores: Optional[Any] = None,
+        holding_horizon_sessions: int = DEFAULT_SWING_HORIZON_SESSIONS,
+        only_cells: Optional[Sequence[Tuple[Any, Any, Any]]] = None,
+        on_cell_complete: Optional[Callable[[Any], None]] = None,
+    ) -> int:
+        """Partitions a 2D panel `(T, N)` into 3x2 `(VolBucket, LiqBucket)` buckets and calibrates frozen parameters."""
+        import numpy as np
+
+        all_vol_buckets = (VolBucket.LOW_VOL, VolBucket.MID_VOL, VolBucket.HIGH_VOL)
+        all_liq_buckets = (LiqBucket.HIGH_LIQ_TIGHT_SPREAD, LiqBucket.LOW_LIQ_WIDE_SPREAD)
+        tf_norm = str(bar_timeframe or "15m").strip().lower()
+        partitioned = self._partition_panel_bucket_candidates(
+            panel_matrices,
+            symbols,
+            timestamps,
+            bar_timeframe=bar_timeframe,
+            sector_map=sector_map,
+            max_bars=max_bars,
+        )
+        if partitioned is None:
+            return 0
+        (
+            candidates_by_cell,
+            bar_slice,
+            bar_spec_str,
+            step_ns,
+            closes,
+            opens,
+            highs,
+            lows,
+            volumes,
+            raw_lows,
+        ) = partitioned
+        if not candidates_by_cell:
+            if persist:
+                self._deactivate_all_cells(all_vol_buckets, all_liq_buckets)
+            return 0
+
+        allowed_cells: Optional[set[Tuple[VolBucket, LiqBucket, StrategyArchetypeId]]] = None
+        allowed_buckets: Optional[set[Tuple[VolBucket, LiqBucket]]] = None
+        if only_cells is not None:
+            allowed_cells = set()
+            allowed_buckets = set()
+            for raw_vb, raw_lb, raw_arch in only_cells:
+                c_vb = raw_vb if isinstance(raw_vb, VolBucket) else VolBucket(str(raw_vb).strip().upper())
+                c_lb = raw_lb if isinstance(raw_lb, LiqBucket) else LiqBucket(str(raw_lb).strip().upper())
+                c_arch = resolve_archetype_for_dominant_style(raw_arch)
+                allowed_cells.add((c_vb, c_lb, c_arch))
+                allowed_buckets.add((c_vb, c_lb))
+            if not allowed_cells:
+                return 0
 
         ts_ns_arr = _build_monotonic_ts_ns(list(timestamps)[-bar_slice:], step_ns=step_ns)
         bucket_bars: Dict[Tuple[VolBucket, LiqBucket], Dict[str, List[Bar]]] = {}
         raw_low_by_sym: Dict[str, Dict[int, float]] = {}
+        selected_syms_set: set[str] = set()
 
         for (vb, lb), cell_cands in candidates_by_cell.items():
+            if allowed_buckets is not None and (vb, lb) not in allowed_buckets:
+                continue
             chosen = _select_sector_stratified_candidates(cell_cands, max(1, int(max_symbols_per_bucket)))
             cell_map = bucket_bars.setdefault((vb, lb), {})
             for j, sym in chosen:
@@ -1699,32 +3286,113 @@ class OfflineRegimePanelCalibrator:
                     c_px = float(closes[t_idx, j])
                     if not np.isfinite(c_px) or c_px <= 0.0:
                         continue
+                    px_tick = float(rule_612_tick_size(Decimal(f"{c_px:.6f}")))
+                    px_prec = 4 if px_tick < float(PENNY_TICK_RULE_612) else 2
                     o_px = float(opens[t_idx, j]) if np.isfinite(opens[t_idx, j]) else c_px
                     h_px = max(o_px, c_px, float(highs[t_idx, j]) if np.isfinite(highs[t_idx, j]) else c_px)
-                    l_px = max(0.01, min(o_px, c_px, float(lows[t_idx, j]) if np.isfinite(lows[t_idx, j]) else c_px))
+                    l_px = max(px_tick, min(o_px, c_px, float(lows[t_idx, j]) if np.isfinite(lows[t_idx, j]) else c_px))
                     v_qty = max(1, int(round(float(volumes[t_idx, j])))) if np.isfinite(volumes[t_idx, j]) else 100
                     ts_ns = ts_ns_arr[t_idx]
                     sym_bar_list.append(
                         Bar(
                             bar_type=bt,
-                            open=Price(o_px, 2),
-                            high=Price(h_px, 2),
-                            low=Price(l_px, 2),
-                            close=Price(c_px, 2),
+                            open=Price(o_px, px_prec),
+                            high=Price(h_px, px_prec),
+                            low=Price(l_px, px_prec),
+                            close=Price(c_px, px_prec),
                             volume=Quantity.from_int(v_qty),
                             ts_event=ts_ns,
                             ts_init=ts_ns,
                         )
                     )
                     r_lo = float(raw_lows[t_idx, j]) if np.isfinite(raw_lows[t_idx, j]) else l_px
-                    sym_raw_low_map[ts_ns] = min(l_px, max(0.01, r_lo))
+                    sym_raw_low_map[ts_ns] = min(l_px, max(px_tick, r_lo))
                 if len(sym_bar_list) >= 30:
                     cell_map[sym] = sym_bar_list
                     raw_low_by_sym[sym] = sym_raw_low_map
+                    selected_syms_set.add(sym)
+
+        selected_syms_list = sorted(selected_syms_set)
+        bars_1m_by_sym: Optional[Dict[str, List[Bar]]] = None
+        if panel_matrices_1m is not None and timestamps_1m is not None and selected_syms_list:
+            b1m, _ = self._build_symbol_bars_from_matrices(
+                panel_matrices=panel_matrices_1m,
+                symbols=symbols_1m or symbols,
+                timestamps=timestamps_1m,
+                target_symbols=selected_syms_list,
+                bar_timeframe="1m",
+            )
+            if b1m:
+                bars_1m_by_sym = b1m
+
+        bars_1d_by_sym: Optional[Dict[str, List[Bar]]] = None
+        if panel_matrices_1d is not None and timestamps_1d is not None and selected_syms_list:
+            b1d, _ = self._build_symbol_bars_from_matrices(
+                panel_matrices=panel_matrices_1d,
+                symbols=symbols_1d or symbols,
+                timestamps=timestamps_1d,
+                target_symbols=selected_syms_list,
+                bar_timeframe="1d",
+            )
+            if b1d:
+                bars_1d_by_sym = b1d
+
+        alpha_scores_by_sym: Optional[Dict[str, List[Tuple[int, float]]]] = None
+        raw_alpha = alpha_scores if alpha_scores is not None else panel_matrices.get("alpha_score")
+        if raw_alpha is not None and selected_syms_list:
+            if isinstance(raw_alpha, Mapping):
+                alpha_scores_by_sym = {}
+                for sym, seq in raw_alpha.items():
+                    norm_s = str(sym).strip().upper().split(".", 1)[0]
+                    if norm_s in selected_syms_set and seq:
+                        alpha_scores_by_sym[norm_s] = [
+                            (_to_epoch_ns(ts_v, ts_ns_arr[0]), float(sc_v))
+                            for ts_v, sc_v in seq
+                            if math.isfinite(float(sc_v))
+                        ]
+            else:
+                alpha_arr = np.asarray(raw_alpha, dtype=np.float64)
+                if alpha_arr.ndim == 2:
+                    a_syms = list(symbols_1d or symbols)
+                    a_ts_raw = list(timestamps_1d or timestamps)
+                    a_t = min(alpha_arr.shape[0], len(a_ts_raw))
+                    a_step = _TF_BAR_SPECS["1d"][2] if timestamps_1d is not None else step_ns
+                    a_ts_ns = _build_monotonic_ts_ns(a_ts_raw[-a_t:], step_ns=a_step)
+                    alpha_mat = alpha_arr[-a_t:]
+                    sym_col_a = {
+                        str(s).strip().upper().split(".", 1)[0]: idx
+                        for idx, s in enumerate(a_syms[: alpha_mat.shape[1]])
+                    }
+                    alpha_scores_by_sym = {}
+                    for norm_s in selected_syms_list:
+                        col_i = sym_col_a.get(norm_s)
+                        if col_i is None:
+                            continue
+                        pts = [
+                            (a_ts_ns[ti], float(alpha_mat[ti, col_i]))
+                            for ti in range(a_t)
+                            if math.isfinite(float(alpha_mat[ti, col_i]))
+                        ]
+                        if pts:
+                            alpha_scores_by_sym[norm_s] = pts
 
         persisted_count = 0
+        eff_horizon_sessions = max(1, int(holding_horizon_sessions))
+        runner_config = {
+            "starting_capital_usd": getattr(self._runner, "_starting_capital_usd", Decimal("100000.00")),
+            "effective_trials": getattr(self._runner, "_effective_trials", 1),
+            "fee_schedule": getattr(self._runner, "_fee_schedule", None),
+            "market_impact_spec": getattr(self._runner, "_market_impact_spec", None),
+            "explicit_half_spread_bps": getattr(self._runner, "_explicit_half_spread_bps", None),
+            "explicit_impact_y": getattr(self._runner, "_explicit_impact_y", None),
+            "system_config": getattr(self._runner, "_system_config", None),
+        }
+        cell_tasks: List[Dict[str, Any]] = []
+
         for vb in all_vol_buckets:
             for lb in all_liq_buckets:
+                if allowed_buckets is not None and (vb, lb) not in allowed_buckets:
+                    continue
                 sym_map = bucket_bars.get((vb, lb), {})
                 if not sym_map:
                     if (
@@ -1737,26 +3405,144 @@ class OfflineRegimePanelCalibrator:
                             StrategyArchetypeId.VOLATILITY_BREAKOUT,
                             StrategyArchetypeId.MEAN_REVERSION,
                         ):
-                            self._param_table.deactivate_cell(vb, lb, arch_id)
+                            if allowed_cells is None or (vb, lb, arch_id) in allowed_cells:
+                                self._param_table.deactivate_cell(vb, lb, arch_id)
                     continue
+
+                bucket_syms = set(sym_map.keys())
+                bucket_raw_low = {
+                    s: raw_low_by_sym[s]
+                    for s in bucket_syms
+                    if s in raw_low_by_sym
+                }
+                bucket_bars_1m = (
+                    ({s: bars_1m_by_sym[s] for s in bucket_syms if s in bars_1m_by_sym} or None)
+                    if bars_1m_by_sym is not None
+                    else None
+                )
+                bucket_bars_1d = (
+                    ({s: bars_1d_by_sym[s] for s in bucket_syms if s in bars_1d_by_sym} or None)
+                    if bars_1d_by_sym is not None
+                    else None
+                )
+                bucket_alpha_scores = (
+                    ({s: alpha_scores_by_sym[s] for s in bucket_syms if s in alpha_scores_by_sym} or None)
+                    if alpha_scores_by_sym is not None
+                    else None
+                )
+
                 for arch_id in (
                     StrategyArchetypeId.TREND_MOMENTUM,
                     StrategyArchetypeId.VOLATILITY_BREAKOUT,
                     StrategyArchetypeId.MEAN_REVERSION,
                 ):
+                    if allowed_cells is not None and (vb, lb, arch_id) not in allowed_cells:
+                        continue
                     tf_grid = tuple(
                         {**cand, "bar_timeframe": tf_norm}
                         for cand in DEFAULT_REGIME_CANDIDATE_GRIDS[arch_id]
                     )
+                    total_trials_est = TOTAL_3X2_REGIME_CELLS * len(tf_grid) * len(DEFAULT_EXECUTION_SPEC_GRID)
+                    cell_tasks.append(
+                        {
+                            "vol_bucket": vb,
+                            "liq_bucket": lb,
+                            "arch_id": arch_id,
+                            "symbol_bars": sym_map,
+                            "candidate_param_grid": tf_grid,
+                            "raw_low_by_symbol_ts_ns": bucket_raw_low,
+                            "execution_spec_grid": DEFAULT_EXECUTION_SPEC_GRID,
+                            "bars_1m_by_symbol": bucket_bars_1m,
+                            "bars_1d_by_symbol": bucket_bars_1d,
+                            "alpha_scores_by_symbol": bucket_alpha_scores,
+                            "total_family_trials": total_trials_est,
+                            "holding_horizon_sessions": eff_horizon_sessions,
+                            "min_pooled_sample_trades": self._min_pooled_sample_trades,
+                            "max_missed_fill_rate": self._max_missed_fill_rate,
+                            "venue_name": self._venue_name,
+                            "runner_config": runner_config,
+                        }
+                    )
+
+        if not cell_tasks:
+            return 0
+
+        max_workers = min(3, os.cpu_count() or 1)
+        can_parallelize_in_workers = (
+            type(self._runner) is IsomorphicBacktestRunner
+            and type(self._falsifier) is StressFalsifier
+            and getattr(self.calibrate_regime_cell, "__func__", None)
+            is OfflineRegimePanelCalibrator.calibrate_regime_cell
+            and getattr(self._runner.run_backtest, "__func__", None)
+            is IsomorphicBacktestRunner.run_backtest
+            and getattr(self._falsifier.run_falsification, "__func__", None)
+            is StressFalsifier.run_falsification
+            and getattr(self._falsifier.run_conditional_swing_falsification, "__func__", None)
+            is StressFalsifier.run_conditional_swing_falsification
+        )
+
+        if max_workers > 1 and len(cell_tasks) > 1 and can_parallelize_in_workers:
+            mp_ctx = multiprocessing.get_context("spawn")
+            with concurrent.futures.ProcessPoolExecutor(
+                max_workers=max_workers,
+                mp_context=mp_ctx,
+            ) as executor:
+                futures = [
+                    executor.submit(_run_panel_cell_calibration_task, task)
+                    for task in cell_tasks
+                ]
+                try:
+                    for fut in concurrent.futures.as_completed(futures):
+                        vb, lb, style_key, arch_id, selected_record = fut.result()
+                        persisted = False
+                        if persist and self._param_table is not None:
+                            if selected_record is not None:
+                                self._param_table.upsert_record(selected_record)
+                                persisted = True
+                                persisted_count += 1
+                            elif hasattr(self._param_table, "deactivate_cell"):
+                                self._param_table.deactivate_cell(vb, lb, style_key)
+                        if on_cell_complete is not None:
+                            on_cell_complete(
+                                RegimeCellCalibrationResult(
+                                    vol_bucket=vb,
+                                    liq_bucket=lb,
+                                    dominant_style=style_key,
+                                    archetype_id=arch_id,
+                                    selected_record=selected_record,
+                                    evaluated_candidates=(),
+                                    persisted=persisted,
+                                )
+                            )
+                except Exception:
+                    for pending_fut in futures:
+                        pending_fut.cancel()
+                    raise
+        else:
+            for task in cell_tasks:
+                self._pending_panel_context = _PanelCalibrationContext(
+                    execution_spec_grid=task["execution_spec_grid"],
+                    bars_1m_by_symbol=task["bars_1m_by_symbol"],
+                    bars_1d_by_symbol=task["bars_1d_by_symbol"],
+                    alpha_scores_by_symbol=task["alpha_scores_by_symbol"],
+                    total_family_trials=task["total_family_trials"],
+                    holding_horizon_sessions=task["holding_horizon_sessions"],
+                )
+                try:
                     res = self.calibrate_regime_cell(
-                        vol_bucket=vb,
-                        liq_bucket=lb,
-                        dominant_style=arch_id,
-                        symbol_bars=sym_map,
-                        candidate_param_grid=tf_grid,
-                        raw_low_by_symbol_ts_ns=raw_low_by_sym,
+                        vol_bucket=task["vol_bucket"],
+                        liq_bucket=task["liq_bucket"],
+                        dominant_style=task["arch_id"],
+                        symbol_bars=task["symbol_bars"],
+                        candidate_param_grid=task["candidate_param_grid"],
+                        raw_low_by_symbol_ts_ns=task["raw_low_by_symbol_ts_ns"],
                         persist=persist,
                     )
-                    if res.persisted:
-                        persisted_count += 1
+                finally:
+                    self._pending_panel_context = None
+                if res.persisted:
+                    persisted_count += 1
+                if on_cell_complete is not None:
+                    on_cell_complete(res)
+
         return persisted_count

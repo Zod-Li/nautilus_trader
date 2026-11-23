@@ -6,7 +6,9 @@ from typing import Any, Dict, FrozenSet, List, Tuple
 
 from nautilus_trader.quant.contracts.models import (
     SUPPORTED_TIMEFRAMES,
+    ExecAlgorithm,
     StrategyArchetypeId,
+    TriggerPolicy,
 )
 
 ALLOWED_BAR_TIMEFRAMES = SUPPORTED_TIMEFRAMES
@@ -65,6 +67,19 @@ def get_mcp_tool_input_schemas() -> List[Dict[str, Any]]:
     """Returns MCP-compliant tool descriptors for the 5 controlled tools."""
     archetype_enum = [a.value for a in StrategyArchetypeId]
     timeframe_enum = list(ALLOWED_BAR_TIMEFRAMES)
+    trigger_policy_enum = [p.value for p in TriggerPolicy]
+    exec_algorithm_enum = [a.value for a in ExecAlgorithm]
+
+    execution_spec_schema: Dict[str, Any] = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "trigger_policy": {"type": "string", "enum": trigger_policy_enum},
+            "exec_algorithm": {"type": "string", "enum": exec_algorithm_enum},
+            "window_quantile": {"type": ["number", "string", "null"]},
+            "bar_timeframe": {"type": "string", "enum": timeframe_enum},
+        },
+    }
 
     strategy_params_schema: Dict[str, Any] = {
         "type": "object",
@@ -87,6 +102,7 @@ def get_mcp_tool_input_schemas() -> List[Dict[str, Any]]:
             "entry_quantile_threshold": {"type": ["number", "string"]},
             "exit_quantile_threshold": {"type": ["number", "string"]},
             "atr_stop_multiplier": {"type": ["number", "string"]},
+            "execution_spec": execution_spec_schema,
         },
     }
 
@@ -113,6 +129,8 @@ def get_mcp_tool_input_schemas() -> List[Dict[str, Any]]:
             "take_profit_price": {"type": ["number", "string", "null"]},
             "reference_price": {"type": ["number", "string"]},
             "max_risk_budget_usd": {"type": ["number", "string"]},
+            "daily_atr_14": {"type": ["number", "string", "null"]},
+            "execution_spec": execution_spec_schema,
             "collar": {"type": "object"},
             "valid_until": {"type": "string"},
             "replace_allowed": {"type": "boolean"},
@@ -166,7 +184,8 @@ def get_mcp_tool_input_schemas() -> List[Dict[str, Any]]:
             "name": "run_archetype_backtest",
             "description": (
                 "Run a 1:1 isomorphic backtest in Nautilus BacktestEngine with "
-                "Strategy(StrategyConfig) + PlanGateExecAlgorithm and return structured metrics."
+                "Strategy(StrategyConfig) + PreTradeRiskGate + CollaredTwapExecAlgorithm "
+                "and return structured metrics."
             ),
             "inputSchema": {
                 "type": "object",
@@ -189,6 +208,7 @@ def get_mcp_tool_input_schemas() -> List[Dict[str, Any]]:
                         "minimum": 1,
                     },
                     "risk_envelope": risk_envelope_schema,
+                    "execution_spec": execution_spec_schema,
                     "walk_forward": {"type": "boolean", "default": False},
                 },
             },
@@ -208,6 +228,11 @@ def get_mcp_tool_input_schemas() -> List[Dict[str, Any]]:
                     "archetype_id": {"type": "string", "enum": archetype_enum},
                     "params": strategy_params_schema,
                     "risk_envelope": risk_envelope_schema,
+                    "execution_spec": execution_spec_schema,
+                    "conditional_event_windows": {
+                        "type": ["array", "null"],
+                        "items": {"type": ["object", "array"]},
+                    },
                     "lookback_days": {
                         "type": "integer",
                         "minimum": 1,
@@ -253,6 +278,8 @@ def get_mcp_tool_input_schemas() -> List[Dict[str, Any]]:
                                 "archetype_id": {"type": "string", "enum": archetype_enum},
                                 "params": strategy_params_schema,
                                 "risk_envelope": risk_envelope_schema,
+                                "execution_spec": execution_spec_schema,
+                                "daily_atr_14": {"type": ["number", "string", "null"]},
                                 "conviction": {"type": "number", "minimum": 0.0, "maximum": 1.0},
                                 "sector": {"type": "string"},
                                 "falsification_token": {"type": "string"},

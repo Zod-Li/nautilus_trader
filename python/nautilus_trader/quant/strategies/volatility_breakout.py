@@ -1,7 +1,8 @@
 """Pre-audited VolatilityBreakoutStrategy and VolatilityBreakoutConfig for Nautilus v2.
 
 Computes rolling price channel quantiles, rolling volume expansion empirical quantiles,
-and volatility-adaptive ATR stops, routing all entry/exit orders through `PLAN_GATE`.
+and `daily_atr_14`-anchored protective stops, routing entry signals through
+`BaseArchetypeStrategy` (`ExecutionSpec` + `PreTradeRiskGate` + `COLLARED_TWAP` / `DIRECT_COLLARED_LIMIT`).
 """
 
 from __future__ import annotations
@@ -18,7 +19,6 @@ from nautilus_trader.quant.strategies.empirical import (
     empirical_quantile_value,
     empirical_rank_quantile,
     quantile_to_float,
-    rolling_atr,
     rolling_mean,
 )
 from nautilus_trader.model import Bar, OrderSide
@@ -38,7 +38,7 @@ class VolatilityBreakoutStrategy(BaseArchetypeStrategy):
        `lookback_window` closes (`empirical_rank_quantile` & `empirical_quantile_value`).
     2. Rolling volume expansion ratio `vol_ratio = volume[-1] / rolling_mean(volume[-slow_window:])`,
        ranked as an empirical quantile `q_vol` over the trailing `lookback_window` volume ratios.
-    3. Adaptive volatility stop-loss (`atr_stop_multiplier * rolling_atr(fast_window)`).
+    3. Initial stop and `1m` Chandelier ratchet anchored strictly to `daily_atr_14`.
     """
 
     def __init__(self, config: VolatilityBreakoutConfig) -> None:
@@ -54,14 +54,7 @@ class VolatilityBreakoutStrategy(BaseArchetypeStrategy):
         super().reset_rolling_windows()
         self._vol_ratios.clear()
 
-    def on_bar(self, bar: Bar) -> None:
-        if bar.bar_type != self._archetype_config.bar_type:
-            return
-
-        if not self._record_primary_bar(bar):
-            return
-        if not self._in_warmup and self._check_and_execute_pending_thesis_exit(bar):
-            return
+    def evaluate_primary_bar(self, bar: Bar) -> None:
         n = len(self._closes)
         cfg = self._archetype_config
         if n < cfg.slow_window:
@@ -79,19 +72,27 @@ class VolatilityBreakoutStrategy(BaseArchetypeStrategy):
         if self._in_warmup:
             return
 
-        atr = rolling_atr(self._highs, self._lows, self._closes, cfg.fast_window)
-        if atr <= 0.0:
+        bar_ts = int(getattr(bar, "ts_event", 0) or getattr(bar, "ts_init", 0) or 0)
+        tod_vol_q = self._update_rth_tod_volume(bar_ts, curr_vol)
+
+        if self._open_position_signed_qty() != Decimal("0"):
+            return
+
+        close_px = self._closes[-1]
+        daily_atr = self._resolve_daily_atr_14(close_px)
+        if daily_atr <= 0.0:
+            return
+
+        if (
+            self._exit_only_mode
+            or n < cfg.lookback_window
+            or self._has_inflight_or_open_entry_order()
+        ):
             return
 
         lookback_len = min(n, cfg.lookback_window)
         close_window = self._closes[-lookback_len:]
         vol_ratio_window = self._vol_ratios[-min(len(self._vol_ratios), cfg.lookback_window) :]
-
-        close_px = self._closes[-1]
-        high_px = self._highs[-1]
-        low_px = self._lows[-1]
-        raw_high_px = self._current_bar_raw_high(high_px)
-        raw_low_px = self._current_bar_raw_low(low_px)
 
         price_quantile = empirical_rank_quantile(close_window, close_px)
         vol_quantile = empirical_rank_quantile(vol_ratio_window, vol_ratio)
@@ -105,111 +106,25 @@ class VolatilityBreakoutStrategy(BaseArchetypeStrategy):
             close_window[:-1] or close_window, 1.0 - entry_q
         )
 
-        signed_pos = self._open_position_signed_qty()
-        if signed_pos > Decimal("0"):
-            if (
-                self._trailing_stop_price is None
-                and self._stop_price is not None
-                and self._stop_price > 0.0
-            ):
-                self._trailing_stop_price = float(self._stop_price)
-            stop_hit = (
-                self._trailing_stop_price is not None
-                and raw_low_px <= self._trailing_stop_price
-            )
-            channel_failure = price_quantile <= exit_q
-            if stop_hit or channel_failure:
-                reason = "VOL_ADAPTIVE_STOP" if stop_hit else "CHANNEL_BREAKDOWN_EXIT"
-                self._submit_plan_gated_exit(
-                    exit_side=OrderSide.SELL,
-                    quantity=signed_pos,
-                    reference_price=close_px,
-                    reason_tag=reason,
-                )
-                self._entry_reference_price = None
-                return
-
-            candidate_stop = high_px - (atr_mult * atr)
-            prev_stop = self._trailing_stop_price
-            ratcheted = False
-            if (
-                prev_stop is None
-                or candidate_stop > prev_stop
-            ):
-                self._trailing_stop_price = candidate_stop
-                ratcheted = prev_stop is not None and candidate_stop > prev_stop
-            if ratcheted:
-                self._replace_protective_stop_price(
-                    self._trailing_stop_price,
-                    self.config.instrument_id,
-                )
-            return
-
-        if signed_pos < Decimal("0"):
-            if (
-                self._trailing_stop_price is None
-                and self._stop_price is not None
-                and self._stop_price > 0.0
-            ):
-                self._trailing_stop_price = float(self._stop_price)
-            stop_hit = (
-                self._trailing_stop_price is not None
-                and raw_high_px >= self._trailing_stop_price
-            )
-            channel_failure = (1.0 - price_quantile) <= exit_q
-            if stop_hit or channel_failure:
-                reason = "VOL_ADAPTIVE_STOP" if stop_hit else "CHANNEL_BREAKOUT_REVERSAL_EXIT"
-                self._submit_plan_gated_exit(
-                    exit_side=OrderSide.BUY,
-                    quantity=abs(signed_pos),
-                    reference_price=close_px,
-                    reason_tag=reason,
-                )
-                self._entry_reference_price = None
-                return
-
-            candidate_stop = low_px + (atr_mult * atr)
-            prev_stop = self._trailing_stop_price
-            ratcheted = False
-            if (
-                prev_stop is None
-                or candidate_stop < prev_stop
-            ):
-                self._trailing_stop_price = candidate_stop
-                ratcheted = prev_stop is not None and candidate_stop < prev_stop
-            if ratcheted:
-                self._replace_protective_stop_price(
-                    self._trailing_stop_price,
-                    self.config.instrument_id,
-                )
-            return
-
-        if (
-            self._exit_only_mode
-            or n < cfg.lookback_window
-            or self._has_inflight_or_open_entry_order()
-        ):
-            return
-
         if cfg.plan_side == PlanSide.LONG:
             if (
                 (price_quantile >= entry_q or close_px >= upper_channel)
                 and vol_quantile >= exit_q
             ):
                 stop_px = self._resolve_entry_stop_price(
-                    close_px, close_px - (atr_mult * atr)
+                    close_px, close_px - (atr_mult * daily_atr)
                 )
                 prev_stop = self._trailing_stop_price
                 prev_ref = self._entry_reference_price
                 self._trailing_stop_price = stop_px
                 self._entry_reference_price = close_px
-                cid = self._submit_plan_gated_entry(
+                cid = self._dispatch_entry_signal(
                     order_side=OrderSide.BUY,
+                    bar=bar,
                     reference_price=close_px,
-                    atr=atr,
-                    limit_price=close_px,
                     stop_loss_price=stop_px,
                     tags=["VOLATILITY_BREAKOUT_LONG_ENTRY"],
+                    tod_volume_quantile=tod_vol_q,
                 )
                 if not cid or self._is_order_denied_or_rejected(cid):
                     self._trailing_stop_price = prev_stop
@@ -220,19 +135,19 @@ class VolatilityBreakoutStrategy(BaseArchetypeStrategy):
                 and vol_quantile >= exit_q
             ):
                 stop_px = self._resolve_entry_stop_price(
-                    close_px, close_px + (atr_mult * atr)
+                    close_px, close_px + (atr_mult * daily_atr)
                 )
                 prev_stop = self._trailing_stop_price
                 prev_ref = self._entry_reference_price
                 self._trailing_stop_price = stop_px
                 self._entry_reference_price = close_px
-                cid = self._submit_plan_gated_entry(
+                cid = self._dispatch_entry_signal(
                     order_side=OrderSide.SELL,
+                    bar=bar,
                     reference_price=close_px,
-                    atr=atr,
-                    limit_price=close_px,
                     stop_loss_price=stop_px,
                     tags=["VOLATILITY_BREAKOUT_SHORT_ENTRY"],
+                    tod_volume_quantile=tod_vol_q,
                 )
                 if not cid or self._is_order_denied_or_rejected(cid):
                     self._trailing_stop_price = prev_stop

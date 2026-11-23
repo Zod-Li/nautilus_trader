@@ -2229,6 +2229,7 @@ async fn test_finding14_query_last_timestamp_bounded_and_request_bars_quotes_tai
 async fn test_ticket02_warmup_filters_unclosed_15m_1h_1d_bars_and_sql_views_guard_future_ex_date() {
     // 1. Verify ClickHouse SQL DDL contracts for Ticket 02:
     //    - `03_adjusted_views.sql` enforces `ex_date <= toDate(now('America/New_York'))` in both `corp_dedup` and `corp_daily`
+    //      across all 3 adjusted/microstructure views (`v_sip_bars_adjusted`, `v_sip_entry_vwap_15m`, `v_sip_daily_microstructure_1d`)
     //    - `02_multi_tf_mv.sql` normalizes `ny_trading_date` in subquery `(B)` via `if(ny_trading_date = toDate('1970-01-01'), ...)`
     let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
@@ -2242,8 +2243,8 @@ async fn test_ticket02_warmup_filters_unclosed_15m_1h_1d_bars_and_sql_views_guar
         .matches("ex_date <= toDate(now('America/New_York'))")
         .count();
     assert_eq!(
-        ex_date_guard_matches, 2,
-        "03_adjusted_views.sql must guard both corp_dedup and corp_daily with `ex_date <= toDate(now('America/New_York'))`, found {ex_date_guard_matches}"
+        ex_date_guard_matches, 6,
+        "03_adjusted_views.sql must guard corp_dedup and corp_daily across all 3 views (`v_sip_bars_adjusted`, `v_sip_entry_vwap_15m`, `v_sip_daily_microstructure_1d`) with `ex_date <= toDate(now('America/New_York'))`, found {ex_date_guard_matches}"
     );
 
     let sql_02 = std::fs::read_to_string(

@@ -1,29 +1,37 @@
-"""Shared base classes and PlanGate order routing helpers for pre-audited Nautilus v2 strategies."""
+"""Shared base classes and CollaredTwap / PreTradeRiskGate order routing helpers for pre-audited Nautilus v2 strategies."""
 
 from __future__ import annotations
 
-from collections import OrderedDict
 from dataclasses import replace
-from datetime import datetime, timezone
-from decimal import Decimal, ROUND_DOWN
+from datetime import date, datetime, timezone
+from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 import logging
 import math
 import threading
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 from zoneinfo import ZoneInfo
 
-from nautilus_trader.common import Clock, OrderFactory
+from nautilus_trader.common import OrderFactory
 from nautilus_trader.quant.contracts.models import (
     ArchetypeStrategyConfig,
-    MarketableLimitCollar,
+    ExecAlgorithm,
+    ExecutionSpec,
     PlanItemContract,
     PlanRiskEnvelope,
     PlanSide,
     StrategyArchetypeId,
+    TriggerPolicy,
     default_limit_collar_for_archetype,
+    quantize_price_rule_612,
+    rule_612_tick_size,
 )
-from nautilus_trader.quant.governance.plan_gate import PLAN_GATE_EXEC_ALGORITHM_ID
-from nautilus_trader.quant.strategies.empirical import rolling_atr
+from nautilus_trader.quant.execution_algorithms.collared_twap import (
+    COLLARED_TWAP_EXEC_ALGORITHM_ID,
+)
+from nautilus_trader.quant.strategies.empirical import (
+    empirical_rank_quantile,
+    rolling_atr,
+)
 from nautilus_trader.model import (
     Bar,
     BarType,
@@ -36,7 +44,6 @@ from nautilus_trader.model import (
     Quantity,
     StrategyId,
     TimeInForce,
-    TraderId,
 )
 from nautilus_trader.quant.governance.bounded_collections import (
     MAX_TRACKED_ORDER_HISTORY,
@@ -111,14 +118,22 @@ class BaseArchetypeStrategyConfig(StrategyConfig):
         submit_protective_stop: bool = False,
         execution_delay_bars: int = 0,
         entry_ttl_bars: Optional[int] = None,
-        exec_algorithm_id: str | ExecAlgorithmId = PLAN_GATE_EXEC_ALGORITHM_ID,
+        exec_algorithm_id: Optional[str | ExecAlgorithmId] = COLLARED_TWAP_EXEC_ALGORITHM_ID,
+        execution_spec: Optional[ExecutionSpec | Mapping[str, Any]] = None,
+        daily_atr_14: Optional[Decimal | float | str] = None,
         strategy_id: Optional[str | StrategyId] = None,
         order_id_tag: Optional[str] = None,
         manage_contingent_orders: bool = False,
         log_events: bool = True,
         log_commands: bool = True,
     ):
-        _ = (execution_delay_bars, entry_ttl_bars)
+        _ = (
+            execution_delay_bars,
+            entry_ttl_bars,
+            exec_algorithm_id,
+            execution_spec,
+            daily_atr_14,
+        )
         inst_str = str(instrument_id).strip()
         sym_clean = inst_str.split(".", 1)[0].replace("/", "")
         default_tag = str(order_id_tag or sym_clean[:8] or "001")
@@ -154,7 +169,9 @@ class BaseArchetypeStrategyConfig(StrategyConfig):
         submit_protective_stop: bool = False,
         execution_delay_bars: int = 0,
         entry_ttl_bars: Optional[int] = None,
-        exec_algorithm_id: str | ExecAlgorithmId = PLAN_GATE_EXEC_ALGORITHM_ID,
+        exec_algorithm_id: Optional[str | ExecAlgorithmId] = COLLARED_TWAP_EXEC_ALGORITHM_ID,
+        execution_spec: Optional[ExecutionSpec | Mapping[str, Any]] = None,
+        daily_atr_14: Optional[Decimal | float | str] = None,
         strategy_id: Optional[str | StrategyId] = None,
         order_id_tag: Optional[str] = None,
         manage_contingent_orders: bool = False,
@@ -176,6 +193,8 @@ class BaseArchetypeStrategyConfig(StrategyConfig):
         self.instrument_id = InstrumentId.from_str(inst_str)
         self.bar_timeframe = self.archetype_contract.bar_timeframe
         self.bar_type = format_datainfra_bar_type(inst_str, self.bar_timeframe)
+        self.execution_bar_timeframe = "1m"
+        self.execution_bar_type = format_datainfra_bar_type(inst_str, "1m")
         self.lookback_window = self.archetype_contract.lookback_window
         self.fast_window = self.archetype_contract.fast_window
         self.slow_window = self.archetype_contract.slow_window
@@ -198,11 +217,24 @@ class BaseArchetypeStrategyConfig(StrategyConfig):
         self.entry_ttl_bars: Optional[int] = (
             max(1, int(entry_ttl_bars)) if entry_ttl_bars is not None else None
         )
-        self.exec_algorithm_id = (
-            exec_algorithm_id
-            if isinstance(exec_algorithm_id, ExecAlgorithmId)
-            else ExecAlgorithmId(str(exec_algorithm_id or PLAN_GATE_EXEC_ALGORITHM_ID))
-        )
+        if execution_spec is None:
+            resolved_spec = ExecutionSpec(bar_timeframe=self.bar_timeframe)
+        elif isinstance(execution_spec, ExecutionSpec):
+            resolved_spec = execution_spec
+        else:
+            resolved_spec = ExecutionSpec.from_dict(
+                execution_spec, default_bar_timeframe=self.bar_timeframe
+            )
+        self._execution_spec: ExecutionSpec = resolved_spec
+
+        if exec_algorithm_id is None:
+            self.exec_algorithm_id: Optional[ExecAlgorithmId] = None
+        elif isinstance(exec_algorithm_id, ExecAlgorithmId):
+            self.exec_algorithm_id = exec_algorithm_id
+        else:
+            raw_ea = str(exec_algorithm_id).strip()
+            self.exec_algorithm_id = ExecAlgorithmId(raw_ea) if raw_ea else None
+
         sym_clean = inst_str.split(".", 1)[0].replace("/", "")
         default_tag = str(order_id_tag or sym_clean[:8] or "001")
         self._resolved_order_id_tag: str = default_tag
@@ -216,6 +248,15 @@ class BaseArchetypeStrategyConfig(StrategyConfig):
         self._plan_risk_envelope: Optional[PlanRiskEnvelope] = None
         self._plan_initial_stop_price: Optional[Decimal] = None
         self._plan_max_risk_budget_usd: Optional[Decimal] = None
+        self._plan_item_id: Optional[str] = None
+        self._plan_id: Optional[str] = None
+        if daily_atr_14 is not None and str(daily_atr_14).strip() != "":
+            d_atr = _to_decimal(daily_atr_14, "0")
+            self._plan_daily_atr_14: Optional[Decimal] = (
+                d_atr if d_atr > Decimal("0") else None
+            )
+        else:
+            self._plan_daily_atr_14 = None
 
     @property
     def required_warmup_bars(self) -> int:
@@ -230,6 +271,17 @@ class BaseArchetypeStrategyConfig(StrategyConfig):
         execution_delay_bars: int = 0,
     ) -> "BaseArchetypeStrategyConfig":
         cfg = plan_item.strategy_config
+        exec_spec = (
+            plan_item.execution_spec
+            or plan_item.risk_envelope.execution_spec
+            or ExecutionSpec(bar_timeframe=cfg.bar_timeframe)
+        )
+        exec_algo_id: Optional[ExecAlgorithmId] = (
+            COLLARED_TWAP_EXEC_ALGORITHM_ID
+            if exec_spec.exec_algorithm == ExecAlgorithm.COLLARED_TWAP
+            else None
+        )
+        daily_atr = plan_item.daily_atr_14 or plan_item.risk_envelope.daily_atr_14
         instance = cls(
             instrument_id=cfg.instrument_id,
             bar_timeframe=cfg.bar_timeframe,
@@ -244,16 +296,23 @@ class BaseArchetypeStrategyConfig(StrategyConfig):
             use_limit_orders=use_limit_orders,
             submit_protective_stop=submit_protective_stop,
             execution_delay_bars=execution_delay_bars,
+            exec_algorithm_id=exec_algo_id,
+            execution_spec=exec_spec,
+            daily_atr_14=daily_atr,
             order_id_tag=plan_item.symbol[:8],
         )
         instance._plan_risk_envelope = plan_item.risk_envelope
         instance._plan_initial_stop_price = plan_item.risk_envelope.initial_stop_price
         instance._plan_max_risk_budget_usd = plan_item.risk_envelope.max_risk_budget_usd
+        instance._plan_daily_atr_14 = daily_atr
+        instance._execution_spec = exec_spec
+        instance._plan_item_id = str(plan_item.item_id)
+        instance._plan_id = str(plan_item.plan_id)
         return instance
 
 
 class BaseArchetypeStrategy(Strategy):
-    """Base pre-audited Nautilus `Strategy` routing all orders through `PLAN_GATE`."""
+    """Base pre-audited Nautilus `Strategy` routing entries through `CollaredTwap` / `PreTradeRiskGate`."""
 
     def __new__(cls, config: BaseArchetypeStrategyConfig) -> "BaseArchetypeStrategy":
         return super().__new__(cls, config)
@@ -285,8 +344,19 @@ class BaseArchetypeStrategy(Strategy):
         self._active_exit_orders_by_inst: Dict[str, str] = {}
         self._active_entry_orders_by_inst: Dict[str, Dict[str, Any]] = {}
         self._telemetry_actor_ref: Optional[Any] = None
-        self._plan_gate_ref: Optional[Any] = None
         self._last_bar_ts_ns: int = 0
+        self._last_exec_bar_ts_ns: int = 0
+        self._last_exec_close: float = 0.0
+        self._last_exec_high: float = 0.0
+        self._last_exec_low: float = 0.0
+        self._peak_favorable_price: Optional[float] = None
+        self._armed_entry_signal: Optional[Dict[str, Any]] = None
+        self._avwap_session_date: Optional[date] = None
+        self._avwap_cum_pv: float = 0.0
+        self._avwap_cum_vol: float = 0.0
+        self._rth_cum_vol_date: Optional[date] = None
+        self._rth_cum_vol_today: float = 0.0
+        self._rth_cum_vol_history_by_tod: Dict[int, List[float]] = {}
         self._in_warmup: bool = False
         self._warmup_bar_count: int = 0
         self._warmup_loader: Optional[Callable[[], Sequence[Bar]]] = None
@@ -450,6 +520,12 @@ class BaseArchetypeStrategy(Strategy):
         self._volumes.clear()
         self._bar_ts_ns_window.clear()
         self._last_bar_ts_ns = 0
+        self._last_exec_bar_ts_ns = 0
+        self._last_exec_close = 0.0
+        self._last_exec_high = 0.0
+        self._last_exec_low = 0.0
+        self._peak_favorable_price = None
+        self._armed_entry_signal = None
         self._warmup_bar_count = 0
 
     def bind_dual_track_bar_extremes(
@@ -475,14 +551,42 @@ class BaseArchetypeStrategy(Strategy):
         self._cleaned_bar_extremes_by_ts_ns = cleaned_dict
         self._raw_bar_extremes_by_ts_ns = raw_dict
 
-    def _current_bar_raw_low(self, fallback: Optional[float] = None) -> float:
+    def _current_bar_raw_low(
+        self,
+        fallback: Optional[float] = None,
+        *,
+        is_primary: bool = True,
+        bar_ts_ns: Optional[int] = None,
+    ) -> float:
+        if not is_primary:
+            if bar_ts_ns is not None and int(bar_ts_ns) > 0:
+                raw_pair = self._raw_bar_extremes_by_ts_ns.get(int(bar_ts_ns))
+                if raw_pair is not None:
+                    return float(raw_pair[1])
+            if fallback is not None:
+                return float(fallback)
+            return float(self._last_exec_low) if self._last_exec_low > 0.0 else 0.0
         if self._raw_lows:
             return float(self._raw_lows[-1])
         if fallback is not None:
             return float(fallback)
         return float(self._lows[-1]) if self._lows else 0.0
 
-    def _current_bar_raw_high(self, fallback: Optional[float] = None) -> float:
+    def _current_bar_raw_high(
+        self,
+        fallback: Optional[float] = None,
+        *,
+        is_primary: bool = True,
+        bar_ts_ns: Optional[int] = None,
+    ) -> float:
+        if not is_primary:
+            if bar_ts_ns is not None and int(bar_ts_ns) > 0:
+                raw_pair = self._raw_bar_extremes_by_ts_ns.get(int(bar_ts_ns))
+                if raw_pair is not None:
+                    return float(raw_pair[0])
+            if fallback is not None:
+                return float(fallback)
+            return float(self._last_exec_high) if self._last_exec_high > 0.0 else 0.0
         if self._raw_highs:
             return float(self._raw_highs[-1])
         if fallback is not None:
@@ -650,17 +754,120 @@ class BaseArchetypeStrategy(Strategy):
         """Optionally binds a `PostgresTelemetryActor` reference for direct safe-exit / resize coordination."""
         self._telemetry_actor_ref = telemetry_actor
 
-    def bind_plan_gate(self, plan_gate: Any) -> None:
-        """Optionally binds a `PlanGateExecAlgorithm` reference for closed-cycle capacity release."""
-        self._plan_gate_ref = plan_gate
-        if plan_gate is not None and hasattr(plan_gate, "register_strategy"):
-            try:
-                plan_gate.register_strategy(self)
-            except Exception:
-                pass
-
     def _resolve_telemetry_actor(self) -> Optional[Any]:
         return self._telemetry_actor_ref
+
+    def _resolve_execution_spec(self) -> ExecutionSpec:
+        env = self._risk_envelope or getattr(
+            self._archetype_config, "_plan_risk_envelope", None
+        )
+        if env is not None and getattr(env, "execution_spec", None) is not None:
+            return env.execution_spec
+        cfg_spec = getattr(self._archetype_config, "_execution_spec", None)
+        if isinstance(cfg_spec, ExecutionSpec):
+            return cfg_spec
+        return ExecutionSpec(bar_timeframe=self._archetype_config.bar_timeframe)
+
+    def _resolve_daily_atr_14(self, reference_price: Optional[float] = None) -> float:
+        """Resolves `daily_atr_14` from the locked plan contract, falling back causally to primary-bar `rolling_atr` when unset."""
+        _ = reference_price
+        env = self._risk_envelope or getattr(
+            self._archetype_config, "_plan_risk_envelope", None
+        )
+        if env is not None and getattr(env, "daily_atr_14", None) is not None:
+            val = float(env.daily_atr_14)
+            if val > 0.0 and math.isfinite(val):
+                return val
+        cfg_atr = getattr(self._archetype_config, "_plan_daily_atr_14", None)
+        if cfg_atr is not None:
+            val = float(cfg_atr)
+            if val > 0.0 and math.isfinite(val):
+                return val
+        n = len(self._closes)
+        if n >= 2:
+            slow_w = int(getattr(self._archetype_config, "slow_window", 0) or 0)
+            fast_w = int(getattr(self._archetype_config, "fast_window", 0) or 0)
+            base_w = slow_w if slow_w >= 2 else (fast_w if fast_w >= 2 else n)
+            atr_win = max(2, min(base_w, n))
+            causal_atr = rolling_atr(self._highs, self._lows, self._closes, atr_win)
+            if causal_atr > 0.0 and math.isfinite(causal_atr):
+                return causal_atr
+        elif n == 1 and len(self._highs) >= 1 and len(self._lows) >= 1:
+            bar_range = max(0.0, float(self._highs[0]) - float(self._lows[0]))
+            if bar_range > 0.0 and math.isfinite(bar_range):
+                return bar_range
+        return 0.0
+
+    def _is_entry_past_valid_until(self, now_ts_ns: Optional[int] = None) -> bool:
+        env = self._risk_envelope or getattr(
+            self._archetype_config, "_plan_risk_envelope", None
+        )
+        vu = getattr(env, "valid_until", None) if env is not None else None
+        if vu is None:
+            return False
+        if isinstance(vu, datetime):
+            vu_utc = vu if vu.tzinfo is not None else vu.replace(tzinfo=timezone.utc)
+            valid_until_ns = int(vu_utc.timestamp() * 1_000_000_000)
+        elif isinstance(vu, (int, float)):
+            valid_until_ns = int(vu)
+        else:
+            return False
+        if valid_until_ns <= 0:
+            return False
+
+        eff_now_ns = int(now_ts_ns or 0)
+        if eff_now_ns <= 0:
+            eff_now_ns = max(self._last_exec_bar_ts_ns, self._last_bar_ts_ns)
+        if eff_now_ns <= 0 and self._is_owner_thread():
+            try:
+                clk = getattr(self, "clock", None) or self._standalone_clock
+                if clk is not None and hasattr(clk, "timestamp_ns"):
+                    eff_now_ns = int(clk.timestamp_ns() or 0)
+            except Exception:
+                eff_now_ns = 0
+        return eff_now_ns > valid_until_ns
+
+    def _cancel_open_entry_orders_for_symbol(
+        self, instrument_id: Optional[InstrumentId] = None
+    ) -> None:
+        target_inst = instrument_id or self._archetype_config.instrument_id
+        inst_key = str(target_inst)
+        sym = self._symbol_from_instrument_id(target_inst)
+        self._armed_entry_signal = None
+        self._delayed_order_queue = [
+            item
+            for item in self._delayed_order_queue
+            if item.get("action") != "entry"
+        ]
+        tracked = self._active_entry_orders_by_inst.pop(inst_key, None)
+        if tracked is not None and tracked.get("order") is not None:
+            self._cancel_single_order_safely(tracked["order"])
+        if self._is_owner_thread():
+            try:
+                open_orders = list(self.cache.orders_open(instrument_id=target_inst) or [])
+                inflight_orders = list(self.cache.orders_inflight(instrument_id=target_inst) or [])
+            except Exception:
+                open_orders = []
+                inflight_orders = []
+            for order in open_orders + inflight_orders:
+                if bool(getattr(order, "is_reduce_only", False)):
+                    continue
+                if self._is_protective_stop_order(order):
+                    continue
+                cid = str(getattr(order, "client_order_id", "") or "")
+                if cid and cid not in self._canceled_order_ids_audit:
+                    self._cancel_single_order_safely(order)
+        actor = self._resolve_telemetry_actor()
+        cancel_cb = (
+            getattr(actor, "_cancel_symbol_entries_callback", None)
+            if actor is not None
+            else None
+        )
+        if callable(cancel_cb) and sym:
+            try:
+                cancel_cb(sym)
+            except Exception as exc:
+                logger.debug("cancel_symbol_entries_callback failed for %s: %s", sym, exc)
 
     def _symbol_from_instrument_id(
         self, instrument_id: Optional[InstrumentId] = None
@@ -687,7 +894,12 @@ class BaseArchetypeStrategy(Strategy):
                             return inc_dec
             except Exception:
                 pass
-        return Decimal("0.01")
+        ref_px = (
+            self._risk_envelope.reference_price
+            if self._risk_envelope is not None and self._risk_envelope.reference_price > Decimal("0")
+            else (Decimal(f"{self._closes[-1]:.6f}") if self._closes else Decimal("1.00"))
+        )
+        return rule_612_tick_size(ref_px)
 
     def _resolve_entry_stop_price(
         self,
@@ -722,34 +934,80 @@ class BaseArchetypeStrategy(Strategy):
             if side is not None
             else self._archetype_config.plan_side == PlanSide.LONG
         )
+        env = self._risk_envelope or getattr(
+            self._archetype_config, "_plan_risk_envelope", None
+        )
+        plan_stop = 0.0
+        plan_ref = 0.0
+        if env is not None and env.initial_stop_price > Decimal("0"):
+            plan_stop = float(env.initial_stop_price)
+            if env.target_qty > Decimal("0") and env.target_notional_usd > Decimal("0"):
+                plan_ref = float(env.target_notional_usd / env.target_qty)
+        elif (
+            getattr(self._archetype_config, "_plan_initial_stop_price", None) is not None
+            and self._archetype_config._plan_initial_stop_price > Decimal("0")
+        ):
+            plan_stop = float(self._archetype_config._plan_initial_stop_price)
+
+        def _fallback_dist() -> float:
+            d = max(0.0, float(raw_stop_distance or 0.0))
+            if d <= 0.0 and plan_ref > 0.0 and plan_stop > 0.0 and abs(plan_ref - plan_stop) > 0.0:
+                d = abs(plan_ref - plan_stop)
+            if d <= 0.0 and eff_ref > 0.0:
+                daily_atr = self._resolve_daily_atr_14(eff_ref)
+                if daily_atr > 0.0:
+                    atr_mult = float(
+                        _to_decimal(
+                            getattr(self._archetype_config, "atr_stop_multiplier", None),
+                            "2.0",
+                        )
+                    )
+                    d = max(0.0, atr_mult * daily_atr)
+            return d
+
         if raw_stop_price is not None:
             eff_raw_stop = float(raw_stop_price)
             if eff_ref > 0.0 and (
                 (is_buy and eff_raw_stop >= eff_ref)
                 or (not is_buy and eff_raw_stop <= eff_ref)
             ):
-                dist = max(0.0, float(raw_stop_distance or 0.0))
-                if (
-                    dist <= 0.0
-                    and self._risk_envelope is not None
-                    and self._risk_envelope.target_qty > Decimal("0")
-                ):
-                    plan_ref = float(
-                        self._risk_envelope.target_notional_usd
-                        / self._risk_envelope.target_qty
-                    )
-                    plan_stop = float(self._risk_envelope.initial_stop_price)
-                    if plan_ref > 0.0 and plan_stop > 0.0 and abs(plan_ref - plan_stop) > 0.0:
-                        dist = abs(plan_ref - plan_stop)
+                dist = _fallback_dist()
                 if dist > 0.0:
                     eff_raw_stop = max(0.01, eff_ref - dist) if is_buy else eff_ref + dist
         else:
-            dist = max(0.0, float(raw_stop_distance or 0.0))
+            dist = _fallback_dist()
             eff_raw_stop = (
                 (max(0.01, eff_ref - dist) if is_buy else eff_ref + dist)
                 if eff_ref > 0.0
                 else (0.0 - dist if is_buy else dist)
             )
+
+        if plan_stop > 0.0:
+            if is_buy:
+                if eff_ref <= 0.0 or eff_ref > plan_stop:
+                    eff_raw_stop = max(eff_raw_stop, plan_stop)
+                else:
+                    if eff_raw_stop >= eff_ref:
+                        dist = _fallback_dist()
+                        if dist > 0.0:
+                            eff_raw_stop = max(0.01, eff_ref - dist)
+                    if plan_ref > plan_stop:
+                        eff_floor = max(0.01, eff_ref - (plan_ref - plan_stop))
+                        if eff_floor < eff_ref:
+                            eff_raw_stop = max(eff_raw_stop, eff_floor)
+            else:
+                if eff_ref <= 0.0 or eff_ref < plan_stop:
+                    eff_raw_stop = min(eff_raw_stop, plan_stop)
+                else:
+                    if eff_raw_stop <= eff_ref:
+                        dist = _fallback_dist()
+                        if dist > 0.0:
+                            eff_raw_stop = eff_ref + dist
+                    if 0.0 < plan_ref < plan_stop:
+                        eff_ceil = eff_ref + (plan_stop - plan_ref)
+                        if eff_ceil > eff_ref:
+                            eff_raw_stop = min(eff_raw_stop, eff_ceil)
+
         return self._resolve_entry_stop_price(
             eff_ref,
             eff_raw_stop,
@@ -927,6 +1185,16 @@ class BaseArchetypeStrategy(Strategy):
                     self._archetype_config.bar_type,
                     exc,
                 )
+            exec_bar_type = getattr(self._archetype_config, "execution_bar_type", None)
+            if exec_bar_type is not None and exec_bar_type != self._archetype_config.bar_type:
+                try:
+                    self.subscribe_bars(exec_bar_type)
+                except Exception as exc:
+                    logger.debug(
+                        "Skipping subscribe_bars on_start for %s (unattached harness): %s",
+                        exec_bar_type,
+                        exc,
+                    )
             if hasattr(self, "subscribe_quote_ticks"):
                 try:
                     self.subscribe_quote_ticks(self.instrument_id)
@@ -1109,6 +1377,16 @@ class BaseArchetypeStrategy(Strategy):
                         self._archetype_config.bar_type,
                         exc,
                     )
+                exec_bar_type = getattr(self._archetype_config, "execution_bar_type", None)
+                if exec_bar_type is not None and exec_bar_type != self._archetype_config.bar_type:
+                    try:
+                        self.unsubscribe_bars(exec_bar_type)
+                    except Exception as exc:
+                        logger.debug(
+                            "Skipping unsubscribe_bars on_stop for %s: %s",
+                            exec_bar_type,
+                            exc,
+                        )
             if hasattr(self, "unsubscribe_quote_ticks"):
                 try:
                     self.unsubscribe_quote_ticks(self.instrument_id)
@@ -1127,6 +1405,38 @@ class BaseArchetypeStrategy(Strategy):
                         self.instrument_id,
                         exc,
                     )
+
+    def on_dispose(self) -> None:
+        if self._is_owner_thread():
+            alert_name = (
+                f"thesis_exit_rth_open_{self._symbol_from_instrument_id(self._archetype_config.instrument_id)}"
+            )
+            clock_obj: Optional[Any] = None
+            try:
+                clock_obj = getattr(self, "clock", None)
+            except Exception:
+                clock_obj = None
+            if clock_obj is None:
+                clock_obj = self._cached_clock or self._standalone_clock
+            clocks_to_cancel: List[Any] = []
+            if clock_obj is not None:
+                clocks_to_cancel.append(clock_obj)
+            if (
+                self._standalone_clock is not None
+                and self._standalone_clock is not clock_obj
+            ):
+                clocks_to_cancel.append(self._standalone_clock)
+            for clk in clocks_to_cancel:
+                if hasattr(clk, "cancel_timer"):
+                    try:
+                        clk.cancel_timer(alert_name)
+                    except Exception:
+                        pass
+            self._standalone_clock = None
+            self._cached_order_factory = None
+            self._cached_clock = None
+            self._telemetry_actor_ref = None
+            self._warmup_loader = None
 
     def on_quote_tick(self, tick: Any) -> None:
         if tick is None or self._in_warmup:
@@ -1247,11 +1557,20 @@ class BaseArchetypeStrategy(Strategy):
             if is_primary:
                 self._instrument_halted = halted
 
+    def _default_stop_reason_tag(self) -> str:
+        archetype_id = getattr(self._archetype_config, "ARCHETYPE_ID", None)
+        if archetype_id == StrategyArchetypeId.VOLATILITY_BREAKOUT:
+            return "VOL_ADAPTIVE_STOP"
+        if archetype_id == StrategyArchetypeId.MEAN_REVERSION:
+            return "MEAN_REV_DISASTER_STOP"
+        return "ATR_TRAILING_STOP"
+
     def _check_and_execute_take_profit_or_corrected_stop(
         self,
         bar: Bar,
         *,
         include_stop_check: bool = False,
+        stop_reason_tag: Optional[str] = None,
     ) -> bool:
         if self._in_warmup:
             return False
@@ -1265,20 +1584,66 @@ class BaseArchetypeStrategy(Strategy):
         if pos_qty <= 0.0:
             return False
         is_long = signed_pos > Decimal("0") if signed_pos != Decimal("0") else (self._archetype_config.plan_side == PlanSide.LONG)
+        is_primary_bar = (
+            not hasattr(bar, "bar_type")
+            or bar.bar_type == self._archetype_config.bar_type
+        )
+        raw_ts_event = int(getattr(bar, "ts_event", 0) or 0)
+        raw_ts_init = int(getattr(bar, "ts_init", 0) or 0)
+        bar_ts = raw_ts_event if raw_ts_event > 0 else raw_ts_init
+        bar_high_val = float(bar.high.as_double())
+        bar_low_val = float(bar.low.as_double())
+        attr_rh = getattr(bar, "raw_high", None)
+        attr_rl = getattr(bar, "raw_low", None)
+        if attr_rh is not None:
+            bar_high_val = max(bar_high_val, float(attr_rh))
+        if attr_rl is not None:
+            bar_low_val = min(bar_low_val, float(attr_rl))
         close_px = float(bar.close.as_double())
-        raw_high_px = self._current_bar_raw_high(float(bar.high.as_double()))
-        raw_low_px = self._current_bar_raw_low(float(bar.low.as_double()))
+        raw_high_px = self._current_bar_raw_high(
+            bar_high_val,
+            is_primary=is_primary_bar,
+            bar_ts_ns=bar_ts,
+        )
+        raw_low_px = self._current_bar_raw_low(
+            bar_low_val,
+            is_primary=is_primary_bar,
+            bar_ts_ns=bar_ts,
+        )
+
+        if (
+            include_stop_check
+            and stop_reason_tag != "CORRECTED_BAR_STOP_EXIT"
+            and bar_ts > 0
+            and self._is_owner_thread()
+        ):
+            try:
+                open_positions = list(
+                    self.cache.positions_open(instrument_id=target_inst) or []
+                )
+            except Exception:
+                open_positions = []
+            if any(
+                int(getattr(pos, "ts_opened", 0) or 0) >= bar_ts > 0
+                for pos in open_positions
+            ):
+                include_stop_check = False
 
         if include_stop_check and self._trailing_stop_price is not None and self._trailing_stop_price > 0.0:
             stop_hit = (raw_low_px <= self._trailing_stop_price) if is_long else (raw_high_px >= self._trailing_stop_price)
             if stop_hit:
                 exit_side = OrderSide.SELL if is_long else OrderSide.BUY
+                resolved_stop_tag = (
+                    stop_reason_tag
+                    if stop_reason_tag is not None and str(stop_reason_tag).strip() != ""
+                    else self._default_stop_reason_tag()
+                )
                 self._submit_plan_gated_exit(
-                    order_side=exit_side,
+                    exit_side=exit_side,
                     reference_price=close_px,
                     quantity=pos_qty,
                     instrument_id=target_inst,
-                    reason_tag="CORRECTED_BAR_STOP_EXIT",
+                    reason_tag=resolved_stop_tag,
                 )
                 return True
 
@@ -1290,7 +1655,7 @@ class BaseArchetypeStrategy(Strategy):
             if tp_hit:
                 exit_side = OrderSide.SELL if is_long else OrderSide.BUY
                 self._submit_plan_gated_exit(
-                    order_side=exit_side,
+                    exit_side=exit_side,
                     reference_price=close_px,
                     quantity=pos_qty,
                     instrument_id=target_inst,
@@ -1299,39 +1664,480 @@ class BaseArchetypeStrategy(Strategy):
                 return True
         return False
 
-    def on_bar(self, bar: Bar) -> None:
-        if hasattr(bar, "bar_type") and bar.bar_type != self._archetype_config.bar_type:
+    def _update_intraday_avwap(
+        self,
+        bar_ts_ns: int,
+        high_px: float,
+        low_px: float,
+        close_px: float,
+        vol_px: float,
+    ) -> None:
+        if bar_ts_ns > 100_000_000_000_000_000:
+            ny_dt = datetime.fromtimestamp(
+                bar_ts_ns / 1_000_000_000.0, tz=timezone.utc
+            ).astimezone(ZoneInfo("America/New_York"))
+            sess_date = ny_dt.date()
+            if self._avwap_session_date != sess_date:
+                self._avwap_session_date = sess_date
+                self._avwap_cum_pv = 0.0
+                self._avwap_cum_vol = 0.0
+        typ_px = (high_px + low_px + close_px) / 3.0
+        eff_vol = max(0.0, float(vol_px))
+        if eff_vol > 0.0 and typ_px > 0.0:
+            self._avwap_cum_pv += typ_px * eff_vol
+            self._avwap_cum_vol += eff_vol
+
+    def _current_intraday_avwap(self) -> float:
+        if self._avwap_cum_vol > 0.0:
+            return self._avwap_cum_pv / self._avwap_cum_vol
+        return 0.0
+
+    def _update_rth_tod_volume(self, bar_ts_ns: int, vol_px: float) -> Optional[float]:
+        """Tracks rolling 20-day RTH cumulative volume at the same NY time-of-day and returns empirical quantile."""
+        if bar_ts_ns <= 100_000_000_000_000_000:
+            return None
+        ny_dt = datetime.fromtimestamp(
+            bar_ts_ns / 1_000_000_000.0, tz=timezone.utc
+        ).astimezone(ZoneInfo("America/New_York"))
+        sess_date = ny_dt.date()
+        tod_min = ny_dt.hour * 60 + ny_dt.minute
+        if self._rth_cum_vol_date != sess_date:
+            self._rth_cum_vol_date = sess_date
+            self._rth_cum_vol_today = 0.0
+        self._rth_cum_vol_today += max(0.0, float(vol_px))
+        hist = self._rth_cum_vol_history_by_tod.setdefault(tod_min, [])
+        q_val: Optional[float] = None
+        if len(hist) >= 2:
+            q_val = empirical_rank_quantile(hist[-20:], self._rth_cum_vol_today)
+        hist.append(self._rth_cum_vol_today)
+        if len(hist) > 60:
+            del hist[:-60]
+        return q_val
+
+    def _update_daily_atr_chandelier_ratchet(self, bar: Bar) -> None:
+        """Ratchets protective stop strictly monotonically using `daily_atr_14` and throttled by `c_collar_atr * daily_atr_14`."""
+        if self._in_warmup:
             return
-        if hasattr(bar, "high") and hasattr(bar, "low") and hasattr(bar, "close"):
-            if not self._record_primary_bar(bar):
-                raw_ts_event = int(getattr(bar, "ts_event", 0) or 0)
-                raw_ts_init = int(getattr(bar, "ts_init", 0) or 0)
-                bar_ts = raw_ts_event if raw_ts_event > 0 else raw_ts_init
-                if bar_ts > 0 and bar_ts == self._last_bar_ts_ns:
-                    self._check_and_execute_take_profit_or_corrected_stop(
-                        bar, include_stop_check=True
-                    )
-                return
-            if self._in_warmup or self._check_and_execute_pending_thesis_exit(bar):
-                return
-            if self._check_and_execute_take_profit_or_corrected_stop(
-                bar, include_stop_check=False
-            ):
-                return
         target_inst = (
             bar.bar_type.instrument_id
             if hasattr(bar, "bar_type") and hasattr(bar.bar_type, "instrument_id")
             else self._archetype_config.instrument_id
         )
-        if (
-            self._is_instrument_halted(target_inst)
-            and self._open_position_signed_qty(target_inst) == Decimal("0")
-            and self._current_position_qty(target_inst) <= 0.0
-        ):
+        inst_key = str(target_inst)
+        if inst_key in self._pending_safe_exits or self._active_exit_orders_by_inst.get(inst_key):
             return
-        eval_fn = getattr(self, "evaluate_bar", None)
-        if callable(eval_fn):
-            eval_fn(bar)
+        signed_pos = self._open_position_signed_qty(target_inst)
+        if signed_pos == Decimal("0"):
+            return
+
+        close_px = float(bar.close.as_double())
+        high_px = float(bar.high.as_double())
+        low_px = float(bar.low.as_double())
+        daily_atr = self._resolve_daily_atr_14(close_px)
+        if daily_atr <= 0.0:
+            return
+
+        cfg = self._archetype_config
+        atr_mult = float(cfg.atr_stop_multiplier)
+        env = self._risk_envelope or getattr(cfg, "_plan_risk_envelope", None)
+        c_collar_atr = (
+            float(env.collar.limit_collar_atr)
+            if env is not None and getattr(env, "collar", None) is not None
+            else float(default_limit_collar_for_archetype(cfg.ARCHETYPE_ID).limit_collar_atr)
+        )
+        tick_dec = self._resolve_tick_size(target_inst)
+        tick_f = float(tick_dec)
+        min_step = max(tick_f, c_collar_atr * daily_atr)
+
+        open_stops = self._get_open_protective_stop_orders(target_inst)
+        open_stop_prices = [
+            float(
+                self._stop_price_by_cid.get(str(getattr(s, "client_order_id", "") or ""), 0.0)
+                or 0.0
+            )
+            for s in open_stops
+        ]
+        pos_open_stop_prices = [p for p in open_stop_prices if p > 0.0]
+        latest_px = self._resolve_latest_market_price(target_inst)
+
+        if signed_pos > Decimal("0"):
+            active_venue_stop = max(pos_open_stop_prices) if pos_open_stop_prices else 0.0
+            active_stop = float(
+                self._trailing_stop_price
+                or active_venue_stop
+                or (
+                    self._stop_price
+                    if self._stop_price is not None and 0.0 < float(self._stop_price) < close_px
+                    else 0.0
+                )
+                or 0.0
+            )
+            if self._trailing_stop_price is None and active_stop > 0.0:
+                self._trailing_stop_price = active_stop
+            self._peak_favorable_price = (
+                high_px
+                if self._peak_favorable_price is None
+                else max(self._peak_favorable_price, high_px)
+            )
+            plan_floor = (
+                float(env.initial_stop_price)
+                if env is not None and env.initial_stop_price > Decimal("0")
+                else 0.0
+            )
+            floor_stop = (
+                active_stop
+                if active_stop > 0.0
+                else (
+                    plan_floor
+                    if plan_floor > 0.0 and plan_floor < min(close_px, low_px)
+                    else 0.0
+                )
+            )
+            raw_cand = self._peak_favorable_price - (atr_mult * daily_atr)
+            bounded_cand = max(raw_cand, floor_stop) if floor_stop > 0.0 else raw_cand
+            if bounded_cand <= 0.0:
+                return
+            cand_q = float(
+                quantize_price_rule_612(
+                    Decimal(f"{bounded_cand:.6f}"),
+                    side=PlanSide.LONG,
+                    tick_size=tick_dec,
+                )
+            )
+            market_ceil = min(close_px, latest_px) if latest_px > 0.0 else close_px
+            if market_ceil > tick_f and cand_q >= market_ceil - (tick_f * 0.5):
+                max_admissible = float(
+                    quantize_price_rule_612(
+                        Decimal(f"{max(tick_f, market_ceil - tick_f):.6f}"),
+                        side=PlanSide.LONG,
+                        tick_size=tick_dec,
+                    )
+                )
+                if max_admissible <= 0.0 or max_admissible >= market_ceil - (tick_f * 0.5):
+                    return
+                cand_q = max_admissible
+            cur_stop = active_stop
+            if (cur_stop <= 0.0 or cand_q >= cur_stop + min_step) and cand_q < market_ceil - (
+                tick_f * 0.5
+            ):
+                replaced_cid = self._replace_protective_stop_price(cand_q, target_inst)
+                if replaced_cid is not None or not open_stops:
+                    self._trailing_stop_price = cand_q
+        else:
+            active_venue_stop = min(pos_open_stop_prices) if pos_open_stop_prices else 0.0
+            active_stop = float(
+                self._trailing_stop_price
+                or active_venue_stop
+                or (
+                    self._stop_price
+                    if self._stop_price is not None and float(self._stop_price) > close_px
+                    else 0.0
+                )
+                or 0.0
+            )
+            if self._trailing_stop_price is None and active_stop > 0.0:
+                self._trailing_stop_price = active_stop
+            self._peak_favorable_price = (
+                low_px
+                if self._peak_favorable_price is None
+                else min(self._peak_favorable_price, low_px)
+            )
+            plan_ceil = (
+                float(env.initial_stop_price)
+                if env is not None and env.initial_stop_price > Decimal("0")
+                else 0.0
+            )
+            ceil_stop = (
+                active_stop
+                if active_stop > 0.0
+                else (
+                    plan_ceil
+                    if plan_ceil > 0.0 and plan_ceil > max(close_px, high_px)
+                    else 0.0
+                )
+            )
+            raw_cand = self._peak_favorable_price + (atr_mult * daily_atr)
+            bounded_cand = min(raw_cand, ceil_stop) if ceil_stop > 0.0 else raw_cand
+            if bounded_cand <= 0.0:
+                return
+            cand_q = float(
+                quantize_price_rule_612(
+                    Decimal(f"{bounded_cand:.6f}"),
+                    side=PlanSide.SHORT,
+                    tick_size=tick_dec,
+                )
+            )
+            market_floor = max(close_px, latest_px) if latest_px > 0.0 else close_px
+            if market_floor > 0.0 and cand_q <= market_floor + (tick_f * 0.5):
+                min_admissible = float(
+                    quantize_price_rule_612(
+                        Decimal(f"{market_floor + tick_f:.6f}"),
+                        side=PlanSide.SHORT,
+                        tick_size=tick_dec,
+                    )
+                )
+                if min_admissible <= market_floor + (tick_f * 0.5):
+                    return
+                cand_q = min_admissible
+            cur_stop = active_stop
+            if (cur_stop <= 0.0 or cand_q <= cur_stop - min_step) and cand_q > market_floor + (
+                tick_f * 0.5
+            ):
+                replaced_cid = self._replace_protective_stop_price(cand_q, target_inst)
+                if replaced_cid is not None or not open_stops:
+                    self._trailing_stop_price = cand_q
+
+    def _dispatch_entry_signal(
+        self,
+        *,
+        order_side: OrderSide,
+        bar: Bar,
+        reference_price: float,
+        stop_loss_price: float,
+        tags: Optional[List[str]] = None,
+        tod_volume_quantile: Optional[float] = None,
+    ) -> str:
+        """Dispatches or arms an entry signal according to `ExecutionSpec.trigger_policy`."""
+        bar_ts = int(getattr(bar, "ts_event", 0) or getattr(bar, "ts_init", 0) or 0)
+        if self._is_entry_past_valid_until(bar_ts):
+            self._armed_entry_signal = None
+            return ""
+        exec_spec = self._resolve_execution_spec()
+        use_implicit_atr = (
+            bool(self._archetype_config.use_limit_orders)
+            or self._has_explicit_plan_atr()
+        )
+        daily_atr = (
+            self._resolve_daily_atr_14(reference_price) if use_implicit_atr else 0.0
+        )
+        if (
+            exec_spec.trigger_policy == TriggerPolicy.FIRST_WINDOW_IMMEDIATE
+            or self._archetype_config.execution_bar_type == self._archetype_config.bar_type
+        ):
+            return self._submit_plan_gated_entry(
+                order_side=order_side,
+                reference_price=reference_price,
+                atr=daily_atr,
+                limit_price=reference_price,
+                stop_loss_price=stop_loss_price,
+                tags=tags,
+            )
+
+        if exec_spec.trigger_policy == TriggerPolicy.HYBRID_15M_1M_BREAKOUT:
+            if (
+                exec_spec.window_quantile is not None
+                and tod_volume_quantile is not None
+                and tod_volume_quantile < float(exec_spec.window_quantile)
+            ):
+                return ""
+
+        self._armed_entry_signal = {
+            "order_side": order_side,
+            "breakout_level": (
+                float(bar.high.as_double())
+                if order_side == OrderSide.BUY
+                else float(bar.low.as_double())
+            ),
+            "reference_price": float(reference_price),
+            "stop_loss_price": float(stop_loss_price),
+            "tags": list(tags or []),
+            "armed_ts_ns": bar_ts,
+            "trigger_policy": exec_spec.trigger_policy,
+        }
+        return ""
+
+    def evaluate_bar(self, bar: Bar) -> None:
+        """Legacy primary-bar hook retained for backwards compatibility with subclasses."""
+        _ = bar
+
+    def evaluate_primary_bar(self, bar: Bar) -> None:
+        """Evaluates primary `15m` bars (implemented by concrete strategy archetypes)."""
+        self.evaluate_bar(bar)
+
+    def evaluate_execution_bar(self, bar: Bar) -> None:
+        """Evaluates `1m` execution bars for armed `HYBRID_15M_1M_BREAKOUT` / `INTRADAY_AVWAP_PULLBACK` entries."""
+        armed = self._armed_entry_signal
+        if not armed:
+            return
+        if (
+            self._exit_only_mode
+            or self._thesis_invalidated
+            or self._has_inflight_or_open_entry_order()
+            or self._open_position_signed_qty() != Decimal("0")
+        ):
+            self._armed_entry_signal = None
+            return
+        bar_ts = int(getattr(bar, "ts_event", 0) or getattr(bar, "ts_init", 0) or 0)
+        if self._is_entry_past_valid_until(bar_ts):
+            self._armed_entry_signal = None
+            return
+
+        order_side: OrderSide = armed["order_side"]
+        close_px = float(bar.close.as_double())
+        high_px = float(bar.high.as_double())
+        low_px = float(bar.low.as_double())
+        policy: TriggerPolicy = armed.get("trigger_policy", TriggerPolicy.HYBRID_15M_1M_BREAKOUT)
+        triggered = False
+        if policy == TriggerPolicy.HYBRID_15M_1M_BREAKOUT:
+            level = float(armed["breakout_level"])
+            if order_side == OrderSide.BUY:
+                triggered = close_px >= level or high_px > level
+            else:
+                triggered = close_px <= level or low_px < level
+        elif policy == TriggerPolicy.INTRADAY_AVWAP_PULLBACK:
+            avwap = self._current_intraday_avwap()
+            if avwap > 0.0:
+                if order_side == OrderSide.BUY:
+                    triggered = low_px <= avwap <= close_px
+                else:
+                    triggered = high_px >= avwap >= close_px
+
+        if not triggered:
+            return
+
+        self._armed_entry_signal = None
+        stop_atr = self._resolve_daily_atr_14(close_px)
+        atr_mult = float(self._archetype_config.atr_stop_multiplier)
+        raw_stop = (
+            close_px - (atr_mult * stop_atr)
+            if order_side == OrderSide.BUY
+            else close_px + (atr_mult * stop_atr)
+        )
+        stop_px = self._resolve_entry_stop_price(close_px, raw_stop)
+        self._trailing_stop_price = stop_px
+        self._peak_favorable_price = high_px if order_side == OrderSide.BUY else low_px
+        use_implicit_atr = (
+            bool(self._archetype_config.use_limit_orders)
+            or self._has_explicit_plan_atr()
+        )
+        daily_atr = stop_atr if use_implicit_atr else 0.0
+        self._submit_plan_gated_entry(
+            order_side=order_side,
+            reference_price=close_px,
+            atr=daily_atr,
+            limit_price=close_px,
+            stop_loss_price=stop_px,
+            tags=armed.get("tags"),
+        )
+
+    def on_bar(self, bar: Bar) -> None:
+        if not hasattr(bar, "bar_type"):
+            return
+        exec_bar_type = getattr(self._archetype_config, "execution_bar_type", None)
+        if bar.bar_type == self._archetype_config.bar_type:
+            if hasattr(bar, "high") and hasattr(bar, "low") and hasattr(bar, "close"):
+                prev_primary_ts_ns = self._last_bar_ts_ns
+                if not self._record_primary_bar(bar):
+                    raw_ts_event = int(getattr(bar, "ts_event", 0) or 0)
+                    raw_ts_init = int(getattr(bar, "ts_init", 0) or 0)
+                    bar_ts = raw_ts_event if raw_ts_event > 0 else raw_ts_init
+                    if (
+                        not self._in_warmup
+                        and bar_ts > 0
+                        and bar_ts == self._last_bar_ts_ns
+                    ):
+                        self._check_and_execute_take_profit_or_corrected_stop(
+                            bar,
+                            include_stop_check=True,
+                            stop_reason_tag="CORRECTED_BAR_STOP_EXIT",
+                        )
+                    return
+                bar_ts = int(getattr(bar, "ts_event", 0) or getattr(bar, "ts_init", 0) or 0)
+                if exec_bar_type == self._archetype_config.bar_type:
+                    self._update_intraday_avwap(
+                        bar_ts,
+                        float(bar.high.as_double()),
+                        float(bar.low.as_double()),
+                        float(bar.close.as_double()),
+                        float(bar.volume.as_double()),
+                    )
+                if self._in_warmup:
+                    self.evaluate_primary_bar(bar)
+                    return
+                if self._check_and_execute_pending_thesis_exit(bar):
+                    return
+                has_intrabar_exec_stream = (
+                    exec_bar_type is not None
+                    and exec_bar_type != self._archetype_config.bar_type
+                    and self._last_exec_bar_ts_ns > prev_primary_ts_ns
+                    and self._last_exec_bar_ts_ns > 0
+                )
+                if self._check_and_execute_take_profit_or_corrected_stop(
+                    bar,
+                    include_stop_check=not has_intrabar_exec_stream,
+                    stop_reason_tag=None,
+                ):
+                    return
+                self._update_daily_atr_chandelier_ratchet(bar)
+            target_inst = (
+                bar.bar_type.instrument_id
+                if hasattr(bar.bar_type, "instrument_id")
+                else self._archetype_config.instrument_id
+            )
+            if (
+                self._is_instrument_halted(target_inst)
+                and self._open_position_signed_qty(target_inst) == Decimal("0")
+                and self._current_position_qty(target_inst) <= 0.0
+            ):
+                return
+            bar_ts = int(getattr(bar, "ts_event", 0) or getattr(bar, "ts_init", 0) or 0)
+            if self._is_entry_past_valid_until(bar_ts):
+                self._armed_entry_signal = None
+            self.evaluate_primary_bar(bar)
+            return
+
+        if exec_bar_type is not None and bar.bar_type == exec_bar_type:
+            raw_ts_event = int(getattr(bar, "ts_event", 0) or 0)
+            raw_ts_init = int(getattr(bar, "ts_init", 0) or 0)
+            bar_ts = raw_ts_event if raw_ts_event > 0 else raw_ts_init
+            high_px = float(bar.high.as_double())
+            low_px = float(bar.low.as_double())
+            close_px = float(bar.close.as_double())
+            vol_px = float(bar.volume.as_double())
+            if bar_ts > 0:
+                self._last_exec_bar_ts_ns = bar_ts
+            self._last_exec_close = close_px
+            self._last_exec_high = high_px
+            self._last_exec_low = low_px
+            self._update_intraday_avwap(bar_ts, high_px, low_px, close_px, vol_px)
+            if self._in_warmup:
+                return
+            if self._is_owner_thread():
+                self._flush_cross_thread_orders()
+            self._expire_stale_unfilled_entry_orders(now_ts_ns=bar_ts)
+            if self._check_and_execute_pending_thesis_exit(bar):
+                return
+            if self._check_and_execute_take_profit_or_corrected_stop(
+                bar, include_stop_check=True, stop_reason_tag=None
+            ):
+                return
+            self._update_daily_atr_chandelier_ratchet(bar)
+            target_inst = (
+                bar.bar_type.instrument_id
+                if hasattr(bar.bar_type, "instrument_id")
+                else self._archetype_config.instrument_id
+            )
+            if (
+                self._is_instrument_halted(target_inst)
+                and self._open_position_signed_qty(target_inst) == Decimal("0")
+                and self._current_position_qty(target_inst) <= 0.0
+            ):
+                return
+            if self._is_entry_past_valid_until(bar_ts):
+                self._armed_entry_signal = None
+                return
+            self.evaluate_execution_bar(bar)
+
+    def _has_explicit_plan_atr(self) -> bool:
+        cfg = self._archetype_config
+        env = self._risk_envelope or getattr(cfg, "_plan_risk_envelope", None)
+        env_atr = getattr(env, "daily_atr_14", None) if env is not None else None
+        if env_atr is not None and float(env_atr) > 0.0 and math.isfinite(float(env_atr)):
+            return True
+        cfg_atr = getattr(cfg, "_plan_daily_atr_14", None)
+        if cfg_atr is not None and float(cfg_atr) > 0.0 and math.isfinite(float(cfg_atr)):
+            return True
+        return False
 
     def _resolve_entry_limit_price(
         self,
@@ -1339,8 +2145,9 @@ class BaseArchetypeStrategy(Strategy):
         reference_price: float,
         atr: float,
         limit_price: Optional[float] = None,
+        instrument_id: Optional[InstrumentId] = None,
     ) -> float:
-        """Resolves the marketable limit entry price bounded by `MarketableLimitCollar`."""
+        """Resolves the marketable limit entry price bounded by `MarketableLimitCollar` (Rule 612)."""
         if reference_price <= 0.0:
             return float(limit_price or 0.0)
         cfg = self._archetype_config
@@ -1350,17 +2157,35 @@ class BaseArchetypeStrategy(Strategy):
             if "BUY" in str(order_side).upper()
             else PlanSide.SHORT
         )
-        ref_dec = Decimal(f"{float(reference_price):.4f}")
-        atr_dec = Decimal(f"{max(0.0, float(atr)):.4f}")
+        ref_dec = Decimal(f"{float(reference_price):.6f}")
+        use_atr_collar = (
+            (float(atr) > 0.0)
+            or bool(cfg.use_limit_orders)
+            or self._has_explicit_plan_atr()
+        )
+        if use_atr_collar:
+            eff_atr = float(atr) if float(atr) > 0.0 else self._resolve_daily_atr_14(reference_price)
+            atr_dec: Optional[Decimal] = Decimal(f"{max(0.0, eff_atr):.6f}")
+            daily_atr_arg: Optional[Decimal] = env.daily_atr_14 if env is not None else None
+        else:
+            atr_dec = None
+            daily_atr_arg = None
         collar = (
             env.collar
             if env is not None and getattr(env, "collar", None) is not None
             else default_limit_collar_for_archetype(self._archetype_config.ARCHETYPE_ID)
         )
+        tick_dec = (
+            self._resolve_tick_size(instrument_id)
+            if instrument_id is not None
+            else rule_612_tick_size(ref_dec)
+        )
         worst_limit_dec = collar.compute_worst_limit_price(
             plan_side,
             ref_dec,
             atr_dec,
+            daily_atr_14=daily_atr_arg,
+            tick_size=tick_dec,
         )
         worst_limit = float(worst_limit_dec)
         if (
@@ -1368,7 +2193,13 @@ class BaseArchetypeStrategy(Strategy):
             and float(limit_price) > 0.0
             and abs(float(limit_price) - float(reference_price)) > 1e-9
         ):
-            req_limit = float(limit_price)
+            req_limit = float(
+                quantize_price_rule_612(
+                    Decimal(f"{float(limit_price):.6f}"),
+                    side=plan_side,
+                    tick_size=tick_dec,
+                )
+            )
             if plan_side == PlanSide.LONG:
                 return min(req_limit, worst_limit)
             return max(req_limit, worst_limit)
@@ -1398,6 +2229,13 @@ class BaseArchetypeStrategy(Strategy):
                 target_inst = kwargs.get("instrument_id") or self._archetype_config.instrument_id
                 cur_px = float(current_bar.close.as_double())
                 if action == "entry":
+                    bar_ts_cur = int(
+                        getattr(current_bar, "ts_event", 0)
+                        or getattr(current_bar, "ts_init", 0)
+                        or 0
+                    )
+                    if self._is_entry_past_valid_until(bar_ts_cur):
+                        continue
                     orig_ref = float(kwargs.get("reference_price") or cur_px)
                     orig_stop = kwargs.get("stop_loss_price")
                     if cur_px > 0.0:
@@ -1511,7 +2349,9 @@ class BaseArchetypeStrategy(Strategy):
             self._flush_delayed_orders(bar)
         return True
 
-    def _expire_stale_unfilled_entry_orders(self) -> None:
+    def _expire_stale_unfilled_entry_orders(
+        self, now_ts_ns: Optional[int] = None
+    ) -> None:
         if not self._active_entry_orders_by_inst:
             return
         valid_until_ns: Optional[int] = None
@@ -1528,13 +2368,16 @@ class BaseArchetypeStrategy(Strategy):
         cfg_ttl = getattr(self._archetype_config, "entry_ttl_bars", None)
         if cfg_ttl is None:
             cfg_ttl = getattr(self, "_entry_ttl_bars", None)
+        eff_now_ns = (
+            int(now_ts_ns)
+            if now_ts_ns is not None and int(now_ts_ns) > 0
+            else max(self._last_exec_bar_ts_ns, self._last_bar_ts_ns)
+        )
 
         for inst_key, entry_spec in list(self._active_entry_orders_by_inst.items()):
             if entry_spec.get("canceling"):
                 continue
             submitted_seq = int(entry_spec.get("submitted_bar_seq", 0))
-            if submitted_seq >= self._post_warmup_bar_seq:
-                continue
             order_obj = entry_spec.get("order")
             cid = str(entry_spec.get("cid", "") or "")
             if self._is_trader_registered() and cid:
@@ -1579,20 +2422,21 @@ class BaseArchetypeStrategy(Strategy):
 
             spec_ttl = entry_spec.get("entry_ttl_bars", cfg_ttl)
             expired_by_ttl = (
-                spec_ttl is not None
+                self._post_warmup_bar_seq > submitted_seq
+                and spec_ttl is not None
                 and int(spec_ttl) > 0
                 and self._post_warmup_bar_seq >= (submitted_seq + int(spec_ttl))
             )
             expired_by_valid_until = (
                 valid_until_ns is not None
                 and valid_until_ns > 0
-                and self._last_bar_ts_ns > valid_until_ns
+                and eff_now_ns > valid_until_ns
             )
             if not (expired_by_ttl or expired_by_valid_until):
                 continue
 
-            self._active_entry_orders_by_inst.pop(inst_key, None)
-            self._cancel_single_order_safely(order_obj)
+            target_inst = entry_spec.get("instrument_id") or self._archetype_config.instrument_id
+            self._cancel_open_entry_orders_for_symbol(target_inst)
 
     def _open_position_signed_qty(
         self, instrument_id: Optional[InstrumentId] = None
@@ -1741,28 +2585,33 @@ class BaseArchetypeStrategy(Strategy):
                         )
             except Exception as exc:
                 logger.debug("OCO stop price sync failed for %s: %s", sym, exc)
-        if self._plan_gate_ref is not None and hasattr(
-            self._plan_gate_ref, "update_stop_price"
-        ):
-            try:
-                self._plan_gate_ref.update_stop_price(sym, float(stop_price))
-            except Exception:
-                pass
 
     def _format_price(
         self, raw_price: Decimal | float, instrument_id: Optional[InstrumentId] = None
     ) -> Price:
         target_inst = instrument_id or self._archetype_config.instrument_id
         val = float(raw_price)
+        val_dec = Decimal(f"{max(0.0, val):.6f}")
         if self._is_owner_thread():
             try:
                 inst = self.cache.instrument(target_inst)
                 if inst is not None:
                     prec = int(getattr(inst, "price_precision", 2) or 2)
+                    px_inc = getattr(inst, "price_increment", None)
+                    tick_dec = (
+                        Decimal(str(px_inc.as_decimal()))
+                        if px_inc is not None and hasattr(px_inc, "as_decimal")
+                        else (_to_decimal(px_inc, "0") if px_inc is not None else None)
+                    )
+                    if tick_dec is not None and tick_dec > Decimal("0"):
+                        q_dec = quantize_price_rule_612(val_dec, tick_size=tick_dec)
+                        return Price.from_str(f"{q_dec:.{prec}f}")
                     return Price(round(val, prec), prec)
             except Exception:
                 pass
-        return Price(round(val, 2), 2)
+        q_dec = quantize_price_rule_612(val_dec)
+        prec = 4 if q_dec < Decimal("1.00") else 2
+        return Price.from_str(f"{q_dec:.{prec}f}")
 
     @staticmethod
     def _normalized_order_status(order: Any) -> str:
@@ -1772,12 +2621,15 @@ class BaseArchetypeStrategy(Strategy):
         return status_str
 
     def _lookup_order_in_cache(self, cid_or_order: Any) -> Optional[Any]:
-        if cid_or_order is None:
+        if cid_or_order is None or not self._is_trader_registered():
             return None
         cid_str = str(getattr(cid_or_order, "client_order_id", cid_or_order) or "")
         if not cid_str:
             return None
-        cache_obj = getattr(self, "cache", None)
+        try:
+            cache_obj = self.cache
+        except RuntimeError:
+            cache_obj = None
         if cache_obj is not None and hasattr(cache_obj, "order"):
             for key in (
                 getattr(cid_or_order, "client_order_id", None),
@@ -1897,13 +2749,20 @@ class BaseArchetypeStrategy(Strategy):
         )
         qty_str = self._format_order_qty(target_qty, target_inst)
         qty_obj = Quantity.from_str(qty_str)
-        rounded_stop_px = round(float(target_stop_px), 2)
-        trig_obj = Price.from_str(f"{rounded_stop_px:.2f}")
+        tick_dec = self._resolve_tick_size(target_inst)
+        tick_f = float(tick_dec)
+        q_stop_dec = quantize_price_rule_612(
+            Decimal(f"{max(0.0, float(target_stop_px)):.6f}"),
+            side=self._archetype_config.plan_side,
+            tick_size=tick_dec,
+        )
+        rounded_stop_px = float(q_stop_dec)
+        trig_obj = self._format_price(rounded_stop_px, target_inst)
         qty_dec = _to_decimal(qty_str, "0")
         if (
             existing_cid
             and existing_cid in self._stop_price_by_cid
-            and abs(rounded_stop_px - round(float(self._stop_price_by_cid[existing_cid]), 2)) < 0.01
+            and abs(rounded_stop_px - float(self._stop_price_by_cid[existing_cid])) < (tick_f * 0.5)
             and abs(float(qty_dec) - float(self._stop_qty_by_cid.get(existing_cid, Decimal("0")))) <= 1e-6
         ):
             self._protective_stop_qty = float(target_qty)
@@ -2239,7 +3098,7 @@ class BaseArchetypeStrategy(Strategy):
             trigger_price=trigger_px,
             time_in_force=TimeInForce.GTC,
             reduce_only=True,
-            exec_algorithm_id=self._archetype_config.exec_algorithm_id,
+            exec_algorithm_id=None,
             exec_algorithm_params=stop_params,
             tags=["PROTECTIVE_STOP", "STOP_LOSS"],
         )
@@ -2920,60 +3779,167 @@ class BaseArchetypeStrategy(Strategy):
         self, instrument_id: Optional[InstrumentId] = None
     ) -> float:
         target_inst = instrument_id or self._archetype_config.instrument_id
-        if self._is_owner_thread():
-            cache_obj = getattr(self, "cache", None)
-            if cache_obj is not None:
-                if hasattr(cache_obj, "quote_tick"):
-                    try:
-                        qt = cache_obj.quote_tick(target_inst)
-                        if qt is not None:
-                            bid_obj = getattr(qt, "bid_price", None)
-                            ask_obj = getattr(qt, "ask_price", None)
-                            bid_val = (
-                                float(bid_obj.as_double())
-                                if hasattr(bid_obj, "as_double")
-                                else float(_to_decimal(bid_obj, "0"))
+        is_primary_inst = str(target_inst) == str(self._archetype_config.instrument_id)
+
+        def _extract_ts_ns(obj: Any) -> int:
+            if obj is None:
+                return 0
+            try:
+                raw_ts_init = int(getattr(obj, "ts_init", 0) or 0)
+            except (TypeError, ValueError):
+                raw_ts_init = 0
+            try:
+                raw_ts_event = int(getattr(obj, "ts_event", 0) or 0)
+            except (TypeError, ValueError):
+                raw_ts_event = 0
+            return max(0, raw_ts_init, raw_ts_event)
+
+        cache_obj = None
+        if self._is_owner_thread() and self._is_trader_registered():
+            try:
+                cache_obj = self.cache
+            except RuntimeError:
+                cache_obj = None
+
+        best_bar_close = 0.0
+        best_bar_ts = 0
+        best_is_exec = False
+
+        if cache_obj is not None and hasattr(cache_obj, "bar"):
+            primary_bt = self._archetype_config.bar_type
+            exec_bt = getattr(self._archetype_config, "execution_bar_type", None)
+            candidates: List[Tuple[BarType, bool]] = [(primary_bt, False)]
+            if exec_bt is not None and exec_bt != primary_bt:
+                candidates.append((exec_bt, True))
+            for bt, is_exec in candidates:
+                try:
+                    cb = cache_obj.bar(bt)
+                except Exception:
+                    continue
+                if cb is None:
+                    continue
+                cb_bt = getattr(cb, "bar_type", None)
+                cb_inst = (
+                    getattr(cb_bt, "instrument_id", None)
+                    if cb_bt is not None
+                    else None
+                )
+                if cb_inst is not None and str(cb_inst) != str(target_inst):
+                    continue
+                if cb_inst is None and not is_primary_inst:
+                    continue
+                bar_close = self._extract_price_float(getattr(cb, "close", None))
+                if bar_close <= 0.0:
+                    continue
+                cb_ts = _extract_ts_ns(cb)
+                if (
+                    best_bar_close <= 0.0
+                    or cb_ts > best_bar_ts
+                    or (cb_ts == best_bar_ts and is_exec and not best_is_exec)
+                ):
+                    best_bar_close = bar_close
+                    best_bar_ts = cb_ts
+                    best_is_exec = is_exec
+
+        if is_primary_inst:
+            exec_ts = max(0, int(getattr(self, "_last_exec_bar_ts_ns", 0) or 0))
+            exec_close = float(getattr(self, "_last_exec_close", 0.0) or 0.0)
+            if exec_close > 0.0 and (
+                best_bar_close <= 0.0
+                or exec_ts > best_bar_ts
+                or (exec_ts == best_bar_ts and not best_is_exec)
+            ):
+                best_bar_close = exec_close
+                best_bar_ts = exec_ts
+                best_is_exec = True
+
+            prim_ts = max(0, int(getattr(self, "_last_bar_ts_ns", 0) or 0))
+            prim_close = float(self._closes[-1]) if getattr(self, "_closes", None) else 0.0
+            if prim_close > 0.0 and (best_bar_close <= 0.0 or prim_ts > best_bar_ts):
+                best_bar_close = prim_close
+                best_bar_ts = prim_ts
+                best_is_exec = False
+
+        if cache_obj is not None:
+            qt = None
+            qt_ts = 0
+            if hasattr(cache_obj, "quote"):
+                try:
+                    qt = cache_obj.quote(target_inst)
+                except Exception:
+                    qt = None
+                if qt is not None:
+                    qt_ts = _extract_ts_ns(qt)
+                    if best_bar_ts <= 0 or qt_ts >= best_bar_ts:
+                        try:
+                            bid_val = self._extract_price_float(
+                                getattr(qt, "bid_price", None)
                             )
-                            ask_val = (
-                                float(ask_obj.as_double())
-                                if hasattr(ask_obj, "as_double")
-                                else float(_to_decimal(ask_obj, "0"))
+                            ask_val = self._extract_price_float(
+                                getattr(qt, "ask_price", None)
                             )
-                            if self._archetype_config.plan_side == PlanSide.LONG and bid_val > 0.0:
+                            if (
+                                self._archetype_config.plan_side == PlanSide.LONG
+                                and bid_val > 0.0
+                            ):
                                 return bid_val
-                            if self._archetype_config.plan_side == PlanSide.SHORT and ask_val > 0.0:
+                            if (
+                                self._archetype_config.plan_side == PlanSide.SHORT
+                                and ask_val > 0.0
+                            ):
                                 return ask_val
                             if bid_val > 0.0 and ask_val > 0.0:
                                 return 0.5 * (bid_val + ask_val)
-                    except Exception:
-                        pass
-                if hasattr(cache_obj, "price"):
+                        except Exception:
+                            pass
+
+            if hasattr(cache_obj, "price"):
+                quote_price_fresh = best_bar_ts <= 0 or (
+                    qt is not None and qt_ts >= best_bar_ts
+                )
+                if quote_price_fresh:
                     try:
                         pref_pt = (
                             PriceType.BID
                             if self._archetype_config.plan_side == PlanSide.LONG
                             else PriceType.ASK
                         )
-                        px_obj = cache_obj.price(target_inst, pref_pt) or cache_obj.price(
-                            target_inst, PriceType.LAST
-                        )
+                        px_obj = cache_obj.price(target_inst, pref_pt)
                         if px_obj is not None:
                             px_val = self._extract_price_float(px_obj)
                             if px_val > 0.0:
                                 return px_val
                     except Exception:
                         pass
-                if hasattr(cache_obj, "bar"):
+
+                tt = None
+                tt_ts = 0
+                for trade_attr in ("trade_tick", "trade"):
+                    trade_fn = getattr(cache_obj, trade_attr, None)
+                    if callable(trade_fn):
+                        try:
+                            tt = trade_fn(target_inst)
+                        except Exception:
+                            tt = None
+                        if tt is not None:
+                            tt_ts = _extract_ts_ns(tt)
+                            break
+
+                last_price_fresh = best_bar_ts <= 0 or (
+                    tt is not None and tt_ts >= best_bar_ts
+                )
+                if last_price_fresh:
                     try:
-                        cb = cache_obj.bar(self._archetype_config.bar_type)
-                        if cb is not None and str(cb.bar_type.instrument_id) == str(target_inst):
-                            bar_close = self._extract_price_float(getattr(cb, "close", None))
-                            if bar_close > 0.0:
-                                return bar_close
+                        px_obj = cache_obj.price(target_inst, PriceType.LAST)
+                        if px_obj is not None:
+                            px_val = self._extract_price_float(px_obj)
+                            if px_val > 0.0:
+                                return px_val
                     except Exception:
                         pass
-        if self._closes:
-            return float(self._closes[-1])
+
+        if best_bar_close > 0.0:
+            return float(best_bar_close)
         return 0.0
 
     def on_order_modify_rejected(self, event: Any) -> None:
@@ -3081,20 +4047,34 @@ class BaseArchetypeStrategy(Strategy):
             or "above market" in reason_str
         )
         if price_breached and (pos_qty > 0.0 or signed_pos != Decimal("0")):
+            sym = self._symbol_from_instrument_id(target_inst)
             logger.warning(
                 "Protective stop modify rejected for %s (%s) with stop_px=%.4f breached by market_px=%.4f (reason=%s); "
-                "triggering immediate fail-closed safe exit",
+                "canceling open entries and triggering fail-closed safe exit",
                 target_inst,
                 cid,
                 target_stop_px,
                 latest_px,
                 reason_str,
             )
-            self._submit_exit(
+            self._cancel_open_entry_orders_for_symbol(target_inst)
+            self._notify_safe_exit_begin(sym)
+            exit_cid = self._submit_exit(
                 reason="PROTECTIVE_STOP_MODIFY_BREACHED_FAIL_CLOSED",
                 reference_price=latest_px if latest_px > 0.0 else target_stop_px,
                 instrument_id=target_inst,
             )
+            if not exit_cid and str(target_inst) not in self._pending_safe_exits:
+                actor = self._resolve_telemetry_actor()
+                if actor is not None and hasattr(actor, "oco_monitor"):
+                    try:
+                        actor.oco_monitor.invalidate_protective_order(
+                            symbol=sym,
+                            broker_order_id=cid,
+                            reason=f"EMERGENCY_EXIT_FAILED_ON_STOP_MODIFY_REJECT:{cid}:{reason_str}",
+                        )
+                    except Exception:
+                        pass
             return
 
         sym = self._symbol_from_instrument_id(target_inst)
@@ -3243,20 +4223,32 @@ class BaseArchetypeStrategy(Strategy):
             else Decimal("0")
         )
         projected_covered_dec = prev_covered_dec + max(Decimal("0"), fill_qty_dec)
-        is_entry_fully_filled = (
-            (leaves_dec is not None and leaves_dec <= Decimal("0"))
-            or (
-                leaves_dec is None
-                and (
-                    target_qty_dec <= Decimal("0")
-                    or projected_covered_dec >= target_qty_dec
+        if spec is not None and target_qty_dec > Decimal("0"):
+            projected_covered_dec = min(target_qty_dec, projected_covered_dec)
+
+        for e_inst_key, e_spec in list(self._active_entry_orders_by_inst.items()):
+            if e_spec.get("cid") not in (cid, lookup_cid):
+                continue
+            prev_e_filled = _to_decimal(e_spec.get("filled_qty_dec"), "0")
+            new_e_filled = prev_e_filled + max(Decimal("0"), fill_qty_dec)
+            e_spec["filled_qty_dec"] = new_e_filled
+            e_target_dec = _to_decimal(e_spec.get("target_qty_dec"), "0")
+            eff_target_dec = target_qty_dec if target_qty_dec > Decimal("0") else e_target_dec
+            eff_covered_dec = projected_covered_dec if spec is not None else new_e_filled
+            if eff_target_dec > Decimal("0"):
+                entry_complete = eff_covered_dec >= eff_target_dec
+            elif cid == lookup_cid:
+                entry_complete = leaves_dec is not None and leaves_dec <= Decimal("0")
+            else:
+                parent_order = self._lookup_order_in_cache(lookup_cid)
+                parent_leaves = (
+                    _to_decimal(getattr(parent_order, "leaves_qty", None), "0")
+                    if parent_order is not None
+                    else Decimal("0")
                 )
-            )
-        )
-        if is_entry_fully_filled:
-            for e_inst_key, e_spec in list(self._active_entry_orders_by_inst.items()):
-                if e_spec.get("cid") in (cid, lookup_cid):
-                    self._active_entry_orders_by_inst.pop(e_inst_key, None)
+                entry_complete = parent_order is not None and parent_leaves <= Decimal("0")
+            if entry_complete:
+                self._active_entry_orders_by_inst.pop(e_inst_key, None)
         if spec is not None and self._should_submit_protective_stop():
             target_qty_dec = _to_decimal(spec.get("target_qty_dec"), "0")
             prev_covered_dec = _to_decimal(spec.get("covered_qty_dec"), "0")
@@ -3298,14 +4290,6 @@ class BaseArchetypeStrategy(Strategy):
             or base_cid in self._rejected_order_ids
         ):
             return True
-        if self._plan_gate_ref is not None and hasattr(self._plan_gate_ref, "decisions"):
-            try:
-                decisions = self._plan_gate_ref.decisions
-                dec = decisions.get(cid) or decisions.get(base_cid)
-                if dec is not None and not bool(getattr(dec, "allowed", True)):
-                    return True
-            except Exception:
-                pass
         order_obj = self._submitted_orders_by_cid.get(cid)
         if self._is_trader_registered():
             try:
@@ -3385,18 +4369,33 @@ class BaseArchetypeStrategy(Strategy):
         if is_protective_stop:
             pos_qty = self._current_position_qty(target_inst)
             if pos_qty > 0.0 or self._entry_filled_qty > 0.0:
+                sym = self._symbol_from_instrument_id(target_inst)
                 reason_msg = str(self._event_get(event, "reason", "UNKNOWN") or "UNKNOWN")
                 logger.error(
-                    "Protective stop order %s rejected for %s while holding position (qty=%s, reason=%s); triggering emergency fail-closed exit",
+                    "Protective stop order %s rejected for %s while holding position (qty=%s, reason=%s); "
+                    "canceling open entries and triggering emergency fail-closed safe exit",
                     cid,
                     target_inst,
                     pos_qty or self._entry_filled_qty,
                     reason_msg,
                 )
-                self._submit_exit(
+                self._cancel_open_entry_orders_for_symbol(target_inst)
+                self._notify_safe_exit_begin(sym)
+                exit_cid = self._submit_exit(
                     reason="PROTECTIVE_STOP_REJECTED_FAIL_CLOSED",
                     instrument_id=target_inst,
                 )
+                if not exit_cid and str(target_inst) not in self._pending_safe_exits:
+                    actor = self._resolve_telemetry_actor()
+                    if actor is not None and hasattr(actor, "oco_monitor"):
+                        try:
+                            actor.oco_monitor.invalidate_protective_order(
+                                symbol=sym,
+                                broker_order_id=cid,
+                                reason=f"EMERGENCY_EXIT_FAILED_ON_STOP_REJECT:{cid}:{reason_msg}",
+                            )
+                        except Exception:
+                            pass
 
     def on_order_canceled(self, event: Any) -> None:
         cid = str(self._event_get(event, "client_order_id", "") or "")
@@ -3632,9 +4631,15 @@ class BaseArchetypeStrategy(Strategy):
 
     def on_position_opened(self, event: Any) -> None:
         self._sync_tracked_position_from_event(event)
+        actor = self._resolve_telemetry_actor()
+        if actor is not None and event is not None and hasattr(actor, "on_position_opened"):
+            actor.on_position_opened(event)
 
     def on_position_changed(self, event: Any) -> None:
         self._sync_tracked_position_from_event(event)
+        actor = self._resolve_telemetry_actor()
+        if actor is not None and event is not None and hasattr(actor, "on_position_changed"):
+            actor.on_position_changed(event)
 
     def on_position_closed(self, event: Any) -> None:
         inst_id = self._event_get(event, "instrument_id", None)
@@ -3646,29 +4651,21 @@ class BaseArchetypeStrategy(Strategy):
         self._active_exit_orders_by_inst.pop(inst_key, None)
         self._active_entry_orders_by_inst.pop(inst_key, None)
         self._notify_safe_exit_end(sym)
+        actor = self._resolve_telemetry_actor()
+        if actor is not None and event is not None and hasattr(actor, "on_position_closed"):
+            actor.on_position_closed(event)
+        backend = getattr(actor, "_plan_gate_backend", None) if actor is not None else None
         if (
-            self._plan_gate_ref is not None
-            and hasattr(self._plan_gate_ref, "release_closed_position_capacity")
+            backend is not None
+            and not bool(getattr(backend, "_allow_multi_cycle_reentry", True))
+            and (inst_id is None or str(inst_id) == str(self._archetype_config.instrument_id))
             and self._open_position_signed_qty(target_inst) == Decimal("0")
         ):
-            item_id = (
-                getattr(self._archetype_config, "plan_item_id", None)
-                if str(target_inst) == str(self._archetype_config.instrument_id)
-                else None
-            )
-            self._plan_gate_ref.release_closed_position_capacity(
-                sym,
-                instrument_id=target_inst,
-                item_id=item_id,
-            )
-            backend = getattr(self._plan_gate_ref, "backend", self._plan_gate_ref)
-            if (
-                not bool(getattr(backend, "_allow_multi_cycle_reentry", True))
-                and (inst_id is None or str(inst_id) == str(self._archetype_config.instrument_id))
-            ):
-                self._exit_only_mode = True
+            self._exit_only_mode = True
         if inst_id is None or str(inst_id) == str(self._archetype_config.instrument_id):
             self._trailing_stop_price = None
+            self._peak_favorable_price = None
+            self._armed_entry_signal = None
             self._pending_thesis_exit = False
             self._entry_filled_qty = 0.0
             self._pending_protective_stop_sync = None
@@ -3752,6 +4749,12 @@ class BaseArchetypeStrategy(Strategy):
 
         # Keep trailing stop ratchets strictly outside the current market to avoid in-the-market modify rejections.
         latest_px = self._resolve_latest_market_price(target_inst)
+        if self._last_exec_bar_ts_ns >= self._last_bar_ts_ns and self._last_exec_close > 0.0:
+            bar_close_px = float(self._last_exec_close)
+        elif self._closes:
+            bar_close_px = float(self._closes[-1])
+        else:
+            bar_close_px = float(self._last_exec_close or 0.0)
         tick = float(self._resolve_tick_size(target_inst))
         fmt_new_stop = float(self._format_price(new_stop_price, target_inst).as_double())
         is_long_pos = (
@@ -3759,6 +4762,10 @@ class BaseArchetypeStrategy(Strategy):
             if signed_pos != Decimal("0")
             else self._archetype_config.plan_side == PlanSide.LONG
         )
+        if latest_px > 0.0 and bar_close_px > 0.0:
+            market_px = min(latest_px, bar_close_px) if is_long_pos else max(latest_px, bar_close_px)
+        else:
+            market_px = max(latest_px, bar_close_px)
         existing_stop_prices = [
             float(self._stop_price_by_cid.get(str(getattr(s, "client_order_id", "") or ""), 0.0) or 0.0)
             for s in open_stops
@@ -3766,15 +4773,15 @@ class BaseArchetypeStrategy(Strategy):
         if self._stop_price is not None and self._stop_price > 0.0:
             existing_stop_prices.append(float(self._stop_price))
         pos_stop_prices = [p for p in existing_stop_prices if p > 0.0]
-        if latest_px > tick:
-            if is_long_pos and fmt_new_stop >= latest_px - 1e-9:
-                max_admissible = float(self._format_price(latest_px - tick, target_inst).as_double())
+        if market_px > tick:
+            if is_long_pos and fmt_new_stop >= market_px - 1e-9:
+                max_admissible = float(self._format_price(market_px - tick, target_inst).as_double())
                 cur_venue_stop = max(pos_stop_prices) if pos_stop_prices else 0.0
                 if max_admissible <= 0.0 or (cur_venue_stop > 0.0 and max_admissible <= cur_venue_stop + 1e-9):
                     return None
                 new_stop_price = max_admissible
-            elif not is_long_pos and fmt_new_stop <= latest_px + 1e-9:
-                min_admissible = float(self._format_price(latest_px + tick, target_inst).as_double())
+            elif not is_long_pos and fmt_new_stop <= market_px + 1e-9:
+                min_admissible = float(self._format_price(market_px + tick, target_inst).as_double())
                 cur_venue_stop = min(pos_stop_prices) if pos_stop_prices else 0.0
                 if cur_venue_stop > 0.0 and min_admissible >= cur_venue_stop - 1e-9:
                     return None
@@ -3876,6 +4883,14 @@ class BaseArchetypeStrategy(Strategy):
         cfg._plan_risk_envelope = renewed_env
         cfg._plan_initial_stop_price = tightened_stop_dec
         cfg._plan_max_risk_budget_usd = renewed_env.max_risk_budget_usd
+        cfg._plan_daily_atr_14 = new_item.daily_atr_14 or renewed_env.daily_atr_14
+        renewed_exec_spec = new_item.execution_spec or renewed_env.execution_spec
+        cfg._execution_spec = renewed_exec_spec
+        cfg.exec_algorithm_id = (
+            COLLARED_TWAP_EXEC_ALGORITHM_ID
+            if renewed_exec_spec.exec_algorithm == ExecAlgorithm.COLLARED_TWAP
+            else None
+        )
 
         self._risk_envelope = renewed_env
         self._exit_only_mode = False
@@ -4015,13 +5030,14 @@ class BaseArchetypeStrategy(Strategy):
         stop_loss_price: Optional[float] = None,
         tags: Optional[List[str]] = None,
     ) -> str:
-        """Creates and submits a PlanGate-routed entry order (`exec_algorithm_id='PLAN_GATE'`)."""
+        """Creates and submits a collared `LimitOrder` entry routed via `CollaredTwap` / `PreTradeRiskGate`."""
         target_inst = instrument_id or self._archetype_config.instrument_id
         if (
             self._in_warmup
             or self._exit_only_mode
             or self._thesis_invalidated
             or self._is_instrument_halted(target_inst)
+            or self._is_entry_past_valid_until()
         ):
             return ""
         if (
@@ -4052,16 +5068,23 @@ class BaseArchetypeStrategy(Strategy):
         raw_qty_val = (
             quantity if quantity is not None else self._archetype_config.trade_qty
         )
+        if self._has_explicit_plan_atr():
+            eff_daily_atr = self._resolve_daily_atr_14(reference_price)
+        elif float(atr) > 0.0:
+            eff_daily_atr = float(atr)
+        elif bool(self._archetype_config.use_limit_orders):
+            eff_daily_atr = self._resolve_daily_atr_14(reference_price)
+        else:
+            eff_daily_atr = 0.0
         if self._risk_envelope is not None and reference_price > 0.0:
-            plan_ref_px = (
-                float(
-                    self._risk_envelope.target_notional_usd
-                    / self._risk_envelope.target_qty
-                )
+            plan_ref_dec = (
+                self._risk_envelope.target_notional_usd
+                / self._risk_envelope.target_qty
                 if self._risk_envelope.target_qty > Decimal("0")
                 and self._risk_envelope.target_notional_usd > Decimal("0")
-                else 0.0
+                else self._risk_envelope.reference_price
             )
+            plan_ref_px = float(plan_ref_dec)
             plan_stop_px = float(self._risk_envelope.initial_stop_price)
             if (
                 stop_loss_price is not None
@@ -4078,7 +5101,7 @@ class BaseArchetypeStrategy(Strategy):
                         "2",
                     )
                 )
-                atr_dist = max(0.0, float(atr)) * max(atr_mult, 1.0)
+                atr_dist = eff_daily_atr * max(atr_mult, 1.0)
                 plan_dist = (
                     abs(plan_ref_px - plan_stop_px)
                     if plan_ref_px > 0.0 and abs(plan_ref_px - plan_stop_px) > 0.0
@@ -4091,12 +5114,58 @@ class BaseArchetypeStrategy(Strategy):
                 )
                 if eff_dist > 0.0:
                     stop_loss_price = (
-                        max(0.01, reference_price - eff_dist)
+                        max(0.0001, reference_price - eff_dist)
                         if order_side == OrderSide.BUY
                         else reference_price + eff_dist
                     )
             raw_qty_dec = _to_decimal(raw_qty_val, "0")
             max_risk_usd = float(self._risk_envelope.max_risk_budget_usd)
+            if (
+                plan_stop_px > 0.0
+                and stop_loss_price is not None
+                and float(stop_loss_price) > 0.0
+            ):
+                ref_dec = Decimal(f"{reference_price:.6f}")
+                plan_stop_dec = self._risk_envelope.initial_stop_price
+                if order_side == OrderSide.BUY:
+                    raw_floor_dec: Optional[Decimal] = None
+                    if ref_dec > plan_stop_dec:
+                        raw_floor_dec = plan_stop_dec
+                    elif plan_ref_dec > plan_stop_dec:
+                        raw_floor_dec = max(
+                            Decimal("0.01"),
+                            ref_dec - (plan_ref_dec - plan_stop_dec),
+                        )
+                    if raw_floor_dec is not None:
+                        eff_floor_dec = raw_floor_dec.quantize(
+                            Decimal("0.000001"), rounding=ROUND_CEILING
+                        )
+                        eff_floor = float(eff_floor_dec)
+                        if float(stop_loss_price) < eff_floor < reference_price:
+                            stop_loss_price = eff_floor
+                            if (
+                                self._trailing_stop_price is not None
+                                and self._trailing_stop_price < float(stop_loss_price)
+                            ):
+                                self._trailing_stop_price = float(stop_loss_price)
+                elif order_side == OrderSide.SELL:
+                    raw_ceil_dec: Optional[Decimal] = None
+                    if ref_dec < plan_stop_dec:
+                        raw_ceil_dec = plan_stop_dec
+                    elif Decimal("0") < plan_ref_dec < plan_stop_dec:
+                        raw_ceil_dec = ref_dec + (plan_stop_dec - plan_ref_dec)
+                    if raw_ceil_dec is not None:
+                        eff_ceil_dec = raw_ceil_dec.quantize(
+                            Decimal("0.000001"), rounding=ROUND_FLOOR
+                        )
+                        eff_ceil = float(eff_ceil_dec)
+                        if float(stop_loss_price) > eff_ceil > reference_price:
+                            stop_loss_price = eff_ceil
+                            if (
+                                self._trailing_stop_price is not None
+                                and self._trailing_stop_price > float(stop_loss_price)
+                            ):
+                                self._trailing_stop_price = float(stop_loss_price)
             is_coherent_plan_env = (
                 plan_ref_px > 0.0
                 and plan_stop_px > 0.0
@@ -4109,6 +5178,7 @@ class BaseArchetypeStrategy(Strategy):
             )
             if (
                 is_coherent_plan_env
+                and plan_ref_px > 0.0
                 and raw_qty_dec > Decimal("0")
                 and raw_qty_dec <= self._risk_envelope.approved_qty_cap
                 and abs(reference_price - plan_ref_px) > 1e-6
@@ -4145,62 +5215,107 @@ class BaseArchetypeStrategy(Strategy):
             raw_qty_val,
             target_inst,
         )
-        exec_params = {
-            "intent": "ENTRY",
-            "reference_price": f"{reference_price:.6f}",
-            "atr": f"{max(0.0, atr):.6f}",
-            "archetype_id": self._archetype_config.ARCHETYPE_ID.value,
-        }
-        if self._last_bar_ts_ns > 100_000_000_000_000_000:
-            exec_params["evaluation_ts"] = datetime.fromtimestamp(
-                self._last_bar_ts_ns / 1e9, tz=timezone.utc
-            ).isoformat()
-        if stop_loss_price is not None:
-            exec_params["stop_loss_price"] = f"{float(stop_loss_price):.6f}"
-
+        use_atr_collar = eff_daily_atr > 0.0
         eff_limit = self._resolve_entry_limit_price(
             order_side=order_side,
             reference_price=reference_price,
-            atr=atr,
+            atr=eff_daily_atr if use_atr_collar else 0.0,
             limit_price=limit_price,
+            instrument_id=target_inst,
+        )
+        if eff_limit <= 0.0:
+            return ""
+        limit_px_obj = self._format_price(eff_limit, target_inst)
+        env = self._risk_envelope or getattr(
+            self._archetype_config, "_plan_risk_envelope", None
+        )
+        collar = (
+            env.collar
+            if env is not None and getattr(env, "collar", None) is not None
+            else default_limit_collar_for_archetype(self._archetype_config.ARCHETYPE_ID)
+        )
+        exec_spec = self._resolve_execution_spec()
+        signal_ts_ns = max(self._last_exec_bar_ts_ns, self._last_bar_ts_ns)
+        if signal_ts_ns <= 0 and self._is_owner_thread():
+            try:
+                clk = getattr(self, "clock", None) or self._standalone_clock
+                if clk is not None and hasattr(clk, "timestamp_ns"):
+                    signal_ts_ns = int(clk.timestamp_ns() or 0)
+            except Exception:
+                signal_ts_ns = 0
+
+        exec_params: Dict[str, str] = {
+            "intent": "ENTRY",
+            "reference_price": f"{reference_price:.6f}",
+            "worst_limit_price": str(limit_px_obj),
+            "limit_collar_pct": str(collar.limit_collar_pct),
+            "limit_collar_atr": str(collar.limit_collar_atr),
+            "exec_algorithm": exec_spec.exec_algorithm.value,
+            "trigger_policy": exec_spec.trigger_policy.value,
+            "archetype_id": self._archetype_config.ARCHETYPE_ID.value,
+        }
+        if use_atr_collar:
+            exec_params["daily_atr_14"] = f"{eff_daily_atr:.6f}"
+            exec_params["atr"] = f"{eff_daily_atr:.6f}"
+        if signal_ts_ns > 0:
+            exec_params["signal_ts_ns"] = str(signal_ts_ns)
+        if signal_ts_ns > 100_000_000_000_000_000:
+            exec_params["evaluation_ts"] = datetime.fromtimestamp(
+                signal_ts_ns / 1e9, tz=timezone.utc
+            ).isoformat()
+        if stop_loss_price is not None:
+            exec_params["stop_loss_price"] = f"{float(stop_loss_price):.6f}"
+        active_item_id: Optional[str] = getattr(self._archetype_config, "_plan_item_id", None)
+        active_plan_id: Optional[str] = getattr(self._archetype_config, "_plan_id", None)
+        actor = self._resolve_telemetry_actor()
+        backend = getattr(actor, "_plan_gate_backend", None) if actor is not None else None
+        if backend is not None and hasattr(backend, "get_plan_item"):
+            active_item = backend.get_plan_item(
+                self._symbol_from_instrument_id(target_inst)
+            )
+            if active_item is not None:
+                active_item_id = str(active_item.item_id)
+                active_plan_id = str(active_item.plan_id)
+        if active_item_id:
+            exec_params["item_id"] = str(active_item_id)
+        if active_plan_id:
+            exec_params["plan_id"] = str(active_plan_id)
+
+        eff_exec_algo_id = (
+            COLLARED_TWAP_EXEC_ALGORITHM_ID
+            if exec_spec.exec_algorithm == ExecAlgorithm.COLLARED_TWAP
+            and self._archetype_config.exec_algorithm_id is not None
+            else (
+                None
+                if exec_spec.exec_algorithm == ExecAlgorithm.DIRECT_COLLARED_LIMIT
+                else self._archetype_config.exec_algorithm_id
+            )
         )
         order_factory = self._get_order_factory()
-        if self._archetype_config.use_limit_orders and eff_limit > 0.0:
-            order = order_factory.limit(
-                instrument_id=target_inst,
-                order_side=order_side,
-                quantity=qty_obj,
-                price=self._format_price(eff_limit, target_inst),
-                time_in_force=TimeInForce.DAY,
-                reduce_only=False,
-                exec_algorithm_id=self._archetype_config.exec_algorithm_id,
-                exec_algorithm_params=exec_params,
-                tags=tags,
-            )
-        else:
-            order = order_factory.market(
-                instrument_id=target_inst,
-                order_side=order_side,
-                quantity=qty_obj,
-                time_in_force=TimeInForce.GTC,
-                reduce_only=False,
-                exec_algorithm_id=self._archetype_config.exec_algorithm_id,
-                exec_algorithm_params=exec_params,
-                tags=tags,
-            )
+        order = order_factory.limit(
+            instrument_id=target_inst,
+            order_side=order_side,
+            quantity=qty_obj,
+            price=limit_px_obj,
+            time_in_force=TimeInForce.DAY,
+            reduce_only=False,
+            exec_algorithm_id=eff_exec_algo_id,
+            exec_algorithm_params=exec_params,
+            tags=tags,
+        )
 
         cid = str(order.client_order_id)
         initial_pos_qty_dec = abs(self._open_position_signed_qty(target_inst))
+        target_qty_dec = (
+            Decimal(str(qty_obj.as_decimal()))
+            if hasattr(qty_obj, "as_decimal")
+            else _to_decimal(qty_obj, "0")
+        )
         if (
             self._should_submit_protective_stop()
             and stop_loss_price is not None
             and stop_loss_price > 0.0
         ):
-            target_qty_dec = (
-                Decimal(str(qty_obj.as_decimal()))
-                if hasattr(qty_obj, "as_decimal")
-                else _to_decimal(qty_obj, "0")
-            )
             self._pending_protective_stops[cid] = {
                 "instrument_id": target_inst,
                 "entry_side": order_side,
@@ -4218,6 +5333,8 @@ class BaseArchetypeStrategy(Strategy):
             "order": order,
             "instrument_id": target_inst,
             "submitted_bar_seq": self._post_warmup_bar_seq,
+            "target_qty_dec": target_qty_dec,
+            "filled_qty_dec": Decimal("0"),
         }
         self._submitted_order_ids.append(cid)
         self._submit_order_safely(order)
@@ -4349,34 +5466,15 @@ class BaseArchetypeStrategy(Strategy):
         if resolved_ref <= 0.0:
             return ""
 
-        compute_atr_fn = getattr(self, "_compute_atr", None)
-        raw_atr = (
-            atr
-            if atr is not None
-            else (compute_atr_fn() if callable(compute_atr_fn) else None)
-        )
-        if (
-            (raw_atr is None or float(raw_atr) <= 0.0)
-            and self._highs
-            and self._lows
-            and self._closes
+        if atr is not None:
+            raw_atr = atr
+        elif (
+            bool(self._archetype_config.use_limit_orders)
+            or self._has_explicit_plan_atr()
         ):
-            fast_win = max(
-                1, int(getattr(self._archetype_config, "fast_window", 5) or 5)
-            )
-            atr_candidate = rolling_atr(
-                self._highs, self._lows, self._closes, fast_win
-            )
-            if atr_candidate > 0.0:
-                raw_atr = atr_candidate
-        if (raw_atr is None or float(raw_atr) <= 0.0) and len(self._closes) >= 2:
-            abs_diffs = [
-                abs(float(self._closes[i]) - float(self._closes[i - 1]))
-                for i in range(1, len(self._closes))
-            ]
-            mean_diff = sum(abs_diffs) / len(abs_diffs) if abs_diffs else 0.0
-            if mean_diff > 0.0:
-                raw_atr = mean_diff
+            raw_atr = self._resolve_daily_atr_14(resolved_ref)
+        else:
+            raw_atr = 0.0
         if raw_atr is None or float(raw_atr) <= 0.0:
             atr_mult_cfg = float(
                 _to_decimal(
@@ -4515,7 +5613,7 @@ class BaseArchetypeStrategy(Strategy):
             quantity=qty_obj,
             time_in_force=TimeInForce.GTC,
             reduce_only=True,
-            exec_algorithm_id=self._archetype_config.exec_algorithm_id,
+            exec_algorithm_id=None,
             exec_algorithm_params=exec_params,
             tags=order_tags,
         )
@@ -4538,7 +5636,7 @@ class BaseArchetypeStrategy(Strategy):
         *,
         reason: Optional[str] = None,
         signal_tags: Optional[List[str]] = None,
-    ) -> str:
+    ) -> Optional[str]:
         """Executes Two-Phase Safe Exit (or direct exit when no stop is open) via `PLAN_GATE`."""
         resolved_reason = str(reason or reason_tag or "SIGNAL_EXIT")
         is_emergency_exit = (

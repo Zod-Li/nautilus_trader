@@ -3,7 +3,8 @@
 Starts the `:8015` Agent-facing MCP proxy (`NautilusMcpServer` HTTP JSON-RPC 2.0) in a
 background thread while the main thread loads or awaits today's `LOCKED` `TradingPlanContract`
 from PostgreSQL via `LISTEN nautilus_plan_locked`, assembles `LiveNode` (`TRADER-LIVE-001`)
-with `DataInfra`, `Alpaca`, `PlanGateExecAlgorithm`, `PostgresTelemetryActor`, and pre-audited
+with `DataInfra`, `Alpaca`, Rust `PreTradeRiskGate` (`PostgresPlanGateBackend`), `CollaredTwapExecAlgorithm`,
+`PostgresTelemetryActor`, and pre-audited
 `Strategy`s, and runs the live execution event loop.
 """
 
@@ -11,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import gc
 import logging
 import os
 import sys
@@ -35,11 +37,23 @@ from nautilus_trader.quant.nodes.live_node import (
     resolve_trading_mode,
     validate_paper_live_isolation,
 )
-from nautilus_trader.adapters.alpaca import AlpacaExecClientConfig
 from nautilus_trader.common import Environment
 
 logger = logging.getLogger("nautilus.live_node")
 NY_TZ = ZoneInfo("America/New_York")
+
+__all__ = [
+    "NY_TZ",
+    "TRADING_MODE_ENV_VARS",
+    "DailyPlanReconciler",
+    "DailyPlanRolloverListener",
+    "NautilusLiveNodeAssembler",
+    "build_alpaca_config_from_env",
+    "main",
+    "resolve_trading_date",
+    "resolve_trading_mode",
+    "validate_paper_live_isolation",
+]
 
 
 def resolve_trading_date(explicit_date: Optional[str] = None) -> date:
@@ -86,6 +100,73 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Build and verify LiveNode wiring from LOCKED plan, then dispose and exit 0",
     )
     return parser
+
+
+def _run_live_node_cycle(
+    *,
+    assembler: NautilusLiveNodeAssembler,
+    dsn: str,
+    active_trading_date: date,
+    listen_timeout_secs: float,
+    dry_run_build: bool,
+) -> tuple[bool, Optional[date]]:
+    bundle = assembler.build_live_node(
+        trading_date=active_trading_date,
+        listen_timeout_secs=listen_timeout_secs,
+        submit_protective_stop=True,
+    )
+    logger.info(
+        "Built LiveNode for trading_date=%s items=%d strategies=%d venues=%s",
+        bundle.trading_date.isoformat(),
+        len(bundle.plan_items),
+        len(bundle.strategies),
+        bundle.routed_venues,
+    )
+    market_name = os.environ.get("TRADING_MARKET", "US_EQUITY")
+    reconciler = bundle.reconciler or DailyPlanReconciler.from_bundle(
+        bundle,
+        assembler=assembler,
+    )
+    rollover_listener = DailyPlanRolloverListener(
+        dsn=dsn,
+        reconciler=reconciler,
+        repository=assembler.repository,
+        market=market_name,
+        on_rollover_callback=lambda report: logger.info(
+            "Completed daily TradingPlan rollover for %s: new=%s renewed=%s carry_over=%s invalidated=%s",
+            report.trading_date.isoformat(),
+            report.new_active_symbols,
+            report.renewed_active_symbols,
+            report.carry_over_exit_only_symbols,
+            report.thesis_invalidated_exit_symbols,
+        ),
+    )
+    try:
+        if dry_run_build:
+            return False, None
+        if hasattr(bundle.node, "run_async") and callable(bundle.node.run_async):
+            async def _drive_live_node(
+                _reconciler: DailyPlanReconciler = reconciler,
+                _listener: DailyPlanRolloverListener = rollover_listener,
+                _node: object = bundle.node,
+            ) -> None:
+                _reconciler.bind_event_loop(asyncio.get_running_loop())
+                _listener.start_background_listener()
+                await _node.run_async()  # type: ignore[attr-defined]
+
+            asyncio.run(_drive_live_node())
+        else:
+            rollover_listener.start_background_listener()
+            bundle.node.run()
+        reload_required = bool(getattr(reconciler, "node_reload_required", False))
+        next_trading_date = reconciler.trading_date or active_trading_date
+        return reload_required, next_trading_date
+    finally:
+        rollover_listener.stop()
+        reconciler.close()
+        bundle.plan_gate_backend.close()
+        bundle.telemetry_actor.close()
+        bundle.node.dispose()
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
@@ -135,60 +216,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     try:
         active_trading_date = trading_date
         while True:
-            bundle = assembler.build_live_node(
-                trading_date=active_trading_date,
-                listen_timeout_secs=args.listen_timeout_secs,
-                submit_protective_stop=True,
-            )
-            logger.info(
-                "Built LiveNode for trading_date=%s items=%d strategies=%d venues=%s",
-                bundle.trading_date.isoformat(),
-                len(bundle.plan_items),
-                len(bundle.strategies),
-                bundle.routed_venues,
-            )
-            market_name = os.environ.get("TRADING_MARKET", "US_EQUITY")
-            reconciler = bundle.reconciler or DailyPlanReconciler.from_bundle(
-                bundle,
+            reload_required, next_trading_date = _run_live_node_cycle(
                 assembler=assembler,
-            )
-            rollover_listener = DailyPlanRolloverListener(
                 dsn=dsn,
-                reconciler=reconciler,
-                repository=assembler.repository,
-                market=market_name,
-                on_rollover_callback=lambda report: logger.info(
-                    "Completed daily TradingPlan rollover for %s: new=%s renewed=%s carry_over=%s invalidated=%s",
-                    report.trading_date.isoformat(),
-                    report.new_active_symbols,
-                    report.renewed_active_symbols,
-                    report.carry_over_exit_only_symbols,
-                    report.thesis_invalidated_exit_symbols,
-                ),
+                active_trading_date=active_trading_date,
+                listen_timeout_secs=args.listen_timeout_secs,
+                dry_run_build=args.dry_run_build,
             )
-            try:
-                if args.dry_run_build:
-                    return 0
-                rollover_listener.start_background_listener()
-                if hasattr(bundle.node, "run_async") and callable(bundle.node.run_async):
-                    async def _drive_live_node(
-                        _reconciler: DailyPlanReconciler = reconciler,
-                        _node: object = bundle.node,
-                    ) -> None:
-                        _reconciler.bind_event_loop(asyncio.get_running_loop())
-                        await _node.run_async()  # type: ignore[attr-defined]
-
-                    asyncio.run(_drive_live_node())
-                else:
-                    bundle.node.run()
-            finally:
-                rollover_listener.stop()
-                bundle.plan_gate.close()
-                bundle.telemetry_actor.close()
-                bundle.node.dispose()
-
-            if getattr(reconciler, "node_reload_required", False):
-                active_trading_date = reconciler.trading_date or active_trading_date
+            if reload_required:
+                active_trading_date = next_trading_date or active_trading_date
+                gc.collect()
                 logger.info(
                     "Reloading LiveNode bundle for trading_date=%s after dynamic strategy rollover",
                     active_trading_date.isoformat(),

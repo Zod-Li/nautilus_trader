@@ -25,6 +25,7 @@ extension-module = [
   "nautilus-common/extension-module",
   "nautilus-core/extension-module",
   "nautilus-model/extension-module",
+  "nautilus-risk/extension-module",
   "python",
   "pyo3/extension-module",
 ]
@@ -32,6 +33,7 @@ python = [
   "nautilus-common/python",
   "nautilus-core/python",
   "nautilus-model/python",
+  "nautilus-risk/python",
   "pyo3",
   "pyo3-stub-gen",
 ]
@@ -41,6 +43,7 @@ high-precision = ["nautilus-model/high-precision"]
 nautilus-common = { workspace = true }
 nautilus-core = { workspace = true }
 nautilus-model = { workspace = true }
+nautilus-risk = { workspace = true }
 
 ahash = { workspace = true }
 anyhow = { workspace = true }

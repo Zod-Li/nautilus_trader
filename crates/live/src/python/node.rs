@@ -934,6 +934,24 @@ impl PyLiveNode {
         }
     }
 
+    /// Sets an optional external pre-trade risk gate on the node's [`RiskEngine`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the node is no longer available for mutation.
+    #[pyo3(name = "set_pre_trade_risk_gate")]
+    fn py_set_pre_trade_risk_gate(
+        &self,
+        gate: Option<nautilus_risk::gate::PyPreTradeRiskGateHandle>,
+    ) -> PyResult<()> {
+        self.node()?
+            .kernel()
+            .risk_engine()
+            .borrow_mut()
+            .set_pre_trade_gate(gate.map(|h| h.0));
+        Ok(())
+    }
+
     /// Adds a callback for supported typed external messages.
     ///
     /// While the node's run loop services external ingress, processors run in registration order

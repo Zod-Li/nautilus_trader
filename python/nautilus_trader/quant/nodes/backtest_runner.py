@@ -1,8 +1,10 @@
 """Isomorphic Backtest Runner, Walk-Forward Calibrator, and Counterfactual Stress Falsifier.
 
-Implements Ticket #14 (`14-isomorphic-backtest-runner-and-stress-falsifier-seam.md`):
-- Runs the exact 1:1 isomorphic combination `BacktestEngine` + `Strategy(StrategyConfig)` +
-  `PlanGateExecAlgorithm(PlanRiskEnvelope)` over `DataInfraCatalog` historical bars/quotes.
+Implements SPEC-0007 isomorphic backtest verification:
+- Runs the 1:1 isomorphic combination `BacktestEngine` + `Strategy(StrategyConfig)` +
+  Rust `PreTradeRiskGate` (`PostgresPlanGateBackend.as_pre_trade_risk_gate()`) +
+  `CollaredTwapExecAlgorithm` + `IbkrProFixedUsEquityFeeModel` over dual-stream
+  (`15m` + `1m`) `DataInfraCatalog` historical bars/quotes.
 - Computes non-annualized Per-Period Deflated Sharpe Ratio (DSR) per Bailey & Lopez de Prado,
   Walk-Forward In-Sample / Out-of-Sample statistics, and Pareto dominance frontier.
 - Executes 3 counterfactual stress falsification experiments in `BacktestEngine`:
@@ -13,7 +15,6 @@ Implements Ticket #14 (`14-isomorphic-backtest-runner-and-stress-falsifier-seam.
 
 from __future__ import annotations
 
-import gc
 import math
 import os
 import statistics
@@ -24,16 +25,29 @@ from decimal import Decimal
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
 from urllib.parse import quote
 
+from evolution_engine.config_center.envelope import load_envelope
+from evolution_engine.config_center.schema import SystemConfig
 from nautilus_trader.quant.contracts.models import (
-    BREAKOUT_ARCHETYPE_IDS,
+    ArchetypeStrategyConfig,
+    ExecutionSpec,
     PlanItemContract,
+    PlanRiskEnvelope,
     PlanSide,
+    rule_612_tick_size,
 )
 from nautilus_trader.quant.strategies.empirical import rolling_atr
-from nautilus_trader.quant.governance.plan_gate import (
-    PLAN_GATE_EXEC_ALGORITHM_ID,
-    PlanGateExecAlgorithm,
-    PlanGateExecAlgorithmConfig,
+from nautilus_trader.quant.execution_algorithms.collared_twap import (
+    COLLARED_TWAP_EXEC_ALGORITHM_ID,
+    CollaredTwapExecAlgorithm,
+    CollaredTwapExecAlgorithmConfig,
+)
+from nautilus_trader.quant.execution_algorithms.friction import (
+    IbkrProFeeSchedule,
+    IbkrProFixedUsEquityFeeModel,
+    MarketImpactSpec,
+    compute_half_spread_and_sqrt_impact,
+)
+from nautilus_trader.quant.governance.plan_gate_backend import (
     PostgresPlanGateBackend,
 )
 from nautilus_trader.quant.governance.telemetry_actor import (
@@ -46,13 +60,14 @@ from nautilus_trader.quant.strategies.registry import (
 )
 from nautilus_trader.adapters.datainfra import DataInfraCatalog, DataInfraConfig
 from nautilus_trader.backtest import BacktestEngine, BacktestEngineConfig
+from nautilus_trader.common import LoggerConfig, LogLevel
 from nautilus_trader.execution import (
     BestPriceFillModel,
     FillModel,
-    MakerTakerFeeModel,
     OneTickSlippageFillModel,
     StaticLatencyModel,
 )
+from nautilus_trader.risk import RiskEngineConfig
 from nautilus_trader.model import (
     AccountType,
     Bar,
@@ -191,14 +206,89 @@ def _parse_money_float(val: Any) -> float:
         return 0.0
 
 
-def _create_default_equity(symbol: str, venue_str: str = "ALPACA") -> Equity:
+def _bar_step_ns(bar: Bar) -> int:
+    """Returns bar duration in nanoseconds so `1m` bars sort ahead of `15m` bars at identical `ts_init`."""
+    bar_type = getattr(bar, "bar_type", None)
+    spec = getattr(bar_type, "spec", None)
+    step = int(getattr(spec, "step", 1) or 1)
+    agg = str(getattr(spec, "aggregation", "") or "").upper()
+    if "SECOND" in agg:
+        return step * 1_000_000_000
+    if "MINUTE" in agg:
+        return step * 60_000_000_000
+    if "HOUR" in agg:
+        return step * 3_600_000_000_000
+    if "DAY" in agg:
+        return step * 86_400_000_000_000
+    raw = str(bar_type or "").upper()
+    if "1-MINUTE" in raw:
+        return 60_000_000_000
+    if "5-MINUTE" in raw:
+        return 300_000_000_000
+    if "15-MINUTE" in raw:
+        return 900_000_000_000
+    if "1-HOUR" in raw:
+        return 3_600_000_000_000
+    if "1-DAY" in raw:
+        return 86_400_000_000_000
+    return 900_000_000_000
+
+
+def _timeframe_step_ns(bar_timeframe: str) -> int:
+    tf = (bar_timeframe or "").strip().lower()
+    if tf.endswith("s") and tf[:-1].isdigit():
+        return int(tf[:-1]) * 1_000_000_000
+    if tf.endswith("m") and tf[:-1].isdigit():
+        return int(tf[:-1]) * 60_000_000_000
+    if tf.endswith("h") and tf[:-1].isdigit():
+        return int(tf[:-1]) * 3_600_000_000_000
+    if tf.endswith("d") and tf[:-1].isdigit():
+        return int(tf[:-1]) * 86_400_000_000_000
+    return 900_000_000_000
+
+
+def _filter_primary_bars(
+    bars: Sequence[Bar],
+    plan_item: PlanItemContract,
+) -> List[Bar]:
+    primary_inst = plan_item.strategy_config.instrument_id
+    inst_bars = [b for b in bars if str(b.bar_type.instrument_id) == primary_inst]
+    target_step = _timeframe_step_ns(plan_item.strategy_config.bar_timeframe)
+    matched = [b for b in inst_bars if _bar_step_ns(b) == target_step]
+    return matched if matched else inst_bars
+
+
+def _sort_bars_deterministic(bars: Sequence[Bar]) -> List[Bar]:
+    return sorted(
+        list(bars),
+        key=lambda b: (int(b.ts_init), _bar_step_ns(b), str(b.bar_type)),
+    )
+
+
+def _create_default_equity(
+    symbol: str,
+    venue_str: str = "ALPACA",
+    ref_price: Optional[float] = None,
+) -> Equity:
     inst_id = InstrumentId.from_str(f"{symbol}.{venue_str}")
+    ref_dec = (
+        Decimal(str(ref_price))
+        if ref_price is not None and float(ref_price) > 0.0
+        else Decimal("100")
+    )
+    tick = rule_612_tick_size(ref_dec)
+    tick_str = f"{tick:.4f}".rstrip("0").rstrip(".") if tick < Decimal("0.01") else "0.01"
+    if tick_str == "0.0001":
+        prec = 4
+    else:
+        tick_str = "0.01"
+        prec = 2
     return Equity(
         instrument_id=inst_id,
         raw_symbol=inst_id.symbol,
         currency=Currency.from_str("USD"),
-        price_precision=2,
-        price_increment=Price.from_str("0.01"),
+        price_precision=prec,
+        price_increment=Price.from_str(tick_str),
         lot_size=Quantity.from_int(1),
         ts_event=0,
         ts_init=0,
@@ -309,7 +399,7 @@ def _normalize_bars_for_parity(bars: Sequence[Bar]) -> List[Bar]:
             )
         else:
             normalized.append(b)
-    return sorted(normalized, key=lambda b: int(b.ts_init))
+    return _sort_bars_deterministic(normalized)
 
 
 def _resolve_trading_date_from_bars(
@@ -465,29 +555,49 @@ def select_pareto_frontier(
 
 
 class IsomorphicBacktestRunner:
-    """Runs 1:1 isomorphic backtests in `Nautilus BacktestEngine` with `PlanGateExecAlgorithm`."""
+    """Runs 1:1 isomorphic backtests in `Nautilus BacktestEngine` with Rust `PreTradeRiskGate` and `CollaredTwapExecAlgorithm`."""
 
     def __init__(
         self,
         dsn: Optional[str] = None,
         datainfra_config: Optional[DataInfraConfig] = None,
         starting_capital_usd: Decimal | float | str = Decimal("100000.00"),
-        maker_fee_rate: Decimal | float | str = Decimal("0.0002"),
-        taker_fee_rate: Decimal | float | str = Decimal("0.0005"),
-        slippage_bps: Decimal | float | str = Decimal("2.5"),
+        maker_fee_rate: Optional[Decimal | float | str] = None,
+        taker_fee_rate: Optional[Decimal | float | str] = None,
+        slippage_bps: Optional[Decimal | float | str] = None,
         effective_trials: int = 1,
         venue_name: str = "ALPACA",
+        fee_schedule: Optional[IbkrProFeeSchedule] = None,
+        market_impact_spec: Optional[MarketImpactSpec] = None,
+        half_spread_bps: Optional[float] = None,
+        impact_coefficient_y: Optional[float] = None,
+        system_config: Optional[SystemConfig] = None,
     ) -> None:
         self._dsn = dsn
         self._datainfra_config = datainfra_config
         self._starting_capital_usd = Decimal(str(starting_capital_usd))
-        self._maker_fee_rate = Decimal(str(maker_fee_rate))
-        self._taker_fee_rate = Decimal(str(taker_fee_rate))
-        self._slippage_bps = Decimal(str(slippage_bps))
+        _ = (maker_fee_rate, taker_fee_rate)
+        self._fee_schedule = fee_schedule or IbkrProFeeSchedule()
+        eff_half_bps = (
+            float(half_spread_bps)
+            if half_spread_bps is not None
+            else (float(slippage_bps) if slippage_bps is not None else None)
+        )
+        self._explicit_half_spread_bps: Optional[float] = eff_half_bps
+        self._explicit_impact_y: Optional[float] = (
+            float(impact_coefficient_y) if impact_coefficient_y is not None else None
+        )
+        self._market_impact_spec = market_impact_spec or MarketImpactSpec(
+            half_spread_bps=float(eff_half_bps if eff_half_bps is not None else 0.0),
+            impact_coefficient_y=float(
+                impact_coefficient_y if impact_coefficient_y is not None else 0.0
+            ),
+        )
+        self._system_config = system_config
         self._effective_trials = max(1, int(effective_trials))
         self._venue_name = str(venue_name or "ALPACA").strip().upper()
         self._last_first_entry_fill: Optional[Tuple[int, float]] = None
-        self._last_plan_gate: Optional[PlanGateExecAlgorithm] = None
+        self._last_plan_gate_backend: Optional[PostgresPlanGateBackend] = None
         self._last_oco_monitor: Optional[ProtectiveOcoMonitor] = None
         self._last_telemetry_actor: Optional[PostgresTelemetryActor] = None
         self._last_strategy: Optional[Any] = None
@@ -503,48 +613,69 @@ class IsomorphicBacktestRunner:
         include_quotes: bool = False,
         include_statuses: bool = False,
     ) -> Tuple[List[Equity], List[Bar], List[QuoteTick], List[InstrumentStatus]]:
-        """Loads instruments, bars, quotes, and statuses from `DataInfraCatalog`."""
+        """Loads instruments, dual-stream bars (`15m` + `1m`), quotes, and statuses from `DataInfraCatalog`."""
         if self._datainfra_config is None:
             raise ValueError(
                 "DataInfraConfig is required to load historical data from DataInfraCatalog"
             )
-        catalog = DataInfraCatalog(self._datainfra_config)
-        symbols = [plan_item.symbol]
-        venue = plan_item.venue or self._venue_name
-        equities = [
-            catalog.register_equity(sym, venue=venue, lot_size=1)
-            for sym in symbols
-        ]
-        bars = catalog.query_bars(
-            symbols,
-            start_ts_ns=start_ns,
-            end_ts_ns=end_ns,
-            timeframe=plan_item.strategy_config.bar_timeframe,
-            adjustment="adjusted",
-            market_session="REG",
-            venue=venue,
-        )
-        quotes = (
-            catalog.query_quotes(
+        catalog: Optional[DataInfraCatalog] = DataInfraCatalog(self._datainfra_config)
+        try:
+            symbols = [plan_item.symbol]
+            venue = plan_item.venue or self._venue_name
+            equities = [
+                catalog.register_equity(sym, venue=venue, lot_size=1)
+                for sym in symbols
+            ]
+            primary_bars = catalog.query_bars(
                 symbols,
                 start_ts_ns=start_ns,
                 end_ts_ns=end_ns,
+                timeframe=plan_item.strategy_config.bar_timeframe,
+                adjustment="adjusted",
+                market_session="REG",
                 venue=venue,
             )
-            if include_quotes
-            else []
-        )
-        statuses = (
-            catalog.query_statuses(
-                symbols,
-                start_ts_ns=start_ns,
-                end_ts_ns=end_ns,
-                venue=venue,
+            dedup_bars: Dict[Tuple[str, int], Bar] = {}
+            for b in primary_bars or ():
+                dedup_bars[(str(b.bar_type), int(b.ts_init))] = b
+            tf_norm = (plan_item.strategy_config.bar_timeframe or "15m").strip().lower()
+            if tf_norm != "1m":
+                exec_bars = catalog.query_bars(
+                    symbols,
+                    start_ts_ns=start_ns,
+                    end_ts_ns=end_ns,
+                    timeframe="1m",
+                    adjustment="adjusted",
+                    market_session="REG",
+                    venue=venue,
+                )
+                for b in exec_bars or ():
+                    if _bar_step_ns(b) == 60_000_000_000:
+                        dedup_bars[(str(b.bar_type), int(b.ts_init))] = b
+            bars = _sort_bars_deterministic(list(dedup_bars.values()))
+            quotes = (
+                catalog.query_quotes(
+                    symbols,
+                    start_ts_ns=start_ns,
+                    end_ts_ns=end_ns,
+                    venue=venue,
+                )
+                if include_quotes
+                else []
             )
-            if include_statuses
-            else []
-        )
-        return equities, bars, quotes, statuses
+            statuses = (
+                catalog.query_statuses(
+                    symbols,
+                    start_ts_ns=start_ns,
+                    end_ts_ns=end_ns,
+                    venue=venue,
+                )
+                if include_statuses
+                else []
+            )
+            return equities, bars, quotes, statuses
+        finally:
+            catalog = None
 
     def run_backtest(
         self,
@@ -570,7 +701,7 @@ class IsomorphicBacktestRunner:
         walk_forward: Optional[WalkForwardSummary] = None,
         effective_trials: Optional[int] = None,
     ) -> IsomorphicBacktestMetrics:
-        """Executes a 5-axis isomorphic backtest in `BacktestEngine` with `PlanGateExecAlgorithm(PostgresPlanGateBackend)` and `ProtectiveOcoMonitor`."""
+        """Executes a 5-axis isomorphic backtest in `BacktestEngine` with Rust `PreTradeRiskGate`, `CollaredTwapExecAlgorithm`, and `ProtectiveOcoMonitor`."""
         venue_str = (
             plan_item.strategy_config.instrument_id.split(".", 1)[1].strip().upper()
             if "." in plan_item.strategy_config.instrument_id
@@ -595,7 +726,16 @@ class IsomorphicBacktestRunner:
             if equities is not None:
                 equity_list = list(equities)
             else:
-                equity_list = [_create_default_equity(plan_item.symbol, venue_str)]
+                ref_px = float(plan_item.risk_envelope.reference_price or 0.0)
+                if ref_px <= 0.0 and bar_list:
+                    ref_px = float(bar_list[0].close)
+                equity_list = [
+                    _create_default_equity(
+                        plan_item.symbol,
+                        venue_str,
+                        ref_price=ref_px if ref_px > 0.0 else None,
+                    )
+                ]
 
         if not bar_list:
             raise ValueError(f"Cannot run backtest for {plan_item.symbol}: bar list is empty")
@@ -626,24 +766,75 @@ class IsomorphicBacktestRunner:
                     )
                 else:
                     engine_bar_list.append(b)
+            engine_bar_list = _sort_bars_deterministic(engine_bar_list)
         else:
             engine_bar_list = bar_list
         effective_date = _resolve_trading_date_from_bars(bar_list, fallback=trading_date)
         items_to_lock = _build_parity_plan_items(plan_item, venue_str)
         cloned_primary = items_to_lock[0]
 
-        engine = BacktestEngine(
-            BacktestEngineConfig(bypass_logging=True, run_analysis=False)
+        sys_cfg = self._system_config or SystemConfig()
+        env_cfg = load_envelope()
+        env_notional = env_cfg.numeric.get("risk.max_order_notional_usd")
+        if self._system_config is not None:
+            order_notional_cap = float(sys_cfg.risk.max_order_notional_usd)
+        elif isinstance(env_notional, Mapping) and env_notional.get("max") is not None:
+            order_notional_cap = float(env_notional["max"])
+        else:
+            order_notional_cap = float(sys_cfg.risk.max_order_notional_usd)
+        max_slices = max(
+            1,
+            max(
+                int(getattr(it.execution_spec, "num_slices", 4) or 4)
+                for it in items_to_lock
+            ),
         )
-        plan_gate: Optional[PlanGateExecAlgorithm] = None
+        max_positions = max(
+            1, int(getattr(sys_cfg.admission, "max_new_positions_per_day", 2) or 2)
+        )
+        submit_limit = max(30, len(items_to_lock) * max_slices * max_positions * 2)
+        modify_limit = max(submit_limit, len(items_to_lock) * max_slices * max_positions * 4)
+        risk_engine_cfg = RiskEngineConfig(
+            max_notional_per_order={
+                str(eq.id): f"{order_notional_cap:.2f}" for eq in equity_list
+            },
+            max_order_submit_rate=f"{submit_limit}/00:01:00",
+            max_order_modify_rate=f"{modify_limit}/00:01:00",
+        )
+        engine = BacktestEngine(
+            BacktestEngineConfig(
+                bypass_logging=True,
+                run_analysis=False,
+                logging=LoggerConfig(
+                    stdout_level=LogLevel.ERROR,
+                    bypass_logging=True,
+                    print_config=False,
+                ),
+                risk_engine=risk_engine_cfg,
+            )
+        )
+        snapshot_backend: Optional[PostgresPlanGateBackend] = None
+        collared_twap: Optional[CollaredTwapExecAlgorithm] = None
         telemetry_actor: Optional[PostgresTelemetryActor] = None
         strategy: Optional[Any] = None
+        effective_fill_model: Optional[FillModel] = None
+        effective_fee_model: Optional[IbkrProFixedUsEquityFeeModel] = None
+        effective_latency_model: Optional[StaticLatencyModel] = None
+        self._last_orders.clear()
         try:
-            eff_maker = self._maker_fee_rate * Decimal(str(max(0.0, fee_multiplier)))
-            eff_taker = self._taker_fee_rate * Decimal(str(max(0.0, fee_multiplier)))
             effective_fill_model = fill_model or BestPriceFillModel(
                 prob_fill_on_limit=1.0,
                 prob_slippage=0.0,
+            )
+            effective_fee_model = IbkrProFixedUsEquityFeeModel(
+                schedule=self._fee_schedule,
+                fee_multiplier=max(0.0, float(fee_multiplier)),
+            )
+            effective_latency_model = StaticLatencyModel(
+                base_latency_nanos=0,
+                insert_latency_nanos=1,
+                update_latency_nanos=0,
+                cancel_latency_nanos=0,
             )
             engine_slippage_active = isinstance(
                 effective_fill_model, OneTickSlippageFillModel
@@ -657,18 +848,9 @@ class IsomorphicBacktestRunner:
                 starting_balances=[Money.from_str(f"{self._starting_capital_usd:.2f} USD")],
                 base_currency=Currency.from_str("USD"),
                 fill_model=effective_fill_model,
-                fee_model=MakerTakerFeeModel(
-                    maker_rate=eff_maker,
-                    taker_rate=eff_taker,
-                ),
-                latency_model=StaticLatencyModel(
-                    base_latency_nanos=0,
-                    insert_latency_nanos=1,
-                    update_latency_nanos=0,
-                    cancel_latency_nanos=0,
-                ),
-                # Trigger already-marketable protective stops on coarse 15m bars instead of rejecting them.
-                reject_stop_orders=False,
+                fee_model=effective_fee_model,
+                latency_model=effective_latency_model,
+                reject_stop_orders=True,
             )
             for eq in equity_list:
                 engine.add_instrument(eq)
@@ -689,6 +871,27 @@ class IsomorphicBacktestRunner:
                     updated_by=f"nautilus:protective_oco_monitor:{sym}",
                 ),
             )
+            primary_exec_spec = getattr(cloned_primary, "execution_spec", None)
+            collared_twap = CollaredTwapExecAlgorithm(
+                config=CollaredTwapExecAlgorithmConfig(
+                    exec_algorithm_id=COLLARED_TWAP_EXEC_ALGORITHM_ID,
+                    horizon_secs=float(
+                        getattr(primary_exec_spec, "twap_horizon_secs", 900) or 900.0
+                    ),
+                    interval_secs=float(
+                        getattr(primary_exec_spec, "twap_interval_secs", 60) or 60.0
+                    ),
+                    default_collar_pct=Decimal(
+                        str(cloned_primary.risk_envelope.collar.limit_collar_pct)
+                    ),
+                    default_collar_atr=Decimal(
+                        str(cloned_primary.risk_envelope.collar.limit_collar_atr)
+                    ),
+                    fee_schedule=self._fee_schedule,
+                    log_events=False,
+                    log_commands=False,
+                ),
+            )
             telemetry_actor = PostgresTelemetryActor(
                 config=PostgresTelemetryActorConfig(
                     dsn=None,
@@ -696,18 +899,12 @@ class IsomorphicBacktestRunner:
                     enforce_protective_oco_on_position_events=bool(submit_protective_stop),
                 ),
                 oco_monitor=oco_monitor,
+                plan_gate_backend=snapshot_backend,
+                cancel_symbol_entries_callback=collared_twap.cancel_symbol_entries,
             )
-            plan_gate = PlanGateExecAlgorithm(
-                backend=snapshot_backend,
-                telemetry_actor=telemetry_actor,
-                oco_monitor=oco_monitor,
-                config=PlanGateExecAlgorithmConfig(
-                    exec_algorithm_id=PLAN_GATE_EXEC_ALGORITHM_ID,
-                    collar_market_orders=bool(use_limit_orders),
-                ),
-            )
+            engine.set_pre_trade_risk_gate(snapshot_backend.as_pre_trade_risk_gate())
             engine.add_actor(telemetry_actor)
-            engine.add_exec_algorithm(plan_gate)
+            engine.add_exec_algorithm(collared_twap)
 
             strategy = instantiate_strategy_from_contract(
                 cloned_primary,
@@ -716,8 +913,6 @@ class IsomorphicBacktestRunner:
                 execution_delay_bars=execution_delay_bars,
             )
             strategy.bind_telemetry_actor(telemetry_actor)
-            if hasattr(strategy, "bind_plan_gate"):
-                strategy.bind_plan_gate(plan_gate)
             if has_raw_divergence and hasattr(strategy, "bind_dual_track_bar_extremes"):
                 strategy.bind_dual_track_bar_extremes(
                     cleaned_by_ts_ns=cleaned_by_ts_ns,
@@ -735,8 +930,9 @@ class IsomorphicBacktestRunner:
             engine.add_data(engine_bar_list)
 
             engine.run()
+            snapshot_backend.flush_rust_mutations(1024)
 
-            self._last_plan_gate = plan_gate
+            self._last_plan_gate_backend = snapshot_backend
             self._last_oco_monitor = oco_monitor
             self._last_telemetry_actor = telemetry_actor
             self._last_strategy = strategy
@@ -744,7 +940,8 @@ class IsomorphicBacktestRunner:
                 engine=engine,
                 plan_item=cloned_primary,
                 bars=bar_list,
-                plan_gate=plan_gate,
+                quotes=quote_list,
+                backend=snapshot_backend,
                 slippage_multiplier=slippage_multiplier,
                 walk_forward=walk_forward,
                 effective_trials=effective_trials,
@@ -752,19 +949,44 @@ class IsomorphicBacktestRunner:
             )
         finally:
             if strategy is not None:
-                if hasattr(strategy, "_telemetry_actor"):
-                    strategy._telemetry_actor = None
-                if hasattr(strategy, "_plan_gate"):
-                    strategy._plan_gate = None
+                if hasattr(strategy, "_telemetry_actor_ref"):
+                    strategy._telemetry_actor_ref = None
+                if hasattr(strategy, "_cached_order_factory"):
+                    strategy._cached_order_factory = None
+                if hasattr(strategy, "_cached_clock"):
+                    strategy._cached_clock = None
+                if hasattr(strategy, "_warmup_loader"):
+                    strategy._warmup_loader = None
+            if collared_twap is not None:
+                collared_twap._schedules_by_primary.clear()
+                collared_twap._primary_by_child.clear()
+                collared_twap._primary_by_timer.clear()
+                collared_twap._primaries_by_symbol.clear()
             if telemetry_actor is not None:
+                telemetry_actor._cached_cache = None
+                telemetry_actor._cached_clock = None
+                telemetry_actor._cancel_symbol_entries_callback = None
+                telemetry_actor._plan_gate_backend = None
+                telemetry_actor._plan_repo = None
+                if (
+                    hasattr(telemetry_actor, "_oco_monitor")
+                    and telemetry_actor._oco_monitor is not None
+                ):
+                    telemetry_actor._oco_monitor._on_entry_freeze_callback = None
+                    telemetry_actor._oco_monitor._entry_freeze_callbacks.clear()
                 telemetry_actor.close()
-            if plan_gate is not None:
-                plan_gate.close()
-                plan_gate._telemetry_actor = None
-                plan_gate._oco_monitor = None
+            if snapshot_backend is not None:
+                snapshot_backend.close()
             engine.dispose()
-            del engine
-            gc.collect()
+            del (
+                effective_fill_model,
+                effective_fee_model,
+                effective_latency_model,
+                strategy,
+                collared_twap,
+                telemetry_actor,
+                engine,
+            )
 
     def run_walk_forward(
         self,
@@ -783,16 +1005,13 @@ class IsomorphicBacktestRunner:
 
         if bars is None:
             loaded_equities, loaded_bars, _, _ = self.load_historical_data(plan_item)
-            bar_list = sorted(loaded_bars, key=lambda b: b.ts_init)
+            bar_list = _sort_bars_deterministic(loaded_bars)
             equity_list = list(loaded_equities)
         else:
-            bar_list = sorted(bars, key=lambda b: b.ts_init)
+            bar_list = _sort_bars_deterministic(bars)
             equity_list = list(equities) if equities is not None else None
 
-        primary_inst_str = plan_item.strategy_config.instrument_id
-        primary_bars = [
-            b for b in bar_list if str(b.bar_type.instrument_id) == primary_inst_str
-        ]
+        primary_bars = _filter_primary_bars(bar_list, plan_item)
         min_required = plan_item.strategy_config.lookback_window + 2
         if len(primary_bars) < min_required + 4:
             raise ValueError(
@@ -871,7 +1090,8 @@ class IsomorphicBacktestRunner:
         engine: BacktestEngine,
         plan_item: PlanItemContract,
         bars: Sequence[Bar],
-        plan_gate: Optional[PlanGateExecAlgorithm],
+        quotes: Sequence[QuoteTick] = (),
+        backend: Optional[PostgresPlanGateBackend],
         slippage_multiplier: float,
         walk_forward: Optional[WalkForwardSummary],
         effective_trials: Optional[int] = None,
@@ -906,14 +1126,12 @@ class IsomorphicBacktestRunner:
         trade_pnls: List[float] = []
 
         primary_inst = plan_item.strategy_config.instrument_id
-        primary_bars = sorted(
-            [b for b in bars if str(b.bar_type.instrument_id) == primary_inst],
-            key=lambda b: b.ts_init,
-        )
+        primary_bars = _sort_bars_deterministic(_filter_primary_bars(bars, plan_item))
         last_close_by_inst: Dict[str, float] = {}
         for b in bars:
             last_close_by_inst[str(b.bar_type.instrument_id)] = float(b.close)
 
+        filled_fills: List[Tuple[float, float]] = []
         first_entry_fill: Optional[Tuple[int, float]] = None
         for o in sorted(
             orders,
@@ -931,6 +1149,8 @@ class IsomorphicBacktestRunner:
                 if px_f <= 0.0:
                     px_f = last_close_by_inst.get(str(o.instrument_id), 0.0)
                 traded_notional += abs(qty_f * px_f)
+                if qty_f > 0.0 and px_f > 0.0:
+                    filled_fills.append((px_f, qty_f))
                 if (
                     first_entry_fill is None
                     and not bool(getattr(o, "is_reduce_only", False))
@@ -944,6 +1164,13 @@ class IsomorphicBacktestRunner:
 
         order_init_ts_by_id: Dict[str, int] = {
             str(getattr(o, "client_order_id", "")): int(getattr(o, "ts_init", 0) or 0)
+            for o in orders
+            if str(getattr(o, "client_order_id", ""))
+        }
+        order_spawn_id_by_id: Dict[str, str] = {
+            str(getattr(o, "client_order_id", "")): str(
+                getattr(o, "exec_spawn_id", "") or ""
+            )
             for o in orders
             if str(getattr(o, "client_order_id", ""))
         }
@@ -972,11 +1199,16 @@ class IsomorphicBacktestRunner:
             ts_opened = int(getattr(pos, "ts_opened", 0) or 0)
             ts_closed = int(getattr(pos, "ts_closed", 0) or 0)
             opening_ord_id = str(getattr(pos, "opening_order_id", "") or "")
-            signal_ts_ns = order_init_ts_by_id.get(opening_ord_id, 0)
+            spawn_ord_id = order_spawn_id_by_id.get(opening_ord_id, "")
+            signal_ts_ns = order_init_ts_by_id.get(
+                spawn_ord_id or opening_ord_id,
+                order_init_ts_by_id.get(opening_ord_id, 0),
+            )
             entry_px = _parse_money_float(getattr(pos, "avg_px_open", 0.0))
             trade_cycles.append(
                 {
                     "instrument_id": inst_key,
+                    "opening_order_id": opening_ord_id,
                     "signal_ts_ns": signal_ts_ns,
                     "ts_opened": ts_opened,
                     "ts_closed": ts_closed,
@@ -986,10 +1218,96 @@ class IsomorphicBacktestRunner:
             )
         self._last_trade_cycles = trade_cycles
 
-        slippage_rate = (float(self._slippage_bps) / 10_000.0) * max(
-            0.0, float(slippage_multiplier)
+        sizing_trace = dict(getattr(plan_item, "sizing_trace", {}) or {})
+        ref_px = float(plan_item.risk_envelope.reference_price or 0.0)
+        if ref_px <= 0.0 and primary_bars:
+            ref_px = float(primary_bars[-1].close)
+        daily_atr_val = float(getattr(plan_item.risk_envelope, "daily_atr_14", 0.0) or 0.0)
+        if daily_atr_val > 0.0 and ref_px > 0.0:
+            daily_sigma = daily_atr_val / ref_px
+        elif len(primary_bars) >= 3:
+            bar_rets = [
+                (float(primary_bars[i].close) / float(primary_bars[i - 1].close)) - 1.0
+                for i in range(1, len(primary_bars))
+                if float(primary_bars[i - 1].close) > 0.0
+            ]
+            if len(bar_rets) >= 2:
+                bars_per_day = max(
+                    1.0,
+                    BARS_PER_TRADING_YEAR.get(plan_item.strategy_config.bar_timeframe, 252.0)
+                    / 252.0,
+                )
+                daily_sigma = statistics.stdev(bar_rets) * math.sqrt(bars_per_day)
+            else:
+                daily_sigma = 0.0
+        else:
+            daily_sigma = 0.0
+
+        adv_raw = sizing_trace.get("adv_20_shares")
+        if adv_raw is not None and float(adv_raw) > 0.0:
+            adv_20_shares = float(adv_raw)
+        elif primary_bars:
+            vols_by_day: Dict[date, float] = {}
+            for pb in primary_bars:
+                pb_dt = datetime.fromtimestamp(
+                    int(pb.ts_init) / 1_000_000_000.0, tz=timezone.utc
+                ).date()
+                vols_by_day[pb_dt] = vols_by_day.get(pb_dt, 0.0) + float(pb.volume)
+            day_vols = [v for v in vols_by_day.values() if v > 0.0]
+            adv_20_shares = (
+                statistics.fmean(day_vols[-20:])
+                if day_vols
+                else max(1.0, sum(q for _, q in filled_fills))
+            )
+        else:
+            adv_20_shares = max(1.0, sum(q for _, q in filled_fills))
+
+        eff_half_bps = self._explicit_half_spread_bps
+        if eff_half_bps is None and quotes:
+            quote_spreads_bps: List[float] = []
+            for qt in quotes:
+                bid_f = float(qt.bid_price)
+                ask_f = float(qt.ask_price)
+                mid_f = 0.5 * (bid_f + ask_f)
+                if mid_f > 0.0 and ask_f >= bid_f:
+                    quote_spreads_bps.append(((ask_f - bid_f) / (2.0 * mid_f)) * 10_000.0)
+            if quote_spreads_bps:
+                eff_half_bps = statistics.median(quote_spreads_bps)
+        if eff_half_bps is None and sizing_trace.get("half_spread_bps") is not None:
+            eff_half_bps = max(0.0, float(sizing_trace["half_spread_bps"]))
+        if eff_half_bps is None:
+            if ref_px > 0.0:
+                eff_half_bps = (
+                    float(rule_612_tick_size(Decimal(str(ref_px)))) / (2.0 * ref_px)
+                ) * 10_000.0
+            else:
+                eff_half_bps = 0.0
+
+        eff_impact_y = self._explicit_impact_y
+        if eff_impact_y is None and sizing_trace.get("impact_coefficient_y") is not None:
+            eff_impact_y = max(0.0, float(sizing_trace["impact_coefficient_y"]))
+        if eff_impact_y is None:
+            eff_impact_y = float(self._market_impact_spec.impact_coefficient_y)
+
+        impact_spec = MarketImpactSpec(
+            half_spread_bps=max(0.0, float(eff_half_bps)),
+            impact_coefficient_y=max(0.0, float(eff_impact_y)),
+            min_adv_shares=self._market_impact_spec.min_adv_shares,
         )
-        est_slippage_cost = traded_notional * slippage_rate
+        slip_scale = max(0.0, float(slippage_multiplier))
+        est_slippage_cost = (
+            sum(
+                compute_half_spread_and_sqrt_impact(
+                    price=px_f,
+                    quantity=qty_f,
+                    daily_sigma=daily_sigma,
+                    adv_20_shares=adv_20_shares,
+                    spec=impact_spec,
+                ).total_slippage_usd
+                for px_f, qty_f in filled_fills
+            )
+            * slip_scale
+        )
         deducted_slippage_cost = (
             0.0 if engine_slippage_active else est_slippage_cost
         )
@@ -1050,9 +1368,19 @@ class IsomorphicBacktestRunner:
         max_single_loss = min(losses) if losses else min(0.0, net_pnl)
         turnover_ratio = (traded_notional / start_cap) if start_cap > 0.0 else 0.0
 
-        if plan_gate is not None:
-            admitted_cnt = sum(1 for d in plan_gate.decisions.values() if d.allowed)
-            denied_cnt = sum(1 for d in plan_gate.decisions.values() if not d.allowed)
+        if backend is not None:
+            gate_denied = sum(
+                1 for a in backend.alerts if str(a.get("kind") or "") == "ORDER_DENIED"
+            )
+            denied_cnt = max(
+                gate_denied,
+                sum(1 for o in orders if o.status == OrderStatus.DENIED),
+            )
+            admitted_cnt = sum(
+                1
+                for o in orders
+                if o.status not in (OrderStatus.DENIED, OrderStatus.INITIALIZED)
+            )
         else:
             admitted_cnt = filled_orders
             denied_cnt = denied_orders
@@ -1100,9 +1428,8 @@ class IsomorphicBacktestRunner:
         if len(primary_bars) < 2:
             return [], 0.0
 
-        bar_universe = sorted(
-            list(all_bars if all_bars is not None else primary_bars),
-            key=lambda b: int(b.ts_init),
+        bar_universe = _sort_bars_deterministic(
+            list(all_bars if all_bars is not None else primary_bars)
         )
         total_notional = 0.0
         raw_fills: List[Tuple[int, str, float, float, float]] = []
@@ -1219,6 +1546,8 @@ class StressFalsificationReport:
     tail_gap_shock_result: StressExperimentResult
     limit_collar_missed_fill_result: Optional[StressExperimentResult] = None
     failure_reasons: Tuple[str, ...] = field(default_factory=tuple)
+    conditional_event_r_multiples: Tuple[float, ...] = field(default_factory=tuple)
+    conditional_event_count: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
         payload: Dict[str, Any] = {
@@ -1235,7 +1564,28 @@ class StressFalsificationReport:
             payload["limit_collar_missed_fill_result"] = (
                 self.limit_collar_missed_fill_result.to_dict()
             )
+        if self.conditional_event_count > 0:
+            payload["conditional_event_count"] = int(self.conditional_event_count)
+            payload["conditional_event_r_multiples"] = [
+                round(float(r), 6) for r in self.conditional_event_r_multiples
+            ]
         return payload
+
+
+def _normalize_event_ts_ns(raw_ts: Any) -> int:
+    if isinstance(raw_ts, datetime):
+        dt = raw_ts if raw_ts.tzinfo is not None else raw_ts.replace(tzinfo=timezone.utc)
+        return int(round(dt.astimezone(timezone.utc).timestamp() * 1_000_000_000))
+    val = int(raw_ts)
+    if val <= 0:
+        return val
+    if val < 100_000_000_000:
+        return val * 1_000_000_000
+    if val < 100_000_000_000_000:
+        return val * 1_000_000
+    if val < 100_000_000_000_000_000:
+        return val * 1_000
+    return val
 
 
 class StressFalsifier:
@@ -1267,14 +1617,35 @@ class StressFalsifier:
         use_limit_orders: bool = True,
         submit_protective_stop: bool = True,
         effective_trials: Optional[int] = None,
+        conditional_event_windows: Optional[Sequence[Tuple[Any, ...]]] = None,
+        execution_spec: Optional[ExecutionSpec | Mapping[str, Any]] = None,
+        daily_atr_14: Optional[Decimal | float | str] = None,
+        impact_spec: Optional[MarketImpactSpec] = None,
     ) -> StressFalsificationReport:
         """Runs baseline + 4 counterfactual stress experiments in `BacktestEngine`."""
+        if conditional_event_windows is not None:
+            return self.run_conditional_swing_falsification(
+                plan_item,
+                bars=bars,
+                conditional_event_windows=conditional_event_windows,
+                execution_spec=execution_spec,
+                daily_atr_14=daily_atr_14,
+                impact_spec=impact_spec,
+                raw_bars=raw_bars,
+                raw_low_by_ts_ns=raw_low_by_ts_ns,
+                raw_high_by_ts_ns=raw_high_by_ts_ns,
+                equities=equities,
+                use_limit_orders=use_limit_orders,
+                submit_protective_stop=submit_protective_stop,
+                effective_trials=effective_trials,
+            )
+
         if bars is None:
             loaded_equities, loaded_bars, _, _ = self._runner.load_historical_data(plan_item)
-            bar_list = sorted(loaded_bars, key=lambda b: b.ts_init)
+            bar_list = _sort_bars_deterministic(loaded_bars)
             equity_list = list(loaded_equities)
         else:
-            bar_list = sorted(bars, key=lambda b: b.ts_init)
+            bar_list = _sort_bars_deterministic(bars)
             equity_list = list(equities) if equities is not None else None
 
         resolved_date = _resolve_trading_date_from_bars(bar_list)
@@ -1295,11 +1666,6 @@ class StressFalsifier:
         baseline_orders = list(getattr(self._runner, "_last_orders", []) or [])
 
         # 1. Experiment 1: 2x Friction & Slippage Stress Test across entire horizon
-        friction_fill_model: FillModel = OneTickSlippageFillModel(
-            prob_fill_on_limit=1.0,
-            prob_slippage=1.0,
-            random_seed=42,
-        )
         friction_metrics = self._runner.run_backtest(
             plan_item,
             bars=bar_list,
@@ -1311,7 +1677,7 @@ class StressFalsifier:
             submit_protective_stop=submit_protective_stop,
             fee_multiplier=self._friction_multiplier,
             slippage_multiplier=self._friction_multiplier,
-            fill_model=friction_fill_model,
+            fill_model=None,
             trading_date=resolved_date,
             effective_trials=effective_trials,
         )
@@ -1342,7 +1708,7 @@ class StressFalsifier:
             experiment_name="double_friction_stress",
             passed=friction_passed,
             metrics=friction_metrics,
-            threshold_description="net_pnl_usd > 0.0 under 2x fees + 2x slippage + OneTickSlippageFillModel",
+            threshold_description="net_pnl_usd > 0.0 under 2x fees + 2x slippage",
             observed_value=friction_metrics.net_pnl_usd,
             reason=friction_reason,
         )
@@ -1431,13 +1797,16 @@ class StressFalsifier:
         )
 
         # 4. Experiment 4: Marketable Limit Collar Missed-Fill Stress Test (missed_fill_rate <= 0.35)
-        limit_collar_missed_fill_result = self._evaluate_limit_collar_missed_fill_stress(
-            plan_item=plan_item,
-            bars=bar_list,
-            baseline_metrics=baseline,
-            trade_cycles=baseline_trade_cycles,
-            orders=baseline_orders,
-        )
+        try:
+            limit_collar_missed_fill_result = self._evaluate_limit_collar_missed_fill_stress(
+                plan_item=plan_item,
+                bars=bar_list,
+                baseline_metrics=baseline,
+                trade_cycles=baseline_trade_cycles,
+                orders=baseline_orders,
+            )
+        finally:
+            baseline_orders.clear()
 
         failures: List[str] = []
         for res in (
@@ -1472,23 +1841,54 @@ class StressFalsifier:
     ) -> StressExperimentResult:
         """Evaluates whether `plan_item.risk_envelope.collar` misses <= 35% of winning signals."""
         primary_inst = plan_item.strategy_config.instrument_id
-        primary_bars = sorted(
-            [b for b in bars if str(b.bar_type.instrument_id) == primary_inst],
-            key=lambda b: int(b.ts_init),
+        inst_bars = _sort_bars_deterministic(
+            [b for b in bars if str(b.bar_type.instrument_id) == primary_inst]
         )
+        if not inst_bars:
+            inst_bars = _sort_bars_deterministic(bars)
+        primary_bars = _sort_bars_deterministic(_filter_primary_bars(bars, plan_item))
         if not primary_bars:
-            primary_bars = sorted(list(bars), key=lambda b: int(b.ts_init))
+            primary_bars = inst_bars
 
         highs = [float(b.high) for b in primary_bars]
         lows = [float(b.low) for b in primary_bars]
         closes = [float(b.close) for b in primary_bars]
         opens = [float(b.open) for b in primary_bars]
+        inst_bar_by_ts: Dict[int, Bar] = {
+            int(b.ts_init): b for b in inst_bars
+        }
 
         collar = plan_item.risk_envelope.collar
         side = plan_item.risk_envelope.side
-        arch_id = plan_item.strategy_config.archetype_id
         fast_win = max(2, int(plan_item.strategy_config.fast_window))
-        entry_q = float(plan_item.strategy_config.entry_quantile_threshold)
+        slow_win = max(fast_win + 1, int(plan_item.strategy_config.slow_window))
+        init_stop = float(getattr(plan_item.risk_envelope, "initial_stop_price", 0.0) or 0.0)
+        atr_mult = max(1.0, float(plan_item.strategy_config.atr_stop_multiplier))
+        plan_daily_atr = getattr(plan_item.risk_envelope, "daily_atr_14", None)
+
+        orders_by_cid: Dict[str, Any] = {
+            str(getattr(o, "client_order_id", "") or ""): o
+            for o in orders
+            if str(getattr(o, "client_order_id", "") or "")
+        }
+        filled_cids = {
+            cid
+            for cid, o in orders_by_cid.items()
+            if getattr(o, "status", None) == OrderStatus.FILLED
+        }
+        filled_spawn_ids: set[str] = set()
+        for o in orders:
+            if bool(getattr(o, "is_reduce_only", False)):
+                continue
+            ord_status = getattr(o, "status", None)
+            filled_qty_val = _parse_money_float(getattr(o, "filled_qty", 0))
+            if ord_status == OrderStatus.FILLED or filled_qty_val > 0.0:
+                spawn_id = str(getattr(o, "exec_spawn_id", "") or "")
+                cid_str = str(getattr(o, "client_order_id", "") or "")
+                if spawn_id:
+                    filled_spawn_ids.add(spawn_id)
+                if cid_str:
+                    filled_spawn_ids.add(cid_str)
 
         winning_cycles = [
             c for c in trade_cycles if float(c.get("net_pnl_usd", 0.0)) > 0.0
@@ -1497,8 +1897,30 @@ class StressFalsifier:
         total_winners = len(winning_cycles)
 
         for cyc in winning_cycles:
+            entry_px = float(cyc.get("entry_px", 0.0) or 0.0)
+            opening_ord_id = str(cyc.get("opening_order_id") or "")
+            opening_ord = orders_by_cid.get(opening_ord_id) if opening_ord_id else None
+            if opening_ord is not None:
+                ord_type_str = str(getattr(opening_ord, "order_type", "") or "").upper()
+                ord_status = getattr(opening_ord, "status", None)
+                ord_filled_qty = _parse_money_float(getattr(opening_ord, "filled_qty", 0))
+                ord_limit_px = _parse_money_float(getattr(opening_ord, "price", None))
+                is_filled_limit = (
+                    "LIMIT" in ord_type_str
+                    and (ord_status == OrderStatus.FILLED or ord_filled_qty > 0.0)
+                    and ord_limit_px > 0.0
+                )
+                if is_filled_limit and entry_px > 0.0:
+                    within_limit = (
+                        entry_px <= ord_limit_px + 1e-9
+                        if side == PlanSide.LONG
+                        else entry_px >= ord_limit_px - 1e-9
+                    )
+                    if within_limit:
+                        continue
+
             signal_ts = int(cyc.get("signal_ts_ns", 0) or 0)
-            ts_opened = int(cyc.get("ts_opened", 0) or 0)
+            ts_opened = int(cyc.get("ts_opened", 0) or cyc.get("entry_ts_ns", 0) or 0)
             anchor_ts = signal_ts if signal_ts > 0 else ts_opened
             bar_idx = 0
             for idx, b in enumerate(primary_bars):
@@ -1507,62 +1929,77 @@ class StressFalsifier:
                 else:
                     break
             next_idx = min(len(primary_bars) - 1, bar_idx + 1)
-            ref_px = closes[bar_idx]
-            atr_window = min(max(fast_win, 14), bar_idx + 1)
-            atr_val = (
-                rolling_atr(
-                    highs[: bar_idx + 1],
-                    lows[: bar_idx + 1],
-                    closes[: bar_idx + 1],
-                    atr_window,
+            if ts_opened > anchor_ts:
+                for idx in range(bar_idx + 1, len(primary_bars)):
+                    if int(primary_bars[idx].ts_init) >= ts_opened:
+                        next_idx = idx
+                        break
+
+            exact_sig_bar = inst_bar_by_ts.get(anchor_ts)
+            ref_px = float(exact_sig_bar.close) if exact_sig_bar is not None else closes[bar_idx]
+
+            if plan_daily_atr is not None and float(plan_daily_atr) > 0.0:
+                atr_val = float(plan_daily_atr)
+            elif init_stop > 0.0 and ref_px > 0.0 and abs(ref_px - init_stop) > 0.0:
+                atr_val = abs(ref_px - init_stop) / atr_mult
+            else:
+                atr_window = min(slow_win, bar_idx + 1)
+                tick_floor = float(rule_612_tick_size(Decimal(f"{ref_px:.4f}")))
+                atr_val = (
+                    rolling_atr(
+                        highs[: bar_idx + 1],
+                        lows[: bar_idx + 1],
+                        closes[: bar_idx + 1],
+                        atr_window,
+                    )
+                    if bar_idx >= 1
+                    else max(highs[bar_idx] - lows[bar_idx], tick_floor)
                 )
-                if bar_idx >= 1
-                else max(highs[bar_idx] - lows[bar_idx], ref_px * 0.005)
-            )
             atr_val = max(atr_val, 1e-6)
             worst_limit_px = float(
                 collar.compute_worst_limit_price(
                     side,
                     Decimal(f"{ref_px:.4f}"),
                     Decimal(f"{atr_val:.4f}"),
+                    daily_atr_14=(
+                        Decimal(f"{float(plan_daily_atr):.4f}")
+                        if plan_daily_atr is not None and float(plan_daily_atr) > 0.0
+                        else None
+                    ),
                 )
             )
-            collar_worst_offset = abs(worst_limit_px - ref_px)
-            collar_atr_offset = float(collar.limit_collar_atr) * atr_val
-            effective_collar_offset = min(collar_worst_offset, collar_atr_offset)
 
-            bar_range = max(highs[bar_idx] - lows[bar_idx], 1e-9)
+            exec_bar = inst_bar_by_ts.get(ts_opened) if ts_opened > 0 else None
+            has_next_bar = exec_bar is not None or next_idx != bar_idx
+            exec_open = float(exec_bar.open) if exec_bar is not None else opens[next_idx]
+            exec_low = float(exec_bar.low) if exec_bar is not None else lows[next_idx]
+            exec_high = float(exec_bar.high) if exec_bar is not None else highs[next_idx]
+
             if side == PlanSide.LONG:
-                next_bar_open_gap = max(0.0, opens[next_idx] - ref_px)
-                clv = max(0.0, min(1.0, (closes[bar_idx] - lows[bar_idx]) / bar_range))
-                impulse_move = max(
-                    0.0,
-                    closes[bar_idx] - opens[bar_idx],
-                    highs[next_idx] - ref_px,
+                price_breached = (
+                    entry_px > worst_limit_px + 1e-9
+                    if entry_px > 0.0
+                    else (has_next_bar and exec_open > worst_limit_px + 1e-9)
                 )
+                bar_unfillable = has_next_bar and (exec_low > worst_limit_px + 1e-9)
             else:
-                next_bar_open_gap = max(0.0, ref_px - opens[next_idx])
-                clv = max(0.0, min(1.0, (highs[bar_idx] - closes[bar_idx]) / bar_range))
-                impulse_move = max(
-                    0.0,
-                    opens[bar_idx] - closes[bar_idx],
-                    ref_px - lows[next_idx],
+                price_breached = (
+                    entry_px < worst_limit_px - 1e-9
+                    if entry_px > 0.0
+                    else (has_next_bar and exec_open < worst_limit_px - 1e-9)
                 )
+                bar_unfillable = has_next_bar and (exec_high < worst_limit_px - 1e-9)
 
-            bar_excursion = (
-                (1.0 - entry_q) * clv * impulse_move
-                if arch_id in BREAKOUT_ARCHETYPE_IDS
-                else 0.0
-            )
-            required_fill_offset = max(next_bar_open_gap, bar_excursion)
-
-            if required_fill_offset > effective_collar_offset + 1e-9:
+            if bar_unfillable or price_breached:
                 missed_winners += 1
 
         # Also inspect any unfilled entry limit orders in BacktestEngine that would have profited
-        # when no completed winning cycles were recorded
         if total_winners == 0:
+            seen_unfilled_spawns: set[str] = set()
             for ord_obj in orders:
+                ord_cid = str(getattr(ord_obj, "client_order_id", "") or "")
+                if ord_cid in filled_cids:
+                    continue
                 if ord_obj.status in (
                     OrderStatus.FILLED,
                     OrderStatus.DENIED,
@@ -1571,6 +2008,14 @@ class StressFalsifier:
                     continue
                 if bool(getattr(ord_obj, "is_reduce_only", False)):
                     continue
+                spawn_key = str(getattr(ord_obj, "exec_spawn_id", "") or ord_cid)
+                if spawn_key and (
+                    spawn_key in filled_spawn_ids or spawn_key in seen_unfilled_spawns
+                ):
+                    continue
+                if spawn_key:
+                    seen_unfilled_spawns.add(spawn_key)
+
                 ord_ts = int(getattr(ord_obj, "ts_init", 0) or 0)
                 ord_idx = 0
                 for idx, b in enumerate(primary_bars):
@@ -1578,14 +2023,15 @@ class StressFalsifier:
                         ord_idx = idx
                     else:
                         break
-                horizon_idx = min(
-                    len(primary_bars) - 1,
-                    ord_idx + max(3, int(plan_item.strategy_config.fast_window)),
+                horizon_idx = min(len(primary_bars) - 1, ord_idx + fast_win)
+                exact_ord_bar = inst_bar_by_ts.get(ord_ts)
+                entry_ref_px = (
+                    float(exact_ord_bar.close) if exact_ord_bar is not None else closes[ord_idx]
                 )
                 fwd_move = (
-                    closes[horizon_idx] - closes[ord_idx]
+                    closes[horizon_idx] - entry_ref_px
                     if side == PlanSide.LONG
-                    else closes[ord_idx] - closes[horizon_idx]
+                    else entry_ref_px - closes[horizon_idx]
                 )
                 if fwd_move > 0.0:
                     total_winners += 1
@@ -1621,28 +2067,886 @@ class StressFalsifier:
             reason=reason,
         )
 
+    def run_conditional_swing_falsification(
+        self,
+        symbol: str | PlanItemContract = "",
+        *,
+        plan_item: Optional[PlanItemContract] = None,
+        strategy_config: Optional[ArchetypeStrategyConfig] = None,
+        risk_envelope: Optional[PlanRiskEnvelope] = None,
+        bars_by_symbol: Optional[Mapping[str, Sequence[Bar]]] = None,
+        bars: Optional[Sequence[Bar]] = None,
+        conditional_event_windows: Sequence[Tuple[Any, ...]] = (),
+        execution_spec: Optional[ExecutionSpec | Mapping[str, Any]] = None,
+        daily_atr_14: Optional[Decimal | float | str] = None,
+        impact_spec: Optional[MarketImpactSpec] = None,
+        plan_items_by_symbol: Optional[Mapping[str, PlanItemContract]] = None,
+        plan_items_by_window: Optional[Sequence[PlanItemContract]] = None,
+        raw_bars: Optional[Sequence[Bar]] = None,
+        raw_low_by_ts_ns: Optional[Mapping[int, float]] = None,
+        raw_high_by_ts_ns: Optional[Mapping[int, float]] = None,
+        raw_low_by_symbol_ts_ns: Optional[Mapping[str, Mapping[int, float]]] = None,
+        equities: Optional[Sequence[Equity]] = None,
+        use_limit_orders: bool = True,
+        submit_protective_stop: bool = True,
+        effective_trials: Optional[int] = None,
+    ) -> StressFalsificationReport:
+        """Evaluates 4 mandatory stress experiments strictly across conditional Top-K swing event windows `[tau, tau + h]` with `0R` missed-trade accounting."""
+        if isinstance(symbol, PlanItemContract):
+            base_plan_item = symbol
+            target_sym = base_plan_item.symbol.strip().upper().split(".", 1)[0]
+        else:
+            base_plan_item = plan_item
+            target_sym = str(symbol or "").strip().upper().split(".", 1)[0]
+
+        if not target_sym and base_plan_item is not None:
+            target_sym = base_plan_item.symbol.strip().upper().split(".", 1)[0]
+        if not target_sym and plan_items_by_symbol:
+            target_sym = next(iter(plan_items_by_symbol.keys())).strip().upper().split(".", 1)[0]
+        if not target_sym and bars_by_symbol:
+            target_sym = next(iter(bars_by_symbol.keys())).strip().upper().split(".", 1)[0]
+
+        def _resolve_item_for_sym(sym_key: str) -> PlanItemContract:
+            if plan_items_by_symbol and sym_key in plan_items_by_symbol:
+                src_item = plan_items_by_symbol[sym_key]
+            elif plan_items_by_window and len(plan_items_by_window) > 0 and base_plan_item is None:
+                src_item = plan_items_by_window[0]
+            elif base_plan_item is not None:
+                src_item = base_plan_item
+            else:
+                if strategy_config is None or risk_envelope is None:
+                    raise ValueError(
+                        "run_conditional_swing_falsification requires either plan_item or (strategy_config, risk_envelope)"
+                    )
+                venue_part = (
+                    strategy_config.instrument_id.split(".", 1)[1].strip().upper()
+                    if "." in strategy_config.instrument_id
+                    else self._runner._venue_name
+                )
+                eff_cfg = (
+                    strategy_config
+                    if strategy_config.instrument_id == f"{sym_key}.{venue_part}"
+                    else replace(strategy_config, instrument_id=f"{sym_key}.{venue_part}")
+                )
+                src_item = PlanItemContract(
+                    item_id=uuid.uuid4(),
+                    plan_id=uuid.uuid4(),
+                    symbol=sym_key,
+                    venue=venue_part,
+                    broker="alpaca",
+                    asset_class="US_EQUITY",
+                    strategy_id=f"{eff_cfg.archetype_id.value}-COND-{sym_key}",
+                    strategy_config=eff_cfg,
+                    risk_envelope=risk_envelope,
+                    sizing_trace={"calibration": "conditional_swing_falsification"},
+                )
+
+            venue_str = src_item.venue or self._runner._venue_name
+            eff_strat_cfg = src_item.strategy_config
+            if eff_strat_cfg.instrument_id != f"{sym_key}.{venue_str}":
+                eff_strat_cfg = replace(eff_strat_cfg, instrument_id=f"{sym_key}.{venue_str}")
+
+            eff_env = src_item.risk_envelope
+            if execution_spec is not None:
+                norm_exec = (
+                    execution_spec
+                    if isinstance(execution_spec, ExecutionSpec)
+                    else ExecutionSpec.from_dict(
+                        execution_spec,
+                        default_bar_timeframe=eff_strat_cfg.bar_timeframe,
+                    )
+                )
+            else:
+                norm_exec = src_item.execution_spec or eff_env.execution_spec
+
+            if daily_atr_14 is not None and str(daily_atr_14).strip() != "":
+                norm_atr: Optional[Decimal] = Decimal(str(daily_atr_14))
+            else:
+                norm_atr = src_item.daily_atr_14 or eff_env.daily_atr_14
+
+            eff_env = replace(
+                eff_env,
+                execution_spec=norm_exec,
+                daily_atr_14=norm_atr,
+            )
+            eff_trace = dict(src_item.sizing_trace or {})
+            if impact_spec is not None:
+                eff_trace["half_spread_bps"] = float(impact_spec.half_spread_bps)
+                eff_trace["impact_coefficient_y"] = float(impact_spec.impact_coefficient_y)
+            return replace(
+                src_item,
+                symbol=sym_key,
+                strategy_config=eff_strat_cfg,
+                risk_envelope=eff_env,
+                execution_spec=norm_exec,
+                daily_atr_14=norm_atr,
+                sizing_trace=eff_trace,
+            )
+
+        seed_item = _resolve_item_for_sym(target_sym or "SPY")
+        bars_map: Dict[str, List[Bar]] = {}
+        equities_map: Dict[str, List[Equity]] = {}
+        if bars_by_symbol is not None:
+            for k, seq in bars_by_symbol.items():
+                if seq:
+                    norm_k = str(k).strip().upper().split(".", 1)[0]
+                    bars_map[norm_k] = _sort_bars_deterministic(seq)
+        elif bars is not None:
+            sym_groups: Dict[str, List[Bar]] = {}
+            for b in bars:
+                b_sym = str(b.bar_type.instrument_id).split(".", 1)[0].strip().upper()
+                sym_groups.setdefault(b_sym or seed_item.symbol, []).append(b)
+            for k, seq in sym_groups.items():
+                bars_map[k] = _sort_bars_deterministic(seq)
+        else:
+            loaded_eq, loaded_bars, _, _ = self._runner.load_historical_data(seed_item)
+            bars_map[seed_item.symbol] = _sort_bars_deterministic(loaded_bars)
+            equities_map[seed_item.symbol] = list(loaded_eq)
+
+        if equities is not None:
+            for eq in equities:
+                eq_sym = str(eq.id).split(".", 1)[0].strip().upper()
+                equities_map.setdefault(eq_sym, []).append(eq)
+
+        normalized_windows: List[Tuple[str, int, int]] = []
+        for win in conditional_event_windows or ():
+            if len(win) == 3:
+                w_sym_raw, w_s, w_e = win
+                w_sym = str(w_sym_raw).strip().upper().split(".", 1)[0]
+                s_ns = _normalize_event_ts_ns(w_s)
+                e_ns = _normalize_event_ts_ns(w_e)
+                if w_sym in bars_map and e_ns >= s_ns:
+                    normalized_windows.append((w_sym, s_ns, e_ns))
+            elif len(win) == 2:
+                w_s, w_e = win
+                s_ns = _normalize_event_ts_ns(w_s)
+                e_ns = _normalize_event_ts_ns(w_e)
+                if e_ns < s_ns:
+                    continue
+                if target_sym and target_sym in bars_map:
+                    normalized_windows.append((target_sym, s_ns, e_ns))
+                else:
+                    for sym_k in bars_map:
+                        normalized_windows.append((sym_k, s_ns, e_ns))
+
+        start_cap = float(self._runner._starting_capital_usd)
+        eff_trials = max(
+            1,
+            int(
+                effective_trials
+                if effective_trials is not None
+                else self._runner._effective_trials
+            ),
+        )
+
+        def _build_agg_metrics(
+            *,
+            sym_label: str,
+            event_pnls: Sequence[float],
+            event_gross_pnls: Sequence[float],
+            event_commissions: Sequence[float],
+            event_slippages: Sequence[float],
+            event_orders: int,
+            event_fills: int,
+            event_denied: int,
+            event_positions: int,
+            event_wins: int,
+            event_losses: int,
+            event_worst_loss: float,
+            event_traded_notional: float,
+            event_admitted: int,
+            event_gate_denied: int,
+            event_gross_win_sum: float,
+            event_gross_loss_sum: float,
+        ) -> IsomorphicBacktestMetrics:
+            net_pnl = float(sum(event_pnls))
+            gross_pnl = float(sum(event_gross_pnls))
+            comms = float(sum(event_commissions))
+            slips = float(sum(event_slippages))
+            rets = [(p / start_cap) if start_cap > 0.0 else 0.0 for p in event_pnls]
+            if len(rets) >= 2:
+                m_r = statistics.fmean(rets)
+                s_r = statistics.stdev(rets)
+                ann = math.sqrt(252.0 / max(1.0, 5.0))
+                sh = (m_r / s_r) * ann if s_r > 1e-12 else 0.0
+            else:
+                sh = 0.0
+            dsr_val = compute_per_period_deflated_sharpe_ratio(
+                rets,
+                effective_trials=eff_trials,
+            )
+            eq_curve = start_cap
+            peak_eq = start_cap
+            max_dd = 0.0
+            for p in event_pnls:
+                eq_curve = max(1.0, eq_curve + p)
+                if eq_curve > peak_eq:
+                    peak_eq = eq_curve
+                dd = (peak_eq - eq_curve) / peak_eq if peak_eq > 0.0 else 0.0
+                if dd > max_dd:
+                    max_dd = dd
+            total_closed = event_wins + event_losses
+            wr = (float(event_wins) / float(total_closed)) if total_closed > 0 else 0.0
+            if event_gross_loss_sum > 1e-9:
+                pf = event_gross_win_sum / event_gross_loss_sum
+            elif event_gross_win_sum > 0.0:
+                pf = 10.0
+            else:
+                pf = 0.0
+            return IsomorphicBacktestMetrics(
+                symbol=sym_label,
+                archetype_id=seed_item.strategy_config.archetype_id.value,
+                bar_timeframe=seed_item.strategy_config.bar_timeframe,
+                starting_capital_usd=start_cap,
+                ending_capital_usd=start_cap + net_pnl,
+                net_pnl_usd=net_pnl,
+                gross_pnl_usd=gross_pnl,
+                total_return_pct=(net_pnl / start_cap) if start_cap > 0.0 else 0.0,
+                sharpe_ratio=sh,
+                per_period_dsr=dsr_val,
+                max_drawdown_pct=max_dd,
+                max_single_trade_loss_usd=min(0.0, float(event_worst_loss)),
+                turnover_ratio=(event_traded_notional / start_cap) if start_cap > 0.0 else 0.0,
+                total_commissions_usd=comms,
+                estimated_slippage_cost_usd=slips,
+                total_orders=event_orders,
+                filled_orders=event_fills,
+                denied_orders=event_denied,
+                total_positions=event_positions,
+                win_rate=wr,
+                profit_factor=pf,
+                plan_gate_admitted_orders=event_admitted,
+                plan_gate_denied_orders=event_gate_denied,
+                effective_trials=eff_trials,
+            )
+
+        if not normalized_windows:
+            empty_m = _build_agg_metrics(
+                sym_label=seed_item.symbol,
+                event_pnls=[],
+                event_gross_pnls=[],
+                event_commissions=[],
+                event_slippages=[],
+                event_orders=0,
+                event_fills=0,
+                event_denied=0,
+                event_positions=0,
+                event_wins=0,
+                event_losses=0,
+                event_worst_loss=0.0,
+                event_traded_notional=0.0,
+                event_admitted=0,
+                event_gate_denied=0,
+                event_gross_win_sum=0.0,
+                event_gross_loss_sum=0.0,
+            )
+            fail_reason = "NO_CONDITIONAL_EVENT_WINDOWS"
+            return StressFalsificationReport(
+                symbol=seed_item.symbol,
+                archetype_id=seed_item.strategy_config.archetype_id.value,
+                passed=False,
+                baseline_metrics=empty_m,
+                double_friction_result=StressExperimentResult(
+                    experiment_name="double_friction_stress",
+                    passed=False,
+                    metrics=empty_m,
+                    threshold_description="conditional_event_windows > 0",
+                    observed_value=0.0,
+                    reason=fail_reason,
+                ),
+                signal_delay_result=StressExperimentResult(
+                    experiment_name="plus_one_bar_delay_stress",
+                    passed=False,
+                    metrics=empty_m,
+                    threshold_description="conditional_event_windows > 0",
+                    observed_value=0.0,
+                    reason=fail_reason,
+                ),
+                tail_gap_shock_result=StressExperimentResult(
+                    experiment_name="tail_gap_shock_stress",
+                    passed=False,
+                    metrics=empty_m,
+                    threshold_description="conditional_event_windows > 0",
+                    observed_value=0.0,
+                    reason=fail_reason,
+                ),
+                limit_collar_missed_fill_result=StressExperimentResult(
+                    experiment_name="limit_collar_missed_fill_stress",
+                    passed=False,
+                    metrics=empty_m,
+                    threshold_description=f"winning_events > 0 and missed_fill_rate <= {self._max_missed_fill_rate:.2f}",
+                    observed_value=1.0,
+                    reason=fail_reason,
+                ),
+                failure_reasons=(fail_reason,),
+            )
+
+        prev_explicit_half = self._runner._explicit_half_spread_bps
+        prev_explicit_y = self._runner._explicit_impact_y
+        prev_impact_spec = self._runner._market_impact_spec
+        if impact_spec is not None:
+            self._runner._explicit_half_spread_bps = float(impact_spec.half_spread_bps)
+            self._runner._explicit_impact_y = float(impact_spec.impact_coefficient_y)
+            self._runner._market_impact_spec = impact_spec
+
+        try:
+            items_cache: Dict[str, PlanItemContract] = {}
+            base_pnls: List[float] = []
+            base_gross_pnls: List[float] = []
+            base_comms: List[float] = []
+            base_slips: List[float] = []
+            base_orders = base_fills = base_denied = base_pos = 0
+            base_wins = base_losses = base_admitted = base_gate_denied = 0
+            base_worst_loss = 0.0
+            base_notional = base_gwin = base_gloss = 0.0
+            event_r_multiples: List[float] = []
+            filled_event_count = 0
+            missed_event_count = 0
+
+            fric_pnls: List[float] = []
+            fric_gross_pnls: List[float] = []
+            fric_comms: List[float] = []
+            fric_slips: List[float] = []
+            fric_orders = fric_fills = fric_denied = fric_pos = 0
+            fric_wins = fric_losses = fric_admitted = fric_gate_denied = 0
+            fric_worst_loss = 0.0
+            fric_notional = fric_gwin = fric_gloss = 0.0
+            fric_filled_events = 0
+
+            delay_pnls: List[float] = []
+            delay_gross_pnls: List[float] = []
+            delay_comms: List[float] = []
+            delay_slips: List[float] = []
+            delay_orders = delay_fills = delay_denied = delay_pos = 0
+            delay_wins = delay_losses = delay_admitted = delay_gate_denied = 0
+            delay_worst_loss = 0.0
+            delay_notional = delay_gwin = delay_gloss = 0.0
+            delay_filled_events = 0
+
+            gap_pnls: List[float] = []
+            gap_gross_pnls: List[float] = []
+            gap_comms: List[float] = []
+            gap_slips: List[float] = []
+            gap_orders = gap_fills = gap_denied = gap_pos = 0
+            gap_wins = gap_losses = gap_admitted = gap_gate_denied = 0
+            gap_worst_loss = 0.0
+            gap_notional = gap_gwin = gap_gloss = 0.0
+            gap_filled_events = 0
+
+            total_budget = 0.0
+            max_single_budget = 0.0
+
+            for win_idx, (win_sym, win_start_ns, win_end_ns) in enumerate(normalized_windows):
+                if plan_items_by_window is not None and win_idx < len(plan_items_by_window):
+                    base_item = plan_items_by_window[win_idx]
+                    items_cache[win_sym] = base_item
+                else:
+                    if win_sym not in items_cache:
+                        items_cache[win_sym] = _resolve_item_for_sym(win_sym)
+                    base_item = items_cache[win_sym]
+                sym_bars = bars_map[win_sym]
+                sym_equities = equities_map.get(win_sym)
+                sym_raw_low = (
+                    raw_low_by_symbol_ts_ns.get(win_sym, raw_low_by_ts_ns)
+                    if raw_low_by_symbol_ts_ns is not None
+                    else raw_low_by_ts_ns
+                )
+
+                primary_step_ns = _timeframe_step_ns(base_item.strategy_config.bar_timeframe)
+                max_warmup_primary = max(int(base_item.strategy_config.lookback_window) * 3, 120)
+                pre_bars = [b for b in sym_bars if int(b.ts_init) < win_start_ns]
+                pre_primary = [b for b in pre_bars if _bar_step_ns(b) == primary_step_ns]
+                if len(pre_primary) > max_warmup_primary:
+                    cutoff_ns = int(pre_primary[-max_warmup_primary].ts_init)
+                    warmup_slice = [b for b in pre_bars if int(b.ts_init) >= cutoff_ns]
+                else:
+                    warmup_slice = pre_bars
+                window_slice = [
+                    b for b in sym_bars if win_start_ns <= int(b.ts_init) <= win_end_ns
+                ]
+
+                env_valid_ns = int(
+                    round(base_item.risk_envelope.valid_until.timestamp() * 1_000_000_000)
+                )
+                if env_valid_ns < win_start_ns:
+                    win_valid_dt = datetime.fromtimestamp(
+                        win_end_ns / 1_000_000_000.0, tz=timezone.utc
+                    ) + timedelta(days=1)
+                    win_item = replace(
+                        base_item,
+                        risk_envelope=replace(
+                            base_item.risk_envelope,
+                            valid_until=win_valid_dt,
+                        ),
+                    )
+                else:
+                    win_item = base_item
+
+                win_budget = max(1.0, float(win_item.risk_envelope.max_risk_budget_usd))
+                total_budget += win_budget
+                max_single_budget = max(max_single_budget, win_budget)
+
+                window_primary = _filter_primary_bars(window_slice, win_item)
+                if not window_primary:
+                    # 0R missed-trade accounting
+                    base_pnls.append(0.0)
+                    base_gross_pnls.append(0.0)
+                    base_comms.append(0.0)
+                    base_slips.append(0.0)
+                    event_r_multiples.append(0.0)
+                    missed_event_count += 1
+                    for lst in (
+                        fric_pnls,
+                        fric_gross_pnls,
+                        fric_comms,
+                        fric_slips,
+                        delay_pnls,
+                        delay_gross_pnls,
+                        delay_comms,
+                        delay_slips,
+                        gap_pnls,
+                        gap_gross_pnls,
+                        gap_comms,
+                        gap_slips,
+                    ):
+                        lst.append(0.0)
+                    continue
+
+                win_date = _resolve_trading_date_from_bars(window_slice)
+                b_m = self._runner.run_backtest(
+                    win_item,
+                    bars=window_slice,
+                    warmup_bars=warmup_slice,
+                    raw_bars=raw_bars,
+                    raw_low_by_ts_ns=sym_raw_low,
+                    raw_high_by_ts_ns=raw_high_by_ts_ns,
+                    equities=sym_equities,
+                    use_limit_orders=use_limit_orders,
+                    submit_protective_stop=submit_protective_stop,
+                    trading_date=win_date,
+                    effective_trials=eff_trials,
+                )
+                b_first_entry = getattr(self._runner, "_last_first_entry_fill", None)
+                b_cycles = list(getattr(self._runner, "_last_trade_cycles", []) or [])
+                b_orders = list(getattr(self._runner, "_last_orders", []) or [])
+
+                if b_m.filled_orders > 0:
+                    filled_event_count += 1
+                    base_pnls.append(float(b_m.net_pnl_usd))
+                    base_gross_pnls.append(float(b_m.gross_pnl_usd))
+                    base_comms.append(float(b_m.total_commissions_usd))
+                    base_slips.append(float(b_m.estimated_slippage_cost_usd))
+                    event_r_multiples.append(float(b_m.net_pnl_usd) / win_budget)
+                    base_orders += int(b_m.total_orders)
+                    base_fills += int(b_m.filled_orders)
+                    base_denied += int(b_m.denied_orders)
+                    base_pos += int(b_m.total_positions)
+                    base_admitted += int(b_m.plan_gate_admitted_orders)
+                    base_gate_denied += int(b_m.plan_gate_denied_orders)
+                    base_worst_loss = min(base_worst_loss, float(b_m.max_single_trade_loss_usd))
+                    base_notional += float(b_m.turnover_ratio) * start_cap
+                    for cyc in b_cycles:
+                        c_pnl = float(cyc.get("net_pnl_usd", 0.0))
+                        if c_pnl > 0.0:
+                            base_wins += 1
+                            base_gwin += c_pnl
+                        elif c_pnl < 0.0:
+                            base_losses += 1
+                            base_gloss += abs(c_pnl)
+                    if not use_limit_orders:
+                        collar_chk = self._evaluate_limit_collar_missed_fill_stress(
+                            plan_item=win_item,
+                            bars=window_slice,
+                            baseline_metrics=b_m,
+                            trade_cycles=b_cycles,
+                            orders=b_orders,
+                        )
+                        if any(float(c.get("net_pnl_usd", 0.0)) > 0.0 for c in b_cycles) and collar_chk.observed_value > 0.0:
+                            missed_event_count += 1
+                else:
+                    # Strictly 0R opportunity cost for missed entry
+                    base_pnls.append(0.0)
+                    base_gross_pnls.append(0.0)
+                    base_comms.append(0.0)
+                    base_slips.append(0.0)
+                    event_r_multiples.append(0.0)
+                    base_orders += int(b_m.total_orders)
+                    base_denied += int(b_m.denied_orders)
+                    base_admitted += int(b_m.plan_gate_admitted_orders)
+                    base_gate_denied += int(b_m.plan_gate_denied_orders)
+                    missed_event_count += 1
+                b_orders.clear()
+
+                # 1. 2x Friction & Slippage
+                f_m = self._runner.run_backtest(
+                    win_item,
+                    bars=window_slice,
+                    warmup_bars=warmup_slice,
+                    raw_bars=raw_bars,
+                    raw_low_by_ts_ns=sym_raw_low,
+                    raw_high_by_ts_ns=raw_high_by_ts_ns,
+                    equities=sym_equities,
+                    use_limit_orders=use_limit_orders,
+                    submit_protective_stop=submit_protective_stop,
+                    fee_multiplier=self._friction_multiplier,
+                    slippage_multiplier=self._friction_multiplier,
+                    trading_date=win_date,
+                    effective_trials=eff_trials,
+                )
+                f_cycles = list(getattr(self._runner, "_last_trade_cycles", []) or [])
+                if f_m.filled_orders > 0:
+                    fric_filled_events += 1
+                    fric_pnls.append(float(f_m.net_pnl_usd))
+                    fric_gross_pnls.append(float(f_m.gross_pnl_usd))
+                    fric_comms.append(float(f_m.total_commissions_usd))
+                    fric_slips.append(float(f_m.estimated_slippage_cost_usd))
+                    fric_worst_loss = min(fric_worst_loss, float(f_m.max_single_trade_loss_usd))
+                    fric_notional += float(f_m.turnover_ratio) * start_cap
+                    for cyc in f_cycles:
+                        c_pnl = float(cyc.get("net_pnl_usd", 0.0))
+                        if c_pnl > 0.0:
+                            fric_wins += 1
+                            fric_gwin += c_pnl
+                        elif c_pnl < 0.0:
+                            fric_losses += 1
+                            fric_gloss += abs(c_pnl)
+                else:
+                    fric_pnls.append(0.0)
+                    fric_gross_pnls.append(0.0)
+                    fric_comms.append(0.0)
+                    fric_slips.append(0.0)
+                fric_orders += int(f_m.total_orders)
+                fric_fills += int(f_m.filled_orders)
+                fric_denied += int(f_m.denied_orders)
+                fric_pos += int(f_m.total_positions)
+                fric_admitted += int(f_m.plan_gate_admitted_orders)
+                fric_gate_denied += int(f_m.plan_gate_denied_orders)
+
+                # 2. +1 Bar Delay
+                d_m = self._runner.run_backtest(
+                    win_item,
+                    bars=window_slice,
+                    warmup_bars=warmup_slice,
+                    raw_bars=raw_bars,
+                    raw_low_by_ts_ns=sym_raw_low,
+                    raw_high_by_ts_ns=raw_high_by_ts_ns,
+                    equities=sym_equities,
+                    use_limit_orders=use_limit_orders,
+                    submit_protective_stop=submit_protective_stop,
+                    execution_delay_bars=1,
+                    trading_date=win_date,
+                    effective_trials=eff_trials,
+                )
+                d_cycles = list(getattr(self._runner, "_last_trade_cycles", []) or [])
+                if d_m.filled_orders > 0:
+                    delay_filled_events += 1
+                    delay_pnls.append(float(d_m.net_pnl_usd))
+                    delay_gross_pnls.append(float(d_m.gross_pnl_usd))
+                    delay_comms.append(float(d_m.total_commissions_usd))
+                    delay_slips.append(float(d_m.estimated_slippage_cost_usd))
+                    delay_worst_loss = min(delay_worst_loss, float(d_m.max_single_trade_loss_usd))
+                    delay_notional += float(d_m.turnover_ratio) * start_cap
+                    for cyc in d_cycles:
+                        c_pnl = float(cyc.get("net_pnl_usd", 0.0))
+                        if c_pnl > 0.0:
+                            delay_wins += 1
+                            delay_gwin += c_pnl
+                        elif c_pnl < 0.0:
+                            delay_losses += 1
+                            delay_gloss += abs(c_pnl)
+                else:
+                    delay_pnls.append(0.0)
+                    delay_gross_pnls.append(0.0)
+                    delay_comms.append(0.0)
+                    delay_slips.append(0.0)
+                delay_orders += int(d_m.total_orders)
+                delay_fills += int(d_m.filled_orders)
+                delay_denied += int(d_m.denied_orders)
+                delay_pos += int(d_m.total_positions)
+                delay_admitted += int(d_m.plan_gate_admitted_orders)
+                delay_gate_denied += int(d_m.plan_gate_denied_orders)
+
+                # 3. Empirical Tail Adverse Opening Gap Shock
+                shocked_win = self._inject_tail_adverse_gap_shock(
+                    window_slice,
+                    plan_item=win_item,
+                    baseline_first_entry=b_first_entry,
+                    empirical_range_bars=warmup_slice + window_slice,
+                )
+                g_m = self._runner.run_backtest(
+                    win_item,
+                    bars=shocked_win,
+                    warmup_bars=warmup_slice,
+                    raw_bars=raw_bars,
+                    raw_low_by_ts_ns=sym_raw_low,
+                    raw_high_by_ts_ns=raw_high_by_ts_ns,
+                    equities=sym_equities,
+                    use_limit_orders=use_limit_orders,
+                    submit_protective_stop=submit_protective_stop,
+                    trading_date=win_date,
+                    effective_trials=eff_trials,
+                )
+                g_cycles = list(getattr(self._runner, "_last_trade_cycles", []) or [])
+                if g_m.filled_orders > 0:
+                    gap_filled_events += 1
+                    gap_pnls.append(float(g_m.net_pnl_usd))
+                    gap_gross_pnls.append(float(g_m.gross_pnl_usd))
+                    gap_comms.append(float(g_m.total_commissions_usd))
+                    gap_slips.append(float(g_m.estimated_slippage_cost_usd))
+                    gap_worst_loss = min(
+                        gap_worst_loss,
+                        float(g_m.max_single_trade_loss_usd),
+                        float(g_m.net_pnl_usd),
+                    )
+                    gap_notional += float(g_m.turnover_ratio) * start_cap
+                    for cyc in g_cycles:
+                        c_pnl = float(cyc.get("net_pnl_usd", 0.0))
+                        if c_pnl > 0.0:
+                            gap_wins += 1
+                            gap_gwin += c_pnl
+                        elif c_pnl < 0.0:
+                            gap_losses += 1
+                            gap_gloss += abs(c_pnl)
+                else:
+                    gap_pnls.append(0.0)
+                    gap_gross_pnls.append(0.0)
+                    gap_comms.append(0.0)
+                    gap_slips.append(0.0)
+                gap_orders += int(g_m.total_orders)
+                gap_fills += int(g_m.filled_orders)
+                gap_denied += int(g_m.denied_orders)
+                gap_pos += int(g_m.total_positions)
+                gap_admitted += int(g_m.plan_gate_admitted_orders)
+                gap_gate_denied += int(g_m.plan_gate_denied_orders)
+
+            sym_label = (
+                seed_item.symbol
+                if len(items_cache) <= 1
+                else f"{seed_item.symbol}+POOLED({len(items_cache)})"
+            )
+            baseline_agg = _build_agg_metrics(
+                sym_label=sym_label,
+                event_pnls=base_pnls,
+                event_gross_pnls=base_gross_pnls,
+                event_commissions=base_comms,
+                event_slippages=base_slips,
+                event_orders=base_orders,
+                event_fills=base_fills,
+                event_denied=base_denied,
+                event_positions=base_pos,
+                event_wins=base_wins,
+                event_losses=base_losses,
+                event_worst_loss=base_worst_loss,
+                event_traded_notional=base_notional,
+                event_admitted=base_admitted,
+                event_gate_denied=base_gate_denied,
+                event_gross_win_sum=base_gwin,
+                event_gross_loss_sum=base_gloss,
+            )
+            fric_agg = _build_agg_metrics(
+                sym_label=sym_label,
+                event_pnls=fric_pnls,
+                event_gross_pnls=fric_gross_pnls,
+                event_commissions=fric_comms,
+                event_slippages=fric_slips,
+                event_orders=fric_orders,
+                event_fills=fric_fills,
+                event_denied=fric_denied,
+                event_positions=fric_pos,
+                event_wins=fric_wins,
+                event_losses=fric_losses,
+                event_worst_loss=fric_worst_loss,
+                event_traded_notional=fric_notional,
+                event_admitted=fric_admitted,
+                event_gate_denied=fric_gate_denied,
+                event_gross_win_sum=fric_gwin,
+                event_gross_loss_sum=fric_gloss,
+            )
+            delay_agg = _build_agg_metrics(
+                sym_label=sym_label,
+                event_pnls=delay_pnls,
+                event_gross_pnls=delay_gross_pnls,
+                event_commissions=delay_comms,
+                event_slippages=delay_slips,
+                event_orders=delay_orders,
+                event_fills=delay_fills,
+                event_denied=delay_denied,
+                event_positions=delay_pos,
+                event_wins=delay_wins,
+                event_losses=delay_losses,
+                event_worst_loss=delay_worst_loss,
+                event_traded_notional=delay_notional,
+                event_admitted=delay_admitted,
+                event_gate_denied=delay_gate_denied,
+                event_gross_win_sum=delay_gwin,
+                event_gross_loss_sum=delay_gloss,
+            )
+            gap_agg = _build_agg_metrics(
+                sym_label=sym_label,
+                event_pnls=gap_pnls,
+                event_gross_pnls=gap_gross_pnls,
+                event_commissions=gap_comms,
+                event_slippages=gap_slips,
+                event_orders=gap_orders,
+                event_fills=gap_fills,
+                event_denied=gap_denied,
+                event_positions=gap_pos,
+                event_wins=gap_wins,
+                event_losses=gap_losses,
+                event_worst_loss=gap_worst_loss,
+                event_traded_notional=gap_notional,
+                event_admitted=gap_admitted,
+                event_gate_denied=gap_gate_denied,
+                event_gross_win_sum=gap_gwin,
+                event_gross_loss_sum=gap_gloss,
+            )
+
+            eff_total_budget = max(1.0, total_budget)
+            eff_single_budget = max(1.0, max_single_budget)
+            if baseline_agg.net_pnl_usd > 0.0:
+                friction_passed = (
+                    fric_filled_events > 0 and fric_agg.net_pnl_usd > 0.0
+                )
+            else:
+                inc_fric_loss = max(
+                    0.0, float(baseline_agg.net_pnl_usd) - float(fric_agg.net_pnl_usd)
+                )
+                friction_passed = (
+                    fric_filled_events > 0
+                    and fric_agg.net_pnl_usd >= -eff_total_budget
+                    and abs(min(0.0, fric_agg.max_single_trade_loss_usd)) <= eff_single_budget
+                    and inc_fric_loss <= 0.50 * eff_total_budget
+                )
+            double_friction_result = StressExperimentResult(
+                experiment_name="double_friction_stress",
+                passed=friction_passed,
+                metrics=fric_agg,
+                threshold_description="conditional pooled net_pnl_usd > 0.0 under 2x fees + 2x slippage",
+                observed_value=fric_agg.net_pnl_usd,
+                reason=(
+                    f"Conditional 2x friction net_pnl_usd={fric_agg.net_pnl_usd:.2f} passed across {len(normalized_windows)} events"
+                    if friction_passed
+                    else f"FAILED conditional 2x friction stress: net_pnl_usd={fric_agg.net_pnl_usd:.2f} (filled_events={fric_filled_events})"
+                ),
+            )
+
+            delay_passed = (
+                delay_filled_events > 0
+                and delay_agg.net_pnl_usd >= -eff_total_budget
+                and abs(min(0.0, delay_agg.max_single_trade_loss_usd)) <= eff_single_budget
+            )
+            signal_delay_result = StressExperimentResult(
+                experiment_name="plus_one_bar_delay_stress",
+                passed=delay_passed,
+                metrics=delay_agg,
+                threshold_description=f"filled_events > 0 and net_pnl_usd >= {-eff_total_budget:.2f}",
+                observed_value=delay_agg.net_pnl_usd,
+                reason=(
+                    f"Conditional +1 bar delay net_pnl_usd={delay_agg.net_pnl_usd:.2f} within budget"
+                    if delay_passed
+                    else f"FAILED conditional +1 bar delay stress: net_pnl_usd={delay_agg.net_pnl_usd:.2f} (filled_events={delay_filled_events})"
+                ),
+            )
+
+            observed_gap_loss = abs(min(0.0, gap_worst_loss))
+            gap_passed = (
+                gap_filled_events > 0
+                and observed_gap_loss <= eff_single_budget
+            )
+            tail_gap_shock_result = StressExperimentResult(
+                experiment_name="tail_gap_shock_stress",
+                passed=gap_passed,
+                metrics=gap_agg,
+                threshold_description=f"worst_event_loss_usd <= max_risk_budget_usd ({eff_single_budget:.2f} USD)",
+                observed_value=observed_gap_loss,
+                reason=(
+                    f"Conditional tail gap shock worst loss ${observed_gap_loss:.2f} <= ${eff_single_budget:.2f}"
+                    if gap_passed
+                    else f"FAILED conditional tail gap shock stress: worst loss ${observed_gap_loss:.2f} > ${eff_single_budget:.2f} (filled_events={gap_filled_events})"
+                ),
+            )
+
+            total_ev = len(normalized_windows)
+            missed_rate = (
+                float(missed_event_count) / float(total_ev)
+                if total_ev > 0 and filled_event_count > 0
+                else 1.0
+            )
+            missed_passed = (
+                filled_event_count > 0
+                and missed_rate <= self._max_missed_fill_rate + 1e-9
+            )
+            limit_collar_missed_fill_result = StressExperimentResult(
+                experiment_name="limit_collar_missed_fill_stress",
+                passed=missed_passed,
+                metrics=baseline_agg,
+                threshold_description=(
+                    f"filled_events > 0 and conditional missed_fill_rate <= {self._max_missed_fill_rate:.2f}"
+                ),
+                observed_value=missed_rate,
+                reason=(
+                    f"Conditional missed_fill_rate={missed_rate:.4f} <= {self._max_missed_fill_rate:.2f} "
+                    f"(missed={missed_event_count}/{total_ev})"
+                    if missed_passed
+                    else f"FAILED conditional missed-fill stress: missed_fill_rate={missed_rate:.4f} > {self._max_missed_fill_rate:.2f} "
+                    f"(missed={missed_event_count}/{total_ev})"
+                ),
+            )
+
+            failures = [
+                res.reason
+                for res in (
+                    double_friction_result,
+                    signal_delay_result,
+                    tail_gap_shock_result,
+                    limit_collar_missed_fill_result,
+                )
+                if not res.passed
+            ]
+            return StressFalsificationReport(
+                symbol=sym_label,
+                archetype_id=seed_item.strategy_config.archetype_id.value,
+                passed=(len(failures) == 0),
+                baseline_metrics=baseline_agg,
+                double_friction_result=double_friction_result,
+                signal_delay_result=signal_delay_result,
+                tail_gap_shock_result=tail_gap_shock_result,
+                limit_collar_missed_fill_result=limit_collar_missed_fill_result,
+                failure_reasons=tuple(failures),
+                conditional_event_r_multiples=tuple(event_r_multiples),
+                conditional_event_count=total_ev,
+            )
+        finally:
+            self._runner._explicit_half_spread_bps = prev_explicit_half
+            self._runner._explicit_impact_y = prev_explicit_y
+            self._runner._market_impact_spec = prev_impact_spec
+
     def _inject_tail_adverse_gap_shock(
         self,
         bars: Sequence[Bar],
         *,
         plan_item: PlanItemContract,
         baseline_first_entry: Optional[Tuple[int, float]] = None,
+        empirical_range_bars: Optional[Sequence[Bar]] = None,
     ) -> List[Bar]:
-        primary_inst = plan_item.strategy_config.instrument_id
-        primary_bars = [
-            b for b in bars if str(b.bar_type.instrument_id) == primary_inst
-        ]
-        other_bars = [
-            b for b in bars if str(b.bar_type.instrument_id) != primary_inst
-        ]
-        if len(primary_bars) < 5:
+        primary_bars = _sort_bars_deterministic(_filter_primary_bars(bars, plan_item))
+        primary_ids = {id(b) for b in primary_bars}
+        other_bars = [b for b in bars if id(b) not in primary_ids]
+        range_source = (
+            _sort_bars_deterministic(_filter_primary_bars(empirical_range_bars, plan_item))
+            if empirical_range_bars is not None
+            else primary_bars
+        )
+        if not primary_bars or (empirical_range_bars is None and len(primary_bars) < 5):
+            return list(bars)
+        if len(range_source) < 2:
             return list(bars)
 
         abs_ranges: List[float] = []
-        for idx in range(1, len(primary_bars)):
-            prev_c = float(primary_bars[idx - 1].close)
-            curr_h = float(primary_bars[idx].high)
-            curr_l = float(primary_bars[idx].low)
+        for idx in range(1, len(range_source)):
+            prev_c = float(range_source[idx - 1].close)
+            curr_h = float(range_source[idx].high)
+            curr_l = float(range_source[idx].low)
             tr = max(curr_h - curr_l, abs(curr_h - prev_c), abs(curr_l - prev_c))
             abs_ranges.append(tr)
 
@@ -1660,7 +2964,7 @@ class StressFalsifier:
             entry_fill_ts_ns, baseline_entry_px = baseline_first_entry
             for idx, b in enumerate(primary_bars):
                 if int(b.ts_init) > int(entry_fill_ts_ns):
-                    shock_idx = min(len(primary_bars) - 1, idx + 1)
+                    shock_idx = idx
                     break
             if shock_idx is None:
                 shock_idx = len(primary_bars) - 1
@@ -1683,8 +2987,9 @@ class StressFalsifier:
             else prev_bar_close
         )
 
+        tick_floor = float(rule_612_tick_size(Decimal(f"{max(anchor_px, 0.0):.6f}")))
         if plan_item.risk_envelope.side == PlanSide.LONG:
-            shocked_close = max(0.01, anchor_px - shock_distance)
+            shocked_close = max(tick_floor, anchor_px - shock_distance)
         else:
             shocked_close = anchor_px + shock_distance
 
@@ -1699,10 +3004,17 @@ class StressFalsifier:
             low_px=shocked_low,
             close_px=shocked_close,
         )
+        if shock_idx + 1 < len(shocked_primary):
+            nxt = shocked_primary[shock_idx + 1]
+            shocked_primary[shock_idx + 1] = _clone_bar_with_prices(
+                nxt,
+                open_px=shocked_close,
+                high_px=max(float(nxt.high), shocked_close),
+                low_px=min(float(nxt.low), shocked_close),
+                close_px=float(nxt.close),
+            )
 
-        combined = shocked_primary + other_bars
-        combined.sort(key=lambda b: b.ts_init)
-        return combined
+        return _sort_bars_deterministic(shocked_primary + other_bars)
 
 
 StressFalsificationSuite = StressFalsifier

@@ -14,18 +14,20 @@ Implements Ticket #15 (`15-nautilus-mcp-server-and-tool-schema-seam.md`):
 
 from __future__ import annotations
 
-import gc
+import concurrent.futures
 import hashlib
 import hmac
+import inspect
 import json
 import logging
 import math
 import os
+import queue
 import statistics
 import threading
 import uuid
 from dataclasses import replace
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
@@ -38,18 +40,23 @@ from evolution_engine.capital.sizing import (
     SizingRequest,
     size_position,
 )
+from evolution_engine.config_center.envelope import load_envelope
 from evolution_engine.config_center.schema import SystemConfig
 from evolution_engine.db.dsn import resolve_database_dsn
 from market_data_service.pipeline.us_equity_universe import get_gics_sector_map
 from nautilus_trader.quant.contracts.models import (
     ArchetypeStrategyConfig,
+    ExecutionSpec,
     MarketableLimitCollar,
     PlanItemContract,
     PlanRiskEnvelope,
     PlanSide,
     StrategyArchetypeId,
+    TriggerPolicy,
     compute_intraday_entry_valid_until,
     default_limit_collar_atr_for_archetype,
+    quantize_price_rule_612,
+    rule_612_tick_size,
 )
 from nautilus_trader.quant.contracts.repository import PlanContractRepository
 from nautilus_trader.quant.mcp.schemas import (
@@ -60,15 +67,21 @@ from nautilus_trader.quant.mcp.schemas import (
     get_mcp_tool_input_schemas,
 )
 from nautilus_trader.quant.nodes.backtest_runner import (
+    BARS_PER_TRADING_YEAR,
     IsomorphicBacktestMetrics,
     IsomorphicBacktestRunner,
     StressFalsificationReport,
     StressFalsifier,
+    _bar_step_ns,
+    _sort_bars_deterministic,
     build_datainfra_config_from_env,
 )
 from nautilus_trader.quant.nodes.live_node import SipFeederSubscriptionClient
 from nautilus_trader.quant.strategies.empirical import rolling_atr
-from nautilus_trader.quant.strategies.registry import list_strategy_archetype_schemas
+from nautilus_trader.quant.strategies.registry import (
+    get_archetype_descriptor,
+    list_strategy_archetype_schemas,
+)
 from nautilus_trader.adapters.datainfra import DataInfraCatalog, DataInfraConfig
 from nautilus_trader.model import Bar, Equity
 
@@ -132,6 +145,19 @@ def _canonicalize_risk_envelope(
         collar_dict = None
     side_val = raw.get("side", "LONG")
     side_str = side_val.value if isinstance(side_val, PlanSide) else str(side_val).strip().upper()
+    raw_exec_spec = raw.get("execution_spec")
+    if isinstance(raw_exec_spec, ExecutionSpec):
+        exec_spec_canon: Optional[Dict[str, Any]] = raw_exec_spec.to_dict()
+    elif isinstance(raw_exec_spec, Mapping) and raw_exec_spec:
+        exec_spec_canon = ExecutionSpec.from_dict(raw_exec_spec).to_dict()
+    else:
+        exec_spec_canon = None
+    raw_daily_atr = raw.get("daily_atr_14")
+    daily_atr_str = (
+        str(Decimal(str(raw_daily_atr)))
+        if raw_daily_atr is not None and str(raw_daily_atr).strip() != ""
+        else None
+    )
     return {
         "side": side_str,
         "target_qty": str(Decimal(str(raw.get("target_qty", "0")))),
@@ -145,6 +171,8 @@ def _canonicalize_risk_envelope(
             else None
         ),
         "collar": collar_dict,
+        "daily_atr_14": daily_atr_str,
+        "execution_spec": exec_spec_canon,
     }
 
 
@@ -162,6 +190,26 @@ def compute_strategy_fingerprint(
         canonical["risk_envelope"] = _canonicalize_risk_envelope(risk_envelope)
     raw = json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(raw).hexdigest()
+
+
+def _is_daily_bar(bar: Bar) -> bool:
+    if _bar_step_ns(bar) == 86_400_000_000_000:
+        return True
+    bt_str = str(getattr(bar, "bar_type", "")).upper()
+    return (
+        "1-DAY" in bt_str
+        or "-DAY-" in bt_str
+        or bt_str == "1D"
+        or bt_str.endswith("-1D")
+        or "-1D-" in bt_str
+    )
+
+
+def _is_minute_bar(bar: Bar) -> bool:
+    if _bar_step_ns(bar) == 60_000_000_000:
+        return True
+    bt_str = str(getattr(bar, "bar_type", "")).upper()
+    return "1-MINUTE" in bt_str or "-1M-" in bt_str or bt_str.endswith("-1M")
 
 
 def _parse_date_to_ns(date_str: Optional[str], end_of_day: bool = False) -> Optional[int]:
@@ -222,6 +270,19 @@ class NautilusMcpServer:
         self._verified_backtests: Dict[str, IsomorphicBacktestMetrics] = {}
         self._verified_falsifications: Dict[str, Tuple[str, StressFalsificationReport]] = {}
         self._verified_falsification_envelopes: Dict[str, PlanRiskEnvelope] = {}
+
+    @staticmethod
+    def _clear_runner_last_refs(runner: Optional[Any]) -> None:
+        if runner is None:
+            return
+        for attr in (
+            "_last_plan_gate_backend",
+            "_last_strategy",
+            "_last_telemetry_actor",
+            "_last_oco_monitor",
+        ):
+            if hasattr(runner, attr):
+                setattr(runner, attr, None)
 
     def _create_isolated_runner(self) -> IsomorphicBacktestRunner:
         return IsomorphicBacktestRunner(
@@ -487,9 +548,57 @@ class NautilusMcpServer:
                 _sample_quantile(sorted_rel_ranges, 0.05) if sorted_rel_ranges else 0.0
             )
 
+            daily_atr_14_val: Optional[float] = None
+            daily_atr_quantiles: Optional[Dict[str, float]] = None
+            if tf_norm == "1d":
+                if current_atr > 0.0 and math.isfinite(current_atr):
+                    daily_atr_14_val = round(current_atr, 6)
+                daily_atr_quantiles = {
+                    "p50": round(atr_p50, 4),
+                    "p80": round(atr_p80, 4),
+                    "p95": round(atr_p95, 4),
+                }
+            else:
+                raw_1d_bars: Sequence[Bar] = ()
+                try:
+                    raw_1d_bars = self._load_bars_for_symbol(
+                        symbol=sym,
+                        bar_timeframe="1d",
+                        lookback_days=max(30, int(lookback_days)),
+                    )
+                except KeyError:
+                    if self._bar_provider is None:
+                        raise
+                    raw_1d_bars = ()
+                filtered_1d = [b for b in (raw_1d_bars or ()) if _is_daily_bar(b)]
+                if len(filtered_1d) >= 2:
+                    filtered_1d.sort(key=lambda b: int(b.ts_init))
+                    d_highs = [float(b.high) for b in filtered_1d]
+                    d_lows = [float(b.low) for b in filtered_1d]
+                    d_closes = [float(b.close) for b in filtered_1d]
+                    d_atr = rolling_atr(d_highs, d_lows, d_closes, min(14, len(d_closes)))
+                    if d_atr > 0.0 and math.isfinite(d_atr):
+                        daily_atr_14_val = round(d_atr, 6)
+                    d_trs: List[float] = []
+                    for d_idx in range(len(filtered_1d)):
+                        dh = d_highs[d_idx]
+                        dl = d_lows[d_idx]
+                        if d_idx > 0:
+                            dprev = d_closes[d_idx - 1]
+                            d_trs.append(max(dh - dl, abs(dh - dprev), abs(dl - dprev)))
+                        else:
+                            d_trs.append(max(0.0, dh - dl))
+                    sorted_d_tr = sorted(d_trs)
+                    daily_atr_quantiles = {
+                        "p50": round(_sample_quantile(sorted_d_tr, 0.50), 4),
+                        "p80": round(_sample_quantile(sorted_d_tr, 0.80), 4),
+                        "p95": round(_sample_quantile(sorted_d_tr, 0.95), 4),
+                    }
+
             summaries[sym] = {
                 "symbol": sym,
                 "bar_timeframe": bar_timeframe,
+                "atr_timeframe": bar_timeframe,
                 "bar_count": len(sorted_bars),
                 "status": "OK",
                 "last_close": round(last_close, 4),
@@ -497,6 +606,8 @@ class NautilusMcpServer:
                 "window_max_high": round(max(highs), 4) if highs else round(last_close, 4),
                 "return_volatility": round(ret_vol, 6),
                 "current_atr": round(current_atr, 4),
+                "daily_atr_14": daily_atr_14_val,
+                "daily_atr_quantiles": daily_atr_quantiles,
                 "atr_quantiles": {
                     "p50": round(atr_p50, 4),
                     "p80": round(atr_p80, 4),
@@ -540,6 +651,7 @@ class NautilusMcpServer:
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
         risk_envelope: Optional[Dict[str, Any]] = None,
+        execution_spec: Optional[Dict[str, Any]] = None,
         walk_forward: bool = False,
         lookback_days: int = 60,
         effective_trials: Optional[int] = None,
@@ -547,11 +659,23 @@ class NautilusMcpServer:
         """Runs `IsomorphicBacktestRunner` for `(symbol, archetype_id, params)` and returns metrics."""
         sym = str(symbol).strip().upper()
         strat_cfg = self._build_strategy_config(sym, archetype_id, params)
+        resolved_exec_spec = self._resolve_execution_spec(
+            execution_spec=execution_spec,
+            params=params,
+            raw_envelope=risk_envelope,
+            bar_timeframe=strat_cfg.bar_timeframe,
+        )
         bars, equities = self._resolve_bars_and_equities_for_contract(
             strat_cfg,
             start_date=start_date,
             end_date=end_date,
             lookback_days=int(lookback_days),
+            execution_spec=resolved_exec_spec,
+        )
+        resolved_daily_atr = self._resolve_daily_atr_14(
+            sym,
+            raw_envelope=risk_envelope,
+            lookback_days=max(60, int(lookback_days)),
         )
         env = self._build_risk_envelope(
             sym,
@@ -560,6 +684,8 @@ class NautilusMcpServer:
             bar_timeframe=strat_cfg.bar_timeframe,
             archetype_id=strat_cfg.archetype_id,
             atr_stop_multiplier=float(strat_cfg.atr_stop_multiplier),
+            daily_atr_14=resolved_daily_atr,
+            execution_spec=resolved_exec_spec,
         )
         plan_item = self._make_plan_item_contract(
             symbol=sym,
@@ -573,20 +699,23 @@ class NautilusMcpServer:
 
         if self._custom_runner_injected:
             with self._runner_lock:
-                if walk_forward:
-                    metrics = self._runner.run_walk_forward(
-                        plan_item,
-                        bars=bars,
-                        equities=equities,
-                        effective_trials=eff_trials,
-                    )
-                else:
-                    metrics = self._runner.run_backtest(
-                        plan_item,
-                        bars=bars,
-                        equities=equities,
-                        effective_trials=eff_trials,
-                    )
+                try:
+                    if walk_forward:
+                        metrics = self._runner.run_walk_forward(
+                            plan_item,
+                            bars=bars,
+                            equities=equities,
+                            effective_trials=eff_trials,
+                        )
+                    else:
+                        metrics = self._runner.run_backtest(
+                            plan_item,
+                            bars=bars,
+                            equities=equities,
+                            effective_trials=eff_trials,
+                        )
+                finally:
+                    self._clear_runner_last_refs(self._runner)
         else:
             request_runner = self._create_isolated_runner()
             try:
@@ -605,12 +734,8 @@ class NautilusMcpServer:
                         effective_trials=eff_trials,
                     )
             finally:
-                request_runner._last_plan_gate = None
-                request_runner._last_strategy = None
-                request_runner._last_telemetry_actor = None
-                request_runner._last_oco_monitor = None
+                self._clear_runner_last_refs(request_runner)
                 del request_runner
-                gc.collect()
 
         fp = compute_strategy_fingerprint(sym, strat_cfg)
         backtest_id = f"bt-{fp[:16]}"
@@ -635,15 +760,29 @@ class NautilusMcpServer:
         archetype_id: str,
         params: Dict[str, Any],
         risk_envelope: Dict[str, Any],
+        execution_spec: Optional[Dict[str, Any]] = None,
+        conditional_event_windows: Optional[Sequence[Any]] = None,
         lookback_days: int = 60,
         effective_trials: Optional[int] = None,
     ) -> Dict[str, Any]:
         """Executes `StressFalsifier` (`2x` friction, `+1 bar` delay, tail gap shock) on candidate."""
         sym = str(symbol).strip().upper()
         strat_cfg = self._build_strategy_config(sym, archetype_id, params)
+        resolved_exec_spec = self._resolve_execution_spec(
+            execution_spec=execution_spec,
+            params=params,
+            raw_envelope=risk_envelope,
+            bar_timeframe=strat_cfg.bar_timeframe,
+        )
         bars, equities = self._resolve_bars_and_equities_for_contract(
             strat_cfg,
             lookback_days=int(lookback_days),
+            execution_spec=resolved_exec_spec,
+        )
+        resolved_daily_atr = self._resolve_daily_atr_14(
+            sym,
+            raw_envelope=risk_envelope,
+            lookback_days=max(60, int(lookback_days)),
         )
         env = self._build_risk_envelope(
             sym,
@@ -652,6 +791,8 @@ class NautilusMcpServer:
             bar_timeframe=strat_cfg.bar_timeframe,
             archetype_id=strat_cfg.archetype_id,
             atr_stop_multiplier=float(strat_cfg.atr_stop_multiplier),
+            daily_atr_14=resolved_daily_atr,
+            execution_spec=resolved_exec_spec,
         )
         plan_item = self._make_plan_item_contract(
             symbol=sym,
@@ -665,29 +806,43 @@ class NautilusMcpServer:
 
         if self._custom_falsifier_injected or self._custom_runner_injected:
             with self._runner_lock:
-                report = self._falsifier.run_falsification(
-                    plan_item,
-                    bars=bars,
-                    equities=equities,
-                    effective_trials=eff_trials,
-                )
+                try:
+                    report = self._invoke_stress_falsifier(
+                        self._falsifier,
+                        symbol=sym,
+                        strategy_config=strat_cfg,
+                        risk_envelope=env,
+                        plan_item=plan_item,
+                        bars=bars,
+                        equities=equities,
+                        effective_trials=eff_trials,
+                        conditional_event_windows=conditional_event_windows,
+                        execution_spec=resolved_exec_spec,
+                        daily_atr_14=env.daily_atr_14,
+                    )
+                finally:
+                    self._clear_runner_last_refs(self._runner)
+                    self._clear_runner_last_refs(getattr(self._falsifier, "_runner", None))
         else:
             request_runner = self._create_isolated_runner()
             request_falsifier = StressFalsifier(runner=request_runner)
             try:
-                report = request_falsifier.run_falsification(
-                    plan_item,
+                report = self._invoke_stress_falsifier(
+                    request_falsifier,
+                    symbol=sym,
+                    strategy_config=strat_cfg,
+                    risk_envelope=env,
+                    plan_item=plan_item,
                     bars=bars,
                     equities=equities,
                     effective_trials=eff_trials,
+                    conditional_event_windows=conditional_event_windows,
+                    execution_spec=resolved_exec_spec,
+                    daily_atr_14=env.daily_atr_14,
                 )
             finally:
-                request_runner._last_plan_gate = None
-                request_runner._last_strategy = None
-                request_runner._last_telemetry_actor = None
-                request_runner._last_oco_monitor = None
+                self._clear_runner_last_refs(request_runner)
                 del request_falsifier, request_runner
-                gc.collect()
         fp = compute_strategy_fingerprint(sym, strat_cfg, risk_envelope=env)
         base_fp = compute_strategy_fingerprint(sym, strat_cfg)
         with self._lock:
@@ -716,6 +871,10 @@ class NautilusMcpServer:
             "backtest_attestation_id": f"bt-{fp[:16]}",
             "passed": report.passed,
             "falsification_token": token,
+            "daily_atr_14": (
+                str(env.daily_atr_14) if env.daily_atr_14 is not None else None
+            ),
+            "execution_spec": env.execution_spec.to_dict(),
             "report": report.to_dict(),
         }
 
@@ -827,6 +986,17 @@ class NautilusMcpServer:
                 if raw_conviction is not None
                 else strat_cfg.entry_quantile_threshold
             )
+            resolved_exec_spec = self._resolve_execution_spec(
+                execution_spec=raw_item.get("execution_spec"),
+                params=params,
+                raw_envelope=raw_env,
+                bar_timeframe=strat_cfg.bar_timeframe,
+            )
+            resolved_daily_atr = self._resolve_daily_atr_14(
+                sym,
+                raw_envelope=raw_env,
+                raw_item=raw_item,
+            )
             req_env = self._build_risk_envelope(
                 sym,
                 raw_env,
@@ -834,6 +1004,8 @@ class NautilusMcpServer:
                 bar_timeframe=strat_cfg.bar_timeframe,
                 archetype_id=strat_cfg.archetype_id,
                 atr_stop_multiplier=float(strat_cfg.atr_stop_multiplier),
+                daily_atr_14=resolved_daily_atr,
+                execution_spec=resolved_exec_spec,
             )
             fp = compute_strategy_fingerprint(sym, strat_cfg, risk_envelope=req_env)
             base_fp = compute_strategy_fingerprint(sym, strat_cfg)
@@ -887,6 +1059,8 @@ class NautilusMcpServer:
                         and req_env.initial_stop_price == falsified_env.initial_stop_price
                         and req_env.take_profit_price == falsified_env.take_profit_price
                         and req_env.collar == falsified_env.collar
+                        and req_env.execution_spec == falsified_env.execution_spec
+                        and req_env.daily_atr_14 == falsified_env.daily_atr_14
                         and req_env.target_qty <= falsified_env.target_qty
                         and req_env.approved_qty_cap <= falsified_env.approved_qty_cap
                         and req_env.target_notional_usd <= falsified_env.target_notional_usd
@@ -995,7 +1169,10 @@ class NautilusMcpServer:
                 float(target_qty) * entry_ref,
             )
             approved_notional = Decimal(f"{raw_sized_notional:.2f}")
-            if approved_notional < Decimal("100.00"):
+            min_order_notional = Decimal(
+                str(load_envelope().numeric["risk.max_order_notional_usd"]["min"])
+            )
+            if approved_notional < min_order_notional:
                 sizing_decisions[sym] = {
                     "target_qty": "0",
                     "approved_qty_cap": "0",
@@ -1050,6 +1227,20 @@ class NautilusMcpServer:
                 take_profit_price=req_env.take_profit_price,
                 collar=req_env.collar,
                 valid_until=req_env.valid_until,
+                daily_atr_14=req_env.daily_atr_14,
+                execution_spec=req_env.execution_spec,
+            )
+            trace_atr: Optional[float] = (
+                float(req_env.daily_atr_14)
+                if req_env.daily_atr_14 is not None
+                else (
+                    abs(entry_ref - float(effective_stop_px))
+                    / max(1.0, float(strat_cfg.atr_stop_multiplier))
+                    if entry_ref > 0.0
+                    and float(effective_stop_px) > 0.0
+                    and abs(entry_ref - float(effective_stop_px)) > 0.0
+                    else None
+                )
             )
             enriched_trace: Dict[str, Any] = dict(decision.trace or {})
             enriched_trace.update(
@@ -1076,6 +1267,8 @@ class NautilusMcpServer:
                     "committee_attestation": dict(committee_attestation),
                 }
             )
+            if trace_atr is not None and trace_atr > 0.0 and math.isfinite(trace_atr):
+                enriched_trace["atr"] = round(trace_atr, 6)
             if matched_co is not None:
                 enriched_trace["carry_over_status"] = str(
                     matched_co.get("lifecycle_state") or "RENEWED_ACTIVE"
@@ -1112,8 +1305,11 @@ class NautilusMcpServer:
 
         all_scaled_to_zero = bool(validated_items) and scaled_to_zero_items == len(validated_items)
         if not locked_items and not (all_candidates_vetoed or l0_zero_quota or all_scaled_to_zero):
+            min_order_notional = Decimal(
+                str(load_envelope().numeric["risk.max_order_notional_usd"]["min"])
+            )
             raise McpPlanLockRejectedError(
-                "All validated_items were rejected due to sub-$100.00 dust notional"
+                f"All validated_items were rejected due to sub-${min_order_notional:.2f} dust notional"
             )
 
         resolved_equity_dec = Decimal(f"{equity_usd:.2f}")
@@ -1205,6 +1401,16 @@ class NautilusMcpServer:
                     "take_profit_price": (
                         str(item.risk_envelope.take_profit_price)
                         if item.risk_envelope.take_profit_price is not None
+                        else None
+                    ),
+                    "daily_atr_14": (
+                        str(item.daily_atr_14)
+                        if item.daily_atr_14 is not None
+                        else None
+                    ),
+                    "execution_spec": (
+                        item.execution_spec.to_dict()
+                        if item.execution_spec is not None
                         else None
                     ),
                 }
@@ -1308,6 +1514,57 @@ class NautilusMcpServer:
         mcp_server = self
         explicit_auth_token = auth_token
 
+        class _AffinityWorker:
+            """Single persistent daemon worker thread keeping PyO3 backtest objects thread-affine."""
+
+            def __init__(self) -> None:
+                self._queue: (
+                    "queue.Queue[Optional[Tuple[Callable[[], Any], concurrent.futures.Future[Any]]]]"
+                ) = queue.Queue()
+                self._closed = False
+                self._lock = threading.Lock()
+                self._thread = threading.Thread(
+                    target=self._run,
+                    name="nautilus-mcp-affinity-worker",
+                    daemon=True,
+                )
+                self._thread.start()
+
+            def _run(self) -> None:
+                while True:
+                    item = self._queue.get()
+                    if item is None:
+                        self._queue.task_done()
+                        break
+                    fn, fut = item
+                    try:
+                        res = fn()
+                    except BaseException as exc:
+                        fut.set_exception(exc)
+                    else:
+                        fut.set_result(res)
+                    finally:
+                        self._queue.task_done()
+
+            def submit(self, fn: Callable[[], Any]) -> Any:
+                with self._lock:
+                    if self._closed:
+                        return fn()
+                    fut: concurrent.futures.Future[Any] = concurrent.futures.Future()
+                    self._queue.put((fn, fut))
+                return fut.result()
+
+            def close(self) -> None:
+                with self._lock:
+                    if self._closed:
+                        return
+                    self._closed = True
+                    self._queue.put(None)
+                if self._thread.is_alive() and threading.current_thread() is not self._thread:
+                    self._thread.join(timeout=2.0)
+
+        affinity_worker = _AffinityWorker()
+
         class _McpHttpHandler(BaseHTTPRequestHandler):
             def log_message(self, format: str, *args: Any) -> None:
                 return
@@ -1388,7 +1645,9 @@ class NautilusMcpServer:
 
                 try:
                     req_obj = json.loads(raw_body.decode("utf-8"))
-                    resp_obj = mcp_server.handle_jsonrpc_request(req_obj)
+                    resp_obj = affinity_worker.submit(
+                        lambda: mcp_server.handle_jsonrpc_request(req_obj)
+                    )
                     status_code = 200
                 except Exception as exc:
                     resp_obj = {
@@ -1398,12 +1657,10 @@ class NautilusMcpServer:
                     }
                     status_code = 400
                 finally:
-                    if not mcp_server._custom_runner_injected and mcp_server._runner is not None:
-                        mcp_server._runner._last_plan_gate = None
-                        mcp_server._runner._last_strategy = None
-                        mcp_server._runner._last_telemetry_actor = None
-                        mcp_server._runner._last_oco_monitor = None
-                    gc.collect()
+                    # Do not invoke gc.collect() across HTTP worker threads when PyO3 unsendable
+                    # objects may exist on other threads; per-request BacktestEngine instances
+                    # already dispose and collect synchronously on the affinity worker thread.
+                    pass
                 payload = json.dumps(resp_obj).encode("utf-8")
                 self.send_response(status_code)
                 self.send_header("Content-Type", "application/json")
@@ -1411,7 +1668,14 @@ class NautilusMcpServer:
                 self.end_headers()
                 self.wfile.write(payload)
 
-        return ThreadingHTTPServer((host, port), _McpHttpHandler)
+        class _AffinityMcpHttpServer(ThreadingHTTPServer):
+            def server_close(self) -> None:
+                try:
+                    affinity_worker.close()
+                finally:
+                    super().server_close()
+
+        return _AffinityMcpHttpServer((host, port), _McpHttpHandler)
 
     # =========================================================================
     # Internal Helpers
@@ -1423,18 +1687,165 @@ class NautilusMcpServer:
         archetype_id: str,
         params: Dict[str, Any],
     ) -> ArchetypeStrategyConfig:
+        arch_enum = StrategyArchetypeId(str(archetype_id).strip())
+        bounds = get_archetype_descriptor(arch_enum).parameter_bounds
         inst_id = str(params.get("instrument_id") or f"{symbol}.{self._venue_name}").strip()
         return ArchetypeStrategyConfig(
-            archetype_id=StrategyArchetypeId(str(archetype_id).strip()),
+            archetype_id=arch_enum,
             instrument_id=inst_id,
-            bar_timeframe=str(params.get("bar_timeframe", "15m")),
-            lookback_window=int(params.get("lookback_window", 20)),
-            fast_window=int(params.get("fast_window", 5)),
-            slow_window=int(params.get("slow_window", 15)),
-            entry_quantile_threshold=Decimal(str(params.get("entry_quantile_threshold", "0.80"))),
-            exit_quantile_threshold=Decimal(str(params.get("exit_quantile_threshold", "0.35"))),
-            atr_stop_multiplier=Decimal(str(params.get("atr_stop_multiplier", "2.0"))),
+            bar_timeframe=str(params.get("bar_timeframe", bounds["bar_timeframe"]["default"])),
+            lookback_window=int(params.get("lookback_window", bounds["lookback_window"]["default"])),
+            fast_window=int(params.get("fast_window", bounds["fast_window"]["default"])),
+            slow_window=int(params.get("slow_window", bounds["slow_window"]["default"])),
+            entry_quantile_threshold=Decimal(
+                str(params.get("entry_quantile_threshold", bounds["entry_quantile_threshold"]["default"]))
+            ),
+            exit_quantile_threshold=Decimal(
+                str(params.get("exit_quantile_threshold", bounds["exit_quantile_threshold"]["default"]))
+            ),
+            atr_stop_multiplier=Decimal(
+                str(params.get("atr_stop_multiplier", bounds["atr_stop_multiplier"]["default"]))
+            ),
         )
+
+    @staticmethod
+    def _invoke_stress_falsifier(
+        falsifier: Any,
+        *,
+        symbol: str,
+        strategy_config: ArchetypeStrategyConfig,
+        risk_envelope: PlanRiskEnvelope,
+        plan_item: PlanItemContract,
+        bars: Sequence[Bar],
+        equities: Optional[Sequence[Equity]],
+        effective_trials: int,
+        conditional_event_windows: Optional[Sequence[Any]] = None,
+        execution_spec: Optional[ExecutionSpec] = None,
+        daily_atr_14: Optional[Decimal] = None,
+    ) -> StressFalsificationReport:
+        if conditional_event_windows:
+            norm_windows: List[Any] = []
+            for w in conditional_event_windows:
+                if isinstance(w, Mapping):
+                    w_start = w.get("start_ts_ns") or w.get("start_ts") or w.get("start") or w.get("tau")
+                    w_end = w.get("end_ts_ns") or w.get("end_ts") or w.get("end") or w.get("tau_end")
+                    w_sym = w.get("symbol")
+                    if w_sym is not None:
+                        norm_windows.append((w_sym, w_start, w_end))
+                    else:
+                        norm_windows.append((w_start, w_end))
+                elif isinstance(w, list):
+                    norm_windows.append(tuple(w))
+                else:
+                    norm_windows.append(w)
+
+            cond_fn = getattr(falsifier, "run_conditional_swing_falsification", None)
+            if callable(cond_fn):
+                sig_params = inspect.signature(cond_fn).parameters
+                accepts_kwargs = any(
+                    p.kind == inspect.Parameter.VAR_KEYWORD for p in sig_params.values()
+                )
+                candidate_kwargs: Dict[str, Any] = {
+                    "symbol": symbol,
+                    "strategy_config": strategy_config,
+                    "risk_envelope": risk_envelope,
+                    "plan_item": plan_item,
+                    "bars_by_symbol": {symbol: list(bars)},
+                    "bars": list(bars),
+                    "equities": list(equities) if equities is not None else None,
+                    "conditional_event_windows": norm_windows,
+                    "execution_spec": execution_spec,
+                    "daily_atr_14": daily_atr_14,
+                    "effective_trials": int(effective_trials),
+                }
+                call_kwargs = (
+                    candidate_kwargs
+                    if accepts_kwargs
+                    else {k: v for k, v in candidate_kwargs.items() if k in sig_params}
+                )
+                return cond_fn(**call_kwargs)
+
+            run_fn = falsifier.run_falsification
+            run_params = inspect.signature(run_fn).parameters
+            if "conditional_event_windows" in run_params or any(
+                p.kind == inspect.Parameter.VAR_KEYWORD for p in run_params.values()
+            ):
+                return run_fn(
+                    plan_item,
+                    bars=bars,
+                    equities=equities,
+                    effective_trials=effective_trials,
+                    conditional_event_windows=norm_windows,
+                )
+
+        return falsifier.run_falsification(
+            plan_item,
+            bars=bars,
+            equities=equities,
+            effective_trials=effective_trials,
+        )
+
+    @staticmethod
+    def _resolve_execution_spec(
+        *,
+        execution_spec: Optional[Mapping[str, Any]] = None,
+        params: Optional[Mapping[str, Any]] = None,
+        raw_envelope: Optional[Mapping[str, Any]] = None,
+        bar_timeframe: str = "15m",
+    ) -> ExecutionSpec:
+        raw: Optional[Mapping[str, Any]] = None
+        for candidate in (
+            execution_spec,
+            raw_envelope.get("execution_spec") if isinstance(raw_envelope, Mapping) else None,
+            params.get("execution_spec") if isinstance(params, Mapping) else None,
+        ):
+            if isinstance(candidate, ExecutionSpec):
+                return candidate
+            if isinstance(candidate, Mapping) and candidate:
+                raw = candidate
+                break
+        return ExecutionSpec.from_dict(raw, default_bar_timeframe=bar_timeframe)
+
+    def _resolve_daily_atr_14(
+        self,
+        symbol: str,
+        *,
+        raw_envelope: Optional[Mapping[str, Any]] = None,
+        raw_item: Optional[Mapping[str, Any]] = None,
+        lookback_days: int = 60,
+    ) -> Optional[Decimal]:
+        for src in (raw_item, raw_envelope):
+            if isinstance(src, Mapping) and src.get("daily_atr_14") is not None:
+                raw_val = src["daily_atr_14"]
+                if str(raw_val).strip() != "":
+                    atr_dec = Decimal(str(raw_val))
+                    if atr_dec > Decimal("0"):
+                        return atr_dec
+
+        if self._bar_provider is None and self._datainfra_config is None:
+            return None
+
+        try:
+            daily_bars = self._load_bars_for_symbol(
+                symbol=symbol,
+                bar_timeframe="1d",
+                lookback_days=max(30, int(lookback_days)),
+            )
+        except Exception as exc:
+            logger.debug("Unable to load 1d bars for daily_atr_14 (%s): %s", symbol, exc)
+            return None
+
+        filtered_1d: List[Bar] = [b for b in (daily_bars or ()) if _is_daily_bar(b)]
+        if len(filtered_1d) < 2:
+            return None
+        filtered_1d.sort(key=lambda b: int(b.ts_init))
+        d_highs = [float(b.high) for b in filtered_1d]
+        d_lows = [float(b.low) for b in filtered_1d]
+        d_closes = [float(b.close) for b in filtered_1d]
+        atr_val = rolling_atr(d_highs, d_lows, d_closes, min(14, len(d_closes)))
+        if atr_val > 0.0 and math.isfinite(atr_val):
+            return Decimal(f"{atr_val:.6f}")
+        return None
 
     def _build_risk_envelope(
         self,
@@ -1446,6 +1857,8 @@ class NautilusMcpServer:
         bar_timeframe: str = "15m",
         archetype_id: Optional[StrategyArchetypeId | str] = None,
         atr_stop_multiplier: Optional[float] = None,
+        daily_atr_14: Optional[Decimal] = None,
+        execution_spec: Optional[ExecutionSpec] = None,
     ) -> PlanRiskEnvelope:
         risk_cfg = self._system_config.risk
         exec_cfg = self._system_config.execution
@@ -1505,6 +1918,26 @@ class NautilusMcpServer:
             if len(bar_closes) >= 2
             else 0.0
         )
+        eff_daily_atr_14 = daily_atr_14
+        if eff_daily_atr_14 is None and isinstance(raw_envelope, Mapping) and raw_envelope.get("daily_atr_14") is not None:
+            raw_d = str(raw_envelope["daily_atr_14"]).strip()
+            if raw_d:
+                cand_d = Decimal(raw_d)
+                if cand_d > Decimal("0"):
+                    eff_daily_atr_14 = cand_d
+        eff_exec_spec = execution_spec or self._resolve_execution_spec(
+            raw_envelope=raw_envelope,
+            bar_timeframe=bar_timeframe,
+        )
+        stop_atr = float(eff_daily_atr_14) if eff_daily_atr_14 is not None else emp_atr
+        arch_desc = get_archetype_descriptor(archetype_id or StrategyArchetypeId.TREND_MOMENTUM)
+        atr_bounds = dict(arch_desc.parameter_bounds.get("atr_stop_multiplier") or {})
+        min_atr_mult = float(atr_bounds.get("min_inclusive", atr_bounds.get("min", "0.5")))
+        default_atr_mult = float(atr_bounds.get("default", min_atr_mult))
+        eff_atr_mult = max(
+            float(atr_stop_multiplier if atr_stop_multiplier is not None else default_atr_mult),
+            min_atr_mult,
+        )
 
         if raw_envelope is not None:
             side = PlanSide(str(raw_envelope.get("side", "long")).strip().lower())
@@ -1541,20 +1974,47 @@ class NautilusMcpServer:
                 raw_envelope.get("stop_loss_price"),
             )
             if raw_stop is None:
-                if emp_last_px <= 0.0 or emp_atr <= 0.0:
+                if emp_last_px <= 0.0 or stop_atr <= 0.0:
                     raise ValueError(
                         f"risk_envelope for {symbol} missing 'initial_stop_price' and no empirical ATR available"
                     )
-                eff_atr_mult = max(float(atr_stop_multiplier or 2.0), 2.0)
                 emp_stop_dist = max(
-                    emp_atr * eff_atr_mult,
+                    stop_atr * eff_atr_mult,
                     emp_last_px * float(risk_per_trade_frac),
                 )
-                initial_stop = Decimal(
-                    f"{max(0.01, emp_last_px - emp_stop_dist if side == PlanSide.LONG else emp_last_px + emp_stop_dist):.2f}"
+                tick_floor = float(rule_612_tick_size(Decimal(f"{emp_last_px:.4f}")))
+                raw_calc_stop = max(
+                    tick_floor,
+                    emp_last_px - emp_stop_dist if side == PlanSide.LONG else emp_last_px + emp_stop_dist,
                 )
+                initial_stop = quantize_price_rule_612(Decimal(f"{raw_calc_stop:.6f}"), side=side)
             else:
                 initial_stop = Decimal(str(raw_stop))
+                if eff_daily_atr_14 is not None and raw_envelope.get("daily_atr_14") is None:
+                    ref_px_val = 0.0
+                    for ref_k in ("reference_price", "entry_price"):
+                        if raw_envelope.get(ref_k) is not None:
+                            ref_px_val = float(raw_envelope[ref_k])
+                            break
+                    if ref_px_val <= 0.0 and target_qty > Decimal("0") and target_notional > Decimal("0"):
+                        ref_px_val = float(target_notional / target_qty)
+                    if ref_px_val > 0.0 and (
+                        str(raw_envelope.get("atr_timeframe") or "").strip().lower() == "15m"
+                        or abs(ref_px_val - float(initial_stop)) < float(eff_daily_atr_14) * min_atr_mult
+                    ):
+                        widened_dist = max(
+                            float(eff_daily_atr_14) * eff_atr_mult,
+                            ref_px_val * float(risk_per_trade_frac),
+                        )
+                        tick_floor = float(rule_612_tick_size(Decimal(f"{ref_px_val:.4f}")))
+                        widened_stop = max(
+                            tick_floor,
+                            ref_px_val - widened_dist if side == PlanSide.LONG else ref_px_val + widened_dist,
+                        )
+                        initial_stop = quantize_price_rule_612(
+                            Decimal(f"{widened_stop:.6f}"),
+                            side=side,
+                        )
 
             tp_raw = raw_envelope.get("take_profit_price")
             take_profit = Decimal(str(tp_raw)) if tp_raw is not None else None
@@ -1598,6 +2058,8 @@ class NautilusMcpServer:
                 take_profit_price=take_profit,
                 collar=collar,
                 valid_until=valid_until,
+                daily_atr_14=eff_daily_atr_14,
+                execution_spec=eff_exec_spec,
             )
 
         if emp_last_px <= 0.0:
@@ -1605,9 +2067,12 @@ class NautilusMcpServer:
                 f"Cannot derive empirical PlanRiskEnvelope for {symbol} without raw_envelope or historical bars"
             )
 
-        eff_atr_mult = max(float(atr_stop_multiplier or 2.0), 2.0)
-        stop_dist = max(emp_atr * eff_atr_mult, emp_last_px * float(risk_per_trade_frac))
-        stop_px = max(0.01, emp_last_px - stop_dist)
+        stop_dist = max(stop_atr * eff_atr_mult, emp_last_px * float(risk_per_trade_frac))
+        tick_floor = float(rule_612_tick_size(Decimal(f"{emp_last_px:.4f}")))
+        stop_px_dec = quantize_price_rule_612(
+            Decimal(f"{max(tick_floor, emp_last_px - stop_dist):.6f}"),
+            side=PlanSide.LONG,
+        )
         tp_px = emp_last_px + stop_dist
         max_risk_usd = float(self._capital_basis_usd * risk_per_trade_frac)
         max_pos_usd = float(self._capital_basis_usd * max_single_name_frac)
@@ -1622,13 +2087,15 @@ class NautilusMcpServer:
             approved_qty_cap=Decimal(str(derived_qty)),
             target_notional_usd=Decimal(f"{notional:.2f}"),
             max_risk_budget_usd=Decimal(f"{max_risk_usd:.2f}"),
-            initial_stop_price=Decimal(f"{stop_px:.2f}"),
+            initial_stop_price=stop_px_dec,
             take_profit_price=Decimal(f"{tp_px:.2f}"),
             collar=MarketableLimitCollar(
                 limit_collar_pct=default_collar_pct,
                 limit_collar_atr=default_collar_atr,
             ),
             valid_until=default_valid_until,
+            daily_atr_14=eff_daily_atr_14,
+            execution_spec=eff_exec_spec,
         )
 
     def _make_plan_item_contract(
@@ -1656,6 +2123,8 @@ class NautilusMcpServer:
             strategy_config=strategy_config,
             risk_envelope=risk_envelope,
             sizing_trace=sizing_trace or {"source": "nautilus_mcp"},
+            daily_atr_14=risk_envelope.daily_atr_14,
+            execution_spec=risk_envelope.execution_spec,
         )
 
     @staticmethod
@@ -2079,21 +2548,28 @@ class NautilusMcpServer:
                 "Either DataInfraConfig or bar_provider must be configured on NautilusMcpServer"
             )
         catalog = DataInfraCatalog(self._datainfra_config)
-        catalog.register_equity(symbol, venue=self._venue_name, lot_size=1)
-        bars = sorted(
-            catalog.query_bars(
-                [symbol],
-                start_ts_ns=start_ns,
-                end_ts_ns=end_ns,
-                timeframe=bar_timeframe,
-                adjustment="adjusted",
-                market_session="REG",
-                venue=self._venue_name,
-            ),
-            key=lambda b: b.ts_init,
-        )
+        try:
+            catalog.register_equity(symbol, venue=self._venue_name, lot_size=1)
+            bars = sorted(
+                catalog.query_bars(
+                    [symbol],
+                    start_ts_ns=start_ns,
+                    end_ts_ns=end_ns,
+                    timeframe=bar_timeframe,
+                    adjustment="adjusted",
+                    market_session="REG",
+                    venue=self._venue_name,
+                ),
+                key=lambda b: b.ts_init,
+            )
+        finally:
+            del catalog
         if start_ns is None and end_ns is None and lookback_days > 0:
-            max_bars = max(120, int(lookback_days) * 26)
+            tf_norm = str(bar_timeframe or "15m").strip().lower()
+            bars_per_day = int(
+                math.ceil(BARS_PER_TRADING_YEAR.get(tf_norm, 252.0 * 26.0) / 252.0)
+            )
+            max_bars = max(120, int(lookback_days) * max(1, bars_per_day))
             if len(bars) > max_bars:
                 bars = bars[-max_bars:]
         return bars
@@ -2104,12 +2580,13 @@ class NautilusMcpServer:
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
         lookback_days: int = 60,
+        execution_spec: Optional[ExecutionSpec] = None,
     ) -> Tuple[List[Bar], Optional[List[Equity]]]:
         start_ns = _parse_date_to_ns(start_date, end_of_day=False)
         end_ns = _parse_date_to_ns(end_date, end_of_day=True)
 
         primary_sym = strategy_config.instrument_id.split(".", 1)[0].strip().upper()
-        all_bars = list(
+        primary_bars = list(
             self._load_bars_for_symbol(
                 symbol=primary_sym,
                 bar_timeframe=strategy_config.bar_timeframe,
@@ -2118,16 +2595,92 @@ class NautilusMcpServer:
                 end_ns=end_ns,
             )
         )
+        dedup_bars: Dict[Tuple[str, int], Bar] = {}
+        for b in primary_bars:
+            dedup_bars[(str(b.bar_type), int(b.ts_init))] = b
+
+        tf_norm = str(strategy_config.bar_timeframe or "15m").strip().lower()
+        needs_1m_policy = execution_spec is not None and execution_spec.trigger_policy in (
+            TriggerPolicy.HYBRID_15M_1M_BREAKOUT,
+            TriggerPolicy.INTRADAY_AVWAP_PULLBACK,
+        )
+        if tf_norm != "1m" and needs_1m_policy:
+            if primary_bars:
+                step_primary_ns = max(
+                    (_bar_step_ns(b) for b in primary_bars),
+                    default=900_000_000_000,
+                )
+                if step_primary_ns <= 0:
+                    step_primary_ns = 900_000_000_000
+                min_ts_primary = min(int(b.ts_init) for b in primary_bars)
+                max_ts_primary = max(int(b.ts_init) for b in primary_bars)
+                exec_start_ns = (
+                    start_ns
+                    if start_ns is not None
+                    else max(0, min_ts_primary - step_primary_ns)
+                )
+                exec_end_ns = (
+                    end_ns
+                    if end_ns is not None
+                    else (max_ts_primary + step_primary_ns)
+                )
+            else:
+                step_primary_ns = 900_000_000_000
+                min_ts_primary = 0
+                max_ts_primary = 0
+                exec_start_ns = start_ns
+                exec_end_ns = end_ns
+            try:
+                exec_bars = self._load_bars_for_symbol(
+                    symbol=primary_sym,
+                    bar_timeframe="1m",
+                    lookback_days=int(lookback_days),
+                    start_ns=exec_start_ns,
+                    end_ns=exec_end_ns,
+                )
+            except KeyError:
+                if self._bar_provider is None:
+                    raise
+                exec_bars = []
+            minute_bars = [b for b in (exec_bars or ()) if _is_minute_bar(b)]
+            if primary_bars and minute_bars:
+                min_ts_1m = min(int(b.ts_init) for b in minute_bars)
+                max_ts_1m = max(int(b.ts_init) for b in minute_bars)
+                if (
+                    min_ts_1m <= min_ts_primary + step_primary_ns
+                    and max_ts_1m >= max_ts_primary - step_primary_ns
+                ):
+                    for b in minute_bars:
+                        dedup_bars[(str(b.bar_type), int(b.ts_init))] = b
+                else:
+                    logger.warning(
+                        "Skipping partial 1m execution bars for %s: 1m range [%s, %s] "
+                        "does not cover %s range [%s, %s] (step_ns=%s)",
+                        primary_sym,
+                        min_ts_1m,
+                        max_ts_1m,
+                        strategy_config.bar_timeframe,
+                        min_ts_primary,
+                        max_ts_primary,
+                        step_primary_ns,
+                    )
+            elif minute_bars:
+                for b in minute_bars:
+                    dedup_bars[(str(b.bar_type), int(b.ts_init))] = b
+
+        all_bars = _sort_bars_deterministic(list(dedup_bars.values()))
         equities: List[Equity] = []
         if self._equity_provider is not None:
             equities.append(self._equity_provider(primary_sym))
         elif self._datainfra_config is not None:
             catalog = DataInfraCatalog(self._datainfra_config)
-            equities.append(
-                catalog.register_equity(primary_sym, venue=self._venue_name, lot_size=1)
-            )
+            try:
+                equities.append(
+                    catalog.register_equity(primary_sym, venue=self._venue_name, lot_size=1)
+                )
+            finally:
+                del catalog
 
-        all_bars.sort(key=lambda b: b.ts_init)
         return all_bars, (equities if equities else None)
 
     @staticmethod

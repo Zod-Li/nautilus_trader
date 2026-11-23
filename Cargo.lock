@@ -6924,6 +6924,7 @@ dependencies = [
  "nautilus-common",
  "nautilus-core",
  "nautilus-model",
+ "nautilus-risk",
  "parking_lot 0.13.0",
  "pyo3",
  "pyo3-stub-gen",

@@ -59,6 +59,7 @@ impl RustPlanItemEnvelope {
         limit_collar_atr,
         initial_stop_price = "0",
         max_risk_budget_usd = "0",
+        daily_atr_14 = None,
     ))]
     #[expect(clippy::too_many_arguments)]
     fn py_new(
@@ -77,6 +78,7 @@ impl RustPlanItemEnvelope {
         limit_collar_atr: &str,
         initial_stop_price: &str,
         max_risk_budget_usd: &str,
+        daily_atr_14: Option<&str>,
     ) -> PyResult<Self> {
         Ok(Self {
             item_id,
@@ -94,6 +96,7 @@ impl RustPlanItemEnvelope {
             limit_collar_atr: parse_dec(limit_collar_atr, "limit_collar_atr")?,
             initial_stop_price: parse_dec(initial_stop_price, "initial_stop_price")?,
             max_risk_budget_usd: parse_dec(max_risk_budget_usd, "max_risk_budget_usd")?,
+            daily_atr_14: parse_opt_dec(daily_atr_14, "daily_atr_14")?,
         })
     }
 
@@ -120,6 +123,11 @@ impl RustPlanItemEnvelope {
     #[getter]
     fn status(&self) -> &str {
         &self.status
+    }
+
+    #[getter]
+    fn daily_atr_14(&self) -> Option<String> {
+        self.daily_atr_14.map(|d| d.to_string())
     }
 }
 
@@ -304,6 +312,55 @@ impl RustPlanGateEngine {
     fn py_release_reservation(&self, symbol: &str, quantity: &str) -> PyResult<String> {
         let qty = parse_dec(quantity, "quantity")?;
         Ok(self.release_reservation(symbol, qty).to_string())
+    }
+
+    #[pyo3(name = "release_order_reservation")]
+    fn py_release_order_reservation(
+        &self,
+        client_order_id: &str,
+        symbol: &str,
+        quantity: &str,
+    ) -> PyResult<String> {
+        let qty = parse_dec(quantity, "quantity")?;
+        Ok(self
+            .release_order_reservation(client_order_id, symbol, qty)
+            .to_string())
+    }
+
+    #[pyo3(name = "reconcile_order_updated")]
+    fn py_reconcile_order_updated(
+        &self,
+        client_order_id: &str,
+        symbol: &str,
+        new_qty: &str,
+    ) -> PyResult<String> {
+        let qty = parse_dec(new_qty, "new_qty")?;
+        Ok(self
+            .reconcile_order_updated(client_order_id, symbol, qty)
+            .to_string())
+    }
+
+    #[pyo3(name = "reconcile_terminal_order")]
+    fn py_reconcile_terminal_order(
+        &self,
+        client_order_id: &str,
+        symbol: &str,
+        filled_qty: &str,
+    ) -> PyResult<String> {
+        let qty = parse_dec(filled_qty, "filled_qty")?;
+        Ok(self
+            .reconcile_terminal_order(client_order_id, symbol, qty)
+            .to_string())
+    }
+
+    #[pyo3(name = "has_admitted_reservation")]
+    fn py_has_admitted_reservation(&self, client_order_id: &str) -> bool {
+        self.has_admitted_reservation(client_order_id)
+    }
+
+    #[pyo3(name = "as_pre_trade_risk_gate")]
+    fn py_as_pre_trade_risk_gate(&self) -> nautilus_risk::gate::PyPreTradeRiskGateHandle {
+        nautilus_risk::gate::PyPreTradeRiskGateHandle(std::sync::Arc::new(self.clone()))
     }
 
     #[pyo3(name = "drain_pending_mutations")]

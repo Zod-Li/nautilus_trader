@@ -1,7 +1,8 @@
 """Pre-audited MeanReversionStrategy and MeanReversionConfig for Nautilus v2.
 
 Computes rolling VWAP/anchor residuals, non-parametric Robust MAD Z-scores,
-and empirical rank quantiles over `lookback_window`, routing all orders through `PLAN_GATE`.
+and empirical rank quantiles over `lookback_window`, routing entry signals through
+`BaseArchetypeStrategy` (`ExecutionSpec` + `PreTradeRiskGate` + `COLLARED_TWAP` / `DIRECT_COLLARED_LIMIT`).
 """
 
 from __future__ import annotations
@@ -17,7 +18,6 @@ from nautilus_trader.quant.strategies.base import (
 from nautilus_trader.quant.strategies.empirical import (
     empirical_rank_quantile,
     quantile_to_float,
-    rolling_atr,
     rolling_mad_zscore,
     rolling_vwap,
 )
@@ -39,8 +39,7 @@ class MeanReversionStrategy(BaseArchetypeStrategy):
     2. Residual deviation `res = close - vwap_anchor`.
     3. Non-parametric Robust MAD Z-score `mad_z = rolling_mad_zscore(residuals[-lookback_window:], res)`
        and empirical rank quantile `q_mad = empirical_rank_quantile(mad_z_history[-lookback_window:], mad_z)`.
-    4. Adaptive mean-reversion target (`vwap_anchor`) and volatility disaster stop
-       (`atr_stop_multiplier * rolling_atr(fast_window)`).
+    4. Initial stop and `1m` Chandelier ratchet anchored strictly to `daily_atr_14`.
     """
 
     def __init__(self, config: MeanReversionConfig) -> None:
@@ -67,14 +66,7 @@ class MeanReversionStrategy(BaseArchetypeStrategy):
         ]
         return rolling_vwap(typical_prices, self._volumes[-window:], window)
 
-    def on_bar(self, bar: Bar) -> None:
-        if bar.bar_type != self._archetype_config.bar_type:
-            return
-
-        if not self._record_primary_bar(bar):
-            return
-        if not self._in_warmup and self._check_and_execute_pending_thesis_exit(bar):
-            return
+    def evaluate_primary_bar(self, bar: Bar) -> None:
         n = len(self._closes)
         cfg = self._archetype_config
         if n < cfg.slow_window:
@@ -82,10 +74,6 @@ class MeanReversionStrategy(BaseArchetypeStrategy):
 
         vwap_anchor = self._compute_rolling_vwap_anchor(cfg.slow_window)
         close_px = self._closes[-1]
-        high_px = self._highs[-1]
-        low_px = self._lows[-1]
-        raw_high_px = self._current_bar_raw_high(high_px)
-        raw_low_px = self._current_bar_raw_low(low_px)
         residual = close_px - vwap_anchor
         self._residuals.append(residual)
 
@@ -101,52 +89,14 @@ class MeanReversionStrategy(BaseArchetypeStrategy):
         if self._in_warmup:
             return
 
-        atr = rolling_atr(self._highs, self._lows, self._closes, cfg.fast_window)
-        if atr <= 0.0:
+        bar_ts = int(getattr(bar, "ts_event", 0) or getattr(bar, "ts_init", 0) or 0)
+        tod_vol_q = self._update_rth_tod_volume(bar_ts, self._volumes[-1])
+
+        if self._open_position_signed_qty() != Decimal("0"):
             return
 
-        z_window = self._mad_zscores[-min(len(self._mad_zscores), cfg.lookback_window) :]
-        z_quantile = empirical_rank_quantile(z_window, mad_z)
-
-        entry_q = quantile_to_float(cfg.entry_quantile_threshold)
-        exit_q = quantile_to_float(cfg.exit_quantile_threshold)
-        atr_mult = quantile_to_float(cfg.atr_stop_multiplier)
-
-        signed_pos = self._open_position_signed_qty()
-        if signed_pos > Decimal("0"):
-            stop_hit = (
-                self._trailing_stop_price is not None
-                and raw_low_px <= self._trailing_stop_price
-            )
-            reverted_to_anchor = (
-                close_px >= vwap_anchor or (1.0 - z_quantile) <= exit_q
-            )
-            if stop_hit or reverted_to_anchor:
-                reason = "MEAN_REV_DISASTER_STOP" if stop_hit else "MEAN_REV_TARGET_REACHED"
-                self._submit_plan_gated_exit(
-                    exit_side=OrderSide.SELL,
-                    quantity=signed_pos,
-                    reference_price=close_px,
-                    reason_tag=reason,
-                )
-                self._anchor_target = None
-            return
-
-        if signed_pos < Decimal("0"):
-            stop_hit = (
-                self._trailing_stop_price is not None
-                and raw_high_px >= self._trailing_stop_price
-            )
-            reverted_to_anchor = close_px <= vwap_anchor or z_quantile <= exit_q
-            if stop_hit or reverted_to_anchor:
-                reason = "MEAN_REV_DISASTER_STOP" if stop_hit else "MEAN_REV_TARGET_REACHED"
-                self._submit_plan_gated_exit(
-                    exit_side=OrderSide.BUY,
-                    quantity=abs(signed_pos),
-                    reference_price=close_px,
-                    reason_tag=reason,
-                )
-                self._anchor_target = None
+        daily_atr = self._resolve_daily_atr_14(close_px)
+        if daily_atr <= 0.0:
             return
 
         if (
@@ -156,24 +106,30 @@ class MeanReversionStrategy(BaseArchetypeStrategy):
         ):
             return
 
+        z_window = self._mad_zscores[-min(len(self._mad_zscores), cfg.lookback_window) :]
+        z_quantile = empirical_rank_quantile(z_window, mad_z)
+
+        entry_q = quantile_to_float(cfg.entry_quantile_threshold)
+        atr_mult = quantile_to_float(cfg.atr_stop_multiplier)
+
         # Oversold tail for LONG mean reversion: (1.0 - z_quantile) >= entry_q and mad_z < 0
         if cfg.plan_side == PlanSide.LONG:
             oversold_quantile = 1.0 - z_quantile
             if oversold_quantile >= entry_q and mad_z < 0.0:
                 stop_px = self._resolve_entry_stop_price(
-                    close_px, close_px - (atr_mult * atr)
+                    close_px, close_px - (atr_mult * daily_atr)
                 )
                 prev_stop = self._trailing_stop_price
                 prev_anchor = self._anchor_target
                 self._trailing_stop_price = stop_px
                 self._anchor_target = vwap_anchor
-                cid = self._submit_plan_gated_entry(
+                cid = self._dispatch_entry_signal(
                     order_side=OrderSide.BUY,
+                    bar=bar,
                     reference_price=close_px,
-                    atr=atr,
-                    limit_price=close_px,
                     stop_loss_price=stop_px,
                     tags=["MEAN_REVERSION_LONG_ENTRY"],
+                    tod_volume_quantile=tod_vol_q,
                 )
                 if not cid or self._is_order_denied_or_rejected(cid):
                     self._trailing_stop_price = prev_stop
@@ -181,19 +137,19 @@ class MeanReversionStrategy(BaseArchetypeStrategy):
         elif cfg.plan_side == PlanSide.SHORT:
             if z_quantile >= entry_q and mad_z > 0.0:
                 stop_px = self._resolve_entry_stop_price(
-                    close_px, close_px + (atr_mult * atr)
+                    close_px, close_px + (atr_mult * daily_atr)
                 )
                 prev_stop = self._trailing_stop_price
                 prev_anchor = self._anchor_target
                 self._trailing_stop_price = stop_px
                 self._anchor_target = vwap_anchor
-                cid = self._submit_plan_gated_entry(
+                cid = self._dispatch_entry_signal(
                     order_side=OrderSide.SELL,
+                    bar=bar,
                     reference_price=close_px,
-                    atr=atr,
-                    limit_price=close_px,
                     stop_loss_price=stop_px,
                     tags=["MEAN_REVERSION_SHORT_ENTRY"],
+                    tod_volume_quantile=tod_vol_q,
                 )
                 if not cid or self._is_order_denied_or_rejected(cid):
                     self._trailing_stop_price = prev_stop

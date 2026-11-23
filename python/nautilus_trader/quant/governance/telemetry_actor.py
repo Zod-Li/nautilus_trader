@@ -10,18 +10,19 @@ coverage via `ProtectiveOcoMonitor`.
 
 from __future__ import annotations
 
-from collections import OrderedDict
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, timezone
 from decimal import Decimal
 import json
 import logging
 import queue
 import threading
 import time
+import types
 from typing import Any, Callable, Dict, List, Mapping, Optional, Set, Tuple
 from uuid import UUID
 import weakref
+from zoneinfo import ZoneInfo
 
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -29,6 +30,7 @@ from psycopg2.extras import RealDictCursor
 from nautilus_trader.common import DataActor, DataActorConfig
 from nautilus_trader.model import (
     ActorId,
+    ClientOrderId,
     OrderAccepted,
     OrderCanceled,
     OrderDenied,
@@ -48,10 +50,13 @@ except ImportError:  # pragma: no cover
     AccountState = None  # type: ignore[assignment,misc]
 
 from evolution_engine.db.dsn import resolve_database_dsn
+from nautilus_trader.quant.contracts.models import PlanSide
+from nautilus_trader.quant.contracts.repository import PlanContractRepository
 from nautilus_trader.quant.governance.bounded_collections import (
     _BoundedFifoDict,
     _BoundedFifoSet,
 )
+from nautilus_trader.quant.governance.plan_gate_backend import EXIT_INTENT_TAGS
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +72,13 @@ class _AsyncTelemetryDbWorker:
     ) -> None:
         self._dsn = dsn
         self._connect_timeout_secs = max(1, int(connect_timeout_secs))
-        self._on_db_error_callback = on_db_error_callback
+        self._on_db_error_callback: Optional[Callable[[str, str], None]] = None
+        self._on_db_error_weak: Optional[weakref.WeakMethod[Any]] = None
+        if on_db_error_callback is not None:
+            if isinstance(on_db_error_callback, types.MethodType):
+                self._on_db_error_weak = weakref.WeakMethod(on_db_error_callback)
+            else:
+                self._on_db_error_callback = on_db_error_callback
         self._queue: "queue.Queue[Optional[Tuple[Callable[[Any], None], Optional[threading.Event]]]]" = queue.Queue()
         self._state_lock = threading.Lock()
         self._retry_buffer: List[Callable[[Any], None]] = []
@@ -80,6 +91,13 @@ class _AsyncTelemetryDbWorker:
             daemon=True,
         )
         self._thread.start()
+
+    def _resolve_db_error_callback(self) -> Optional[Callable[[str, str], None]]:
+        if self._on_db_error_callback is not None:
+            return self._on_db_error_callback
+        if self._on_db_error_weak is not None:
+            return self._on_db_error_weak()
+        return None
 
     def submit(self, task_fn: Callable[[Any], None], eager_flush: bool = False) -> None:
         done = threading.Event() if eager_flush else None
@@ -99,6 +117,10 @@ class _AsyncTelemetryDbWorker:
         if self._thread.is_alive() and threading.current_thread() is not self._thread:
             self._thread.join(timeout=2.0)
         self._close_conn()
+        self._on_db_error_callback = None
+        self._on_db_error_weak = None
+        with self._state_lock:
+            self._retry_buffer.clear()
 
     def _close_conn(self) -> None:
         conn = self._conn
@@ -143,9 +165,10 @@ class _AsyncTelemetryDbWorker:
                 self._consecutive_failures += 1
                 backoff = min(30.0, 0.5 * (2 ** min(self._consecutive_failures, 6)))
                 self._next_retry_monotonic = time.monotonic() + backoff
-            if self._on_db_error_callback is not None:
+            cb = self._resolve_db_error_callback()
+            if cb is not None:
                 try:
-                    self._on_db_error_callback(
+                    cb(
                         "POSTGRES_TELEMETRY",
                         f"TELEMETRY_DB_WRITE_FAILED: {exc}",
                     )
@@ -328,8 +351,12 @@ class ProtectiveOcoMonitor:
         )
         self._broker = str(broker or "alpaca").strip().lower()
         self._connect_timeout_secs = max(1, int(connect_timeout_secs))
-        self._on_entry_freeze_callback = on_entry_freeze_callback
-        self._entry_freeze_callbacks: List[Callable[[str, str], None]] = []
+        self._on_entry_freeze_callback: Any = (
+            self._wrap_callback(on_entry_freeze_callback)
+            if on_entry_freeze_callback is not None
+            else None
+        )
+        self._entry_freeze_callbacks: List[Any] = []
         self._positions_qty: Dict[str, Decimal] = {}
         self._unapplied_pos_reduction_by_symbol: Dict[str, Decimal] = {}
         self._coverage_by_symbol: Dict[str, ProtectiveOrderCoverage] = {}
@@ -365,18 +392,63 @@ class ProtectiveOcoMonitor:
     def is_safe_exit_in_flight(self, symbol: str) -> bool:
         return self.is_safe_exit_active(symbol)
 
+    @staticmethod
+    def _wrap_callback(cb: Callable[[str, str], None]) -> Any:
+        if isinstance(cb, types.MethodType):
+            return weakref.WeakMethod(cb)
+        return cb
+
+    @staticmethod
+    def _resolve_callback(entry: Any) -> Optional[Callable[[str, str], None]]:
+        if isinstance(entry, weakref.WeakMethod):
+            return entry()
+        return entry
+
     def add_entry_freeze_callback(self, callback: Callable[[str, str], None]) -> None:
-        if callback not in self._entry_freeze_callbacks and callback is not self._on_entry_freeze_callback:
-            self._entry_freeze_callbacks.append(callback)
+        if callback is None:
+            return
+        primary = self._resolve_callback(self._on_entry_freeze_callback)
+        if callback is primary or callback == primary:
+            return
+        alive_entries: List[Any] = []
+        already_present = False
+        for entry in self._entry_freeze_callbacks:
+            resolved = self._resolve_callback(entry)
+            if resolved is None:
+                continue
+            alive_entries.append(entry)
+            if resolved is callback or resolved == callback:
+                already_present = True
+        if not already_present:
+            alive_entries.append(self._wrap_callback(callback))
+        self._entry_freeze_callbacks = alive_entries
+
+    def remove_entry_freeze_callback(
+        self, callback: Optional[Callable[[str, str], None]]
+    ) -> None:
+        if callback is None:
+            return
+        primary = self._resolve_callback(self._on_entry_freeze_callback)
+        if primary is callback or primary == callback:
+            self._on_entry_freeze_callback = None
+        kept: List[Any] = []
+        for entry in self._entry_freeze_callbacks:
+            resolved = self._resolve_callback(entry)
+            if resolved is None or resolved is callback or resolved == callback:
+                continue
+            kept.append(entry)
+        self._entry_freeze_callbacks = kept
 
     def _notify_entry_freeze(self, symbol: str, reason: str) -> None:
-        if self._on_entry_freeze_callback is not None:
+        primary = self._resolve_callback(self._on_entry_freeze_callback)
+        if primary is not None:
             try:
-                self._on_entry_freeze_callback(symbol, reason)
+                primary(symbol, reason)
             except Exception as exc:
                 logger.error("Primary entry freeze callback failed: %s", exc)
-        for cb in list(self._entry_freeze_callbacks):
-            if cb is self._on_entry_freeze_callback:
+        for entry in list(self._entry_freeze_callbacks):
+            cb = self._resolve_callback(entry)
+            if cb is None or cb is primary or cb == primary:
                 continue
             try:
                 cb(symbol, reason)
@@ -398,9 +470,11 @@ class ProtectiveOcoMonitor:
     def close(self) -> None:
         self._on_entry_freeze_callback = None
         self._entry_freeze_callbacks.clear()
+        writer = self._async_writer
+        self._async_writer = None
         try:
-            if self._async_writer is not None:
-                self._async_writer.close()
+            if writer is not None:
+                writer.close()
         except Exception:
             pass
 
@@ -646,7 +720,12 @@ class ProtectiveOcoMonitor:
         if existing is None:
             existing = current_sym_cov
 
-        if self.is_safe_exit_active(target_sym) and "CANCELED" in reason.upper():
+        if self.is_safe_exit_active(target_sym) and (
+            "CANCELED" in reason.upper()
+            or "REJECTED" in reason.upper()
+            or "DENIED" in reason.upper()
+            or "EXPIRED" in reason.upper()
+        ):
             return None
 
         if (
@@ -1077,7 +1156,11 @@ class PostgresTelemetryActor(DataActor):
         cls,
         config: Optional[PostgresTelemetryActorConfig] = None,
         oco_monitor: Optional[ProtectiveOcoMonitor] = None,
+        plan_gate_backend: Optional[Any] = None,
+        plan_repo: Optional[PlanContractRepository] = None,
+        cancel_symbol_entries_callback: Optional[Callable[[str], Any]] = None,
     ) -> "PostgresTelemetryActor":
+        _ = (oco_monitor, plan_gate_backend, plan_repo, cancel_symbol_entries_callback)
         effective_config = config or PostgresTelemetryActorConfig()
         return super().__new__(cls, effective_config)
 
@@ -1085,6 +1168,9 @@ class PostgresTelemetryActor(DataActor):
         self,
         config: Optional[PostgresTelemetryActorConfig] = None,
         oco_monitor: Optional[ProtectiveOcoMonitor] = None,
+        plan_gate_backend: Optional[Any] = None,
+        plan_repo: Optional[PlanContractRepository] = None,
+        cancel_symbol_entries_callback: Optional[Callable[[str], Any]] = None,
     ) -> None:
         effective_config = config or PostgresTelemetryActorConfig()
         super().__init__(effective_config)
@@ -1103,14 +1189,26 @@ class PostgresTelemetryActor(DataActor):
         self._enforce_oco_on_pos = (
             effective_config.enforce_protective_oco_on_position_events
         )
+        self._owns_oco_monitor: bool = oco_monitor is None
         self._oco_monitor = oco_monitor or ProtectiveOcoMonitor(
             dsn=self._dsn if self._persist_to_db else None,
             broker=self._broker,
             connect_timeout_secs=self._connect_timeout_secs,
             persist_to_db=self._persist_to_db,
         )
+        self._plan_gate_backend: Optional[Any] = plan_gate_backend
+        self._plan_repo: Optional[PlanContractRepository] = plan_repo
+        self._cancel_symbol_entries_callback: Optional[Callable[[str], Any]] = (
+            cancel_symbol_entries_callback
+        )
         self._processed_event_ids: _BoundedFifoSet = _BoundedFifoSet(16384)
         self._persisted_plan_event_ids: _BoundedFifoSet = _BoundedFifoSet(16384)
+        self._released_entry_cids: _BoundedFifoSet = _BoundedFifoSet(16384)
+        self._opened_position_ids: Set[str] = set()
+        self._startup_entry_reservations: Dict[str, Tuple[str, Decimal]] = {}
+        self._scheduled_expiry_item_ids: Set[str] = set()
+        self._expiry_targets_by_timer: Dict[str, Tuple[str, UUID, int]] = {}
+        self._pending_expiry_by_symbol: Dict[str, Tuple[UUID, int]] = {}
         self._plan_item_cache: Dict[Tuple[Optional[date], str, str], Tuple[Any, Any]] = {}
         self._order_meta: _BoundedFifoDict = _BoundedFifoDict(
             8192,
@@ -1125,6 +1223,7 @@ class PostgresTelemetryActor(DataActor):
         self._replaced_stop_cids: _BoundedFifoSet = _BoundedFifoSet(4096)
         self._safe_exit_symbols: Set[str] = set()
         self._msgbus_subscriptions: List[Tuple[str, Any]] = []
+        self._msgbus_bindings: List[Tuple[Any, str, Any]] = []
         self._subscribed_msgbuses: Set[int] = set()
         self._is_started: bool = False
         self._owner_thread_id: int = threading.get_ident()
@@ -1133,6 +1232,34 @@ class PostgresTelemetryActor(DataActor):
         self._cache_identity_key: str = f"__nautilus_telemetry_actor__{id(self)}"
         self._cache_identity_bytes: bytes = str(id(self)).encode("utf-8")
         self._async_writer = self._oco_monitor._async_writer
+        self._oco_monitor.add_entry_freeze_callback(self._on_oco_entry_freeze)
+
+    def _on_oco_entry_freeze(self, symbol: str, reason: str) -> None:
+        backend = self._plan_gate_backend
+        if backend is None:
+            return
+        set_freeze = getattr(backend, "set_entry_freeze", None)
+        if callable(set_freeze):
+            norm_sym = _normalize_symbol(symbol)
+            updated_by = (
+                f"nautilus:protective_oco_monitor:{norm_sym}"
+                if norm_sym
+                else "nautilus:protective_oco_monitor"
+            )
+            set_freeze(True, reason=reason, updated_by=updated_by)
+
+    def attach_plan_gate_backend(self, backend: Optional[Any]) -> None:
+        self._plan_gate_backend = backend
+        if backend is not None and self._oco_monitor is not None:
+            self._oco_monitor.add_entry_freeze_callback(self._on_oco_entry_freeze)
+
+    def attach_plan_repo(self, repo: Optional[PlanContractRepository]) -> None:
+        self._plan_repo = repo
+
+    def set_cancel_symbol_entries_callback(
+        self, callback: Optional[Callable[[str], Any]]
+    ) -> None:
+        self._cancel_symbol_entries_callback = callback
 
     def _is_owner_thread(self) -> bool:
         return threading.get_ident() == getattr(
@@ -1148,6 +1275,12 @@ class PostgresTelemetryActor(DataActor):
         self._trading_date = trading_date
         self._telemetry_config.trading_date = trading_date
         self._plan_item_cache.clear()
+        self._startup_entry_reservations.clear()
+        self._scheduled_expiry_item_ids.clear()
+        self._expiry_targets_by_timer.clear()
+        self._pending_expiry_by_symbol.clear()
+        if self._is_started:
+            self.sync_plan_expiry_timers()
 
     def begin_safe_exit(self, symbol: str, reason: str = "TWO_PHASE_SAFE_EXIT") -> None:
         """Marks `symbol` as entering an authorized Two-Phase Safe Exit window."""
@@ -1157,6 +1290,7 @@ class PostgresTelemetryActor(DataActor):
             return
         self._safe_exit_symbols.add(norm_sym)
         self._oco_monitor.begin_safe_exit(norm_sym)
+        self._refresh_runtime_handles()
         cache = self._safe_cache()
         if cache is not None and callable(getattr(cache, "add", None)):
             try:
@@ -1171,6 +1305,7 @@ class PostgresTelemetryActor(DataActor):
             return
         self._safe_exit_symbols.discard(norm_sym)
         self._oco_monitor.end_safe_exit(norm_sym)
+        self._refresh_runtime_handles()
         cache = self._safe_cache()
         if cache is not None and callable(getattr(cache, "add", None)):
             try:
@@ -1381,19 +1516,29 @@ class PostgresTelemetryActor(DataActor):
         bus_id = id(msgbus)
         if bus_id in self._subscribed_msgbuses:
             return
+        try:
+            bus_ref: Any = weakref.ref(msgbus)
+        except TypeError:
+            bus_ref = msgbus
         order_handler = self.on_order_event
         position_handler = self.on_position_event
         account_handler = self.on_account_state
         msgbus.subscribe("events.order.*", order_handler)
         msgbus.subscribe("events.position.*", position_handler)
+        subscribed_account = False
         try:
             msgbus.subscribe("events.account.*", account_handler)
+            subscribed_account = True
         except Exception:
             pass
         self._subscribed_msgbuses.add(bus_id)
         self._msgbus_subscriptions.append(("events.order.*", order_handler))
         self._msgbus_subscriptions.append(("events.position.*", position_handler))
-        self._msgbus_subscriptions.append(("events.account.*", account_handler))
+        self._msgbus_bindings.append((bus_ref, "events.order.*", order_handler))
+        self._msgbus_bindings.append((bus_ref, "events.position.*", position_handler))
+        if subscribed_account:
+            self._msgbus_subscriptions.append(("events.account.*", account_handler))
+            self._msgbus_bindings.append((bus_ref, "events.account.*", account_handler))
 
     def on_start(self) -> None:
         self._is_started = True
@@ -1419,16 +1564,744 @@ class PostgresTelemetryActor(DataActor):
             except Exception:
                 pass
         self.sync_from_cache()
+        self.reconcile_startup_reservations()
+        self.sync_plan_expiry_timers()
+        self._flush_backend_mutations()
+
+    def _flush_backend_mutations(self) -> int:
+        if self._plan_gate_backend is None:
+            return 0
+        flush_fn = getattr(self._plan_gate_backend, "flush_rust_mutations", None)
+        if callable(flush_fn):
+            try:
+                return int(flush_fn())
+            except Exception as exc:
+                logger.error("Failed to flush PlanGate Rust mutations: %s", exc, exc_info=True)
+        return 0
+
+    def _resolve_session_date(self) -> date:
+        if self._trading_date is not None:
+            return self._trading_date
+        clk = self._safe_clock()
+        if clk is not None:
+            try:
+                ts_ns = int(clk.timestamp_ns())
+                if ts_ns > 0:
+                    return (
+                        datetime.fromtimestamp(ts_ns / 1_000_000_000.0, tz=timezone.utc)
+                        .astimezone(ZoneInfo("America/New_York"))
+                        .date()
+                    )
+            except Exception:
+                pass
+        return datetime.now(timezone.utc).astimezone(ZoneInfo("America/New_York")).date()
+
+    @staticmethod
+    def _is_entry_order_obj(order: Any) -> bool:
+        if bool(getattr(order, "is_reduce_only", False)):
+            return False
+        otype = _normalize_order_type_str(getattr(order, "order_type", "MARKET"))
+        if _is_protective_stop_order_type(otype):
+            return False
+        exec_params = getattr(order, "exec_algorithm_params", None) or {}
+        if isinstance(exec_params, Mapping):
+            intent = str(
+                exec_params.get("intent") or exec_params.get("action") or ""
+            ).strip().upper()
+            if intent in EXIT_INTENT_TAGS:
+                return False
+        return True
+
+    def _count_open_entry_leaves_in_cache(self, symbol: str) -> int:
+        norm_sym = _normalize_symbol(symbol)
+        if not norm_sym:
+            return 0
+        cache = self._safe_cache()
+        if cache is None:
+            return 0
+        candidates: List[Any] = []
+        seen_keys: Set[str] = set()
+        for fn_name in ("orders_open", "orders_inflight", "orders"):
+            fn = getattr(cache, fn_name, None)
+            if not callable(fn):
+                continue
+            try:
+                orders_seq = fn() or ()
+            except Exception:
+                continue
+            for ord_obj in orders_seq:
+                cid = str(getattr(ord_obj, "client_order_id", "") or "")
+                key = cid if cid else f"id:{id(ord_obj)}"
+                if key in seen_keys:
+                    continue
+                seen_keys.add(key)
+                candidates.append(ord_obj)
+
+        count = 0
+        for order in candidates:
+            if _normalize_symbol(getattr(order, "instrument_id", "")) != norm_sym:
+                continue
+            if not self._is_entry_order_obj(order):
+                continue
+            if bool(getattr(order, "is_closed", False)):
+                continue
+            status_str = str(getattr(order, "status", "") or "").upper()
+            if "." in status_str:
+                status_str = status_str.rsplit(".", 1)[-1]
+            if status_str in {
+                "DENIED",
+                "REJECTED",
+                "CANCELED",
+                "CANCELLED",
+                "EXPIRED",
+                "FILLED",
+                "VOIDED",
+            }:
+                continue
+            if status_str == "INITIALIZED":
+                cid = str(getattr(order, "client_order_id", "") or "")
+                ea_id = getattr(order, "exec_algorithm_id", None)
+                spawn_id = getattr(order, "exec_spawn_id", None)
+                is_primary_init = bool(getattr(order, "is_primary", False)) or (
+                    ea_id is not None
+                    and spawn_id is not None
+                    and bool(cid)
+                    and str(spawn_id) == cid
+                )
+                if is_primary_init:
+                    continue
+            leaves_qty = _to_decimal(getattr(order, "leaves_qty", None), "0")
+            if leaves_qty > Decimal("0"):
+                count += 1
+        return count
+
+    def reconcile_startup_reservations(self) -> None:
+        """Reconciles per-symbol entry reservations on startup against cache, PG orders, and broker positions.
+
+        Formula: `max(cache_fills_today, pg_orders_filled_today, max(0, |pos_broker| - |carry_over|)) + open_leaves`.
+        Fails closed (`ENTRY_FREEZE`) on PostgreSQL query failure when `persist_to_db=True`.
+        """
+        if self._plan_gate_backend is None:
+            return
+        items_map = getattr(self._plan_gate_backend, "_items_by_symbol", None)
+        if not items_map:
+            return
+
+        session_date = self._resolve_session_date()
+        ny_midnight = datetime(
+            session_date.year,
+            session_date.month,
+            session_date.day,
+            0,
+            0,
+            0,
+            tzinfo=ZoneInfo("America/New_York"),
+        )
+        session_start_ns = int(ny_midnight.astimezone(timezone.utc).timestamp() * 1_000_000_000)
+
+        cache = self._safe_cache()
+        try:
+            all_orders = list(cache.orders() or ()) if cache is not None else []
+        except Exception:
+            all_orders = []
+        try:
+            open_orders = list(cache.orders_open() or ()) if cache is not None else []
+        except Exception:
+            open_orders = []
+        try:
+            open_positions = list(cache.positions_open() or ()) if cache is not None else []
+        except Exception:
+            open_positions = []
+
+        pg_filled_by_key: Dict[Tuple[str, str], Decimal] = {}
+        pg_pos_by_sym: Dict[str, Tuple[Decimal, Optional[date]]] = {}
+        db_carry_over_by_sym: Dict[str, Decimal] = {}
+        if self._persist_to_db and self._dsn:
+            try:
+                conn = psycopg2.connect(
+                    self._dsn,
+                    cursor_factory=RealDictCursor,
+                    connect_timeout=self._connect_timeout_secs,
+                )
+                try:
+                    with conn.cursor() as cur:
+                        if ProtectiveOcoMonitor._table_exists(cur, "orders"):
+                            cur.execute(
+                                """
+                                SELECT UPPER(symbol) AS sym,
+                                       UPPER(action) AS act,
+                                       COALESCE(SUM(COALESCE(filled_qty, 0)), 0) AS total_filled
+                                FROM orders
+                                WHERE LOWER(broker) = LOWER(%s)
+                                  AND UPPER(environment) = UPPER(%s)
+                                  AND UPPER(COALESCE(order_type, '')) NOT LIKE '%%STOP%%'
+                                  AND COALESCE((created_at AT TIME ZONE 'America/New_York')::date, %s) = %s
+                                GROUP BY UPPER(symbol), UPPER(action)
+                                """,
+                                (self._broker, self._environment, session_date, session_date),
+                            )
+                            for row in cur.fetchall() or ():
+                                r_sym = str(row.get("sym") or "").strip().upper()
+                                r_act = str(row.get("act") or "").strip().upper()
+                                if r_sym and r_act:
+                                    pg_filled_by_key[(r_sym, r_act)] = max(
+                                        Decimal("0"),
+                                        _to_decimal(row.get("total_filled"), "0"),
+                                    )
+                        if ProtectiveOcoMonitor._table_exists(cur, "trading_positions"):
+                            cur.execute(
+                                """
+                                SELECT UPPER(symbol) AS sym,
+                                       ABS(COALESCE(qty, 0)) AS abs_qty,
+                                       (updated_at AT TIME ZONE 'America/New_York')::date AS pos_date
+                                FROM trading_positions
+                                WHERE LOWER(broker) = LOWER(%s)
+                                  AND UPPER(environment) = UPPER(%s)
+                                  AND COALESCE(qty, 0) <> 0
+                                """,
+                                (self._broker, self._environment),
+                            )
+                            for row in cur.fetchall() or ():
+                                p_sym = str(row.get("sym") or "").strip().upper()
+                                if p_sym:
+                                    p_qty = max(
+                                        Decimal("0"),
+                                        _to_decimal(row.get("abs_qty"), "0"),
+                                    )
+                                    p_date = row.get("pos_date")
+                                    if isinstance(p_date, datetime):
+                                        p_date = p_date.date()
+                                    if p_qty > Decimal("0"):
+                                        pg_pos_by_sym[p_sym] = (p_qty, p_date)
+                        if ProtectiveOcoMonitor._table_exists(cur, "trading_plan_items") and ProtectiveOcoMonitor._table_exists(cur, "trading_plans"):
+                            cur.execute(
+                                """
+                                SELECT UPPER(i.symbol) AS sym,
+                                       UPPER(COALESCE(i.kind, '')) AS kind,
+                                       COALESCE(i.filled_qty, 0) AS filled_qty,
+                                       i.sizing_trace
+                                FROM trading_plan_items i
+                                JOIN trading_plans p ON p.plan_id = i.plan_id
+                                WHERE p.trading_date = %s
+                                  AND p.market = %s
+                                """,
+                                (session_date, self._market),
+                            )
+                            for row in cur.fetchall() or ():
+                                c_sym = str(row.get("sym") or "").strip().upper()
+                                if not c_sym:
+                                    continue
+                                raw_trace = row.get("sizing_trace") or {}
+                                if isinstance(raw_trace, str):
+                                    try:
+                                        raw_trace = json.loads(raw_trace)
+                                    except (TypeError, ValueError):
+                                        raw_trace = {}
+                                trace = raw_trace if isinstance(raw_trace, Mapping) else {}
+                                r_kind = str(row.get("kind") or trace.get("kind") or "").strip().upper()
+                                r_co_status = str(trace.get("carry_over_status") or "").strip().upper()
+                                r_co_qty = trace.get("carry_over_position_qty")
+                                if r_co_qty is not None and str(r_co_qty).strip() != "":
+                                    co_dec = abs(_to_decimal(r_co_qty, "0"))
+                                    db_carry_over_by_sym[c_sym] = max(
+                                        db_carry_over_by_sym.get(c_sym, Decimal("0")),
+                                        co_dec,
+                                    )
+                                elif r_kind in ("CARRY_OVER", "POSITION_MGMT") or r_co_status in (
+                                    "CARRY_OVER_EXIT_ONLY",
+                                    "THESIS_INVALIDATED_EXIT",
+                                    "RENEWED_ACTIVE",
+                                ):
+                                    co_dec = abs(_to_decimal(row.get("filled_qty"), "0"))
+                                    if co_dec == Decimal("0") and c_sym in pg_pos_by_sym:
+                                        co_dec = pg_pos_by_sym[c_sym][0]
+                                    db_carry_over_by_sym[c_sym] = max(
+                                        db_carry_over_by_sym.get(c_sym, Decimal("0")),
+                                        co_dec,
+                                    )
+                finally:
+                    conn.close()
+            except Exception as exc:
+                reason = f"STARTUP_RECONCILE_DB_ERROR: {exc}"
+                logger.error("Startup reservation reconciliation DB error: %s", exc, exc_info=True)
+                freeze_fn = getattr(self._plan_gate_backend, "set_entry_freeze", None)
+                if callable(freeze_fn):
+                    freeze_fn(
+                        True,
+                        reason=reason,
+                        updated_by="nautilus:telemetry_actor:startup_reconcile",
+                    )
+                return
+
+        rust_engine = getattr(self._plan_gate_backend, "rust_engine", None)
+        reconcile_sym_fn = getattr(
+            self._plan_gate_backend, "reconcile_symbol_reservation", None
+        )
+        if not callable(reconcile_sym_fn):
+            return
+
+        for raw_sym, item in list(items_map.items()):
+            sym = _normalize_symbol(raw_sym)
+            if not sym:
+                continue
+            expected_action = (
+                "BUY" if item.risk_envelope.side == PlanSide.LONG else "SELL"
+            )
+
+            cache_fills_today = Decimal("0")
+            for order in all_orders:
+                if _normalize_symbol(getattr(order, "instrument_id", "")) != sym:
+                    continue
+                if not self._is_entry_order_obj(order):
+                    continue
+                if _normalize_side_str(getattr(order, "side", "")) != expected_action:
+                    continue
+                status_str = str(getattr(order, "status", "") or "").upper()
+                if "." in status_str:
+                    status_str = status_str.rsplit(".", 1)[-1]
+                if status_str == "INITIALIZED":
+                    continue
+                ts_init = int(getattr(order, "ts_init", 0) or 0)
+                if ts_init > 0 and ts_init < session_start_ns:
+                    continue
+                cache_fills_today += max(
+                    Decimal("0"), _to_decimal(getattr(order, "filled_qty", None), "0")
+                )
+
+            pg_orders_filled_today = pg_filled_by_key.get(
+                (sym, expected_action), Decimal("0")
+            )
+
+            abs_pos_broker = Decimal("0")
+            for pos in open_positions:
+                if bool(getattr(pos, "is_closed", False)):
+                    continue
+                p_sym = _normalize_symbol(
+                    getattr(pos, "instrument_id", "") or getattr(pos, "symbol", "")
+                )
+                if p_sym == sym:
+                    abs_pos_broker += abs(_to_decimal(getattr(pos, "quantity", None), "0"))
+
+            co_status = str(
+                getattr(item, "carry_over_status", None)
+                or item.sizing_trace.get("carry_over_status")
+                or ""
+            ).strip().upper()
+            item_kind = str(
+                getattr(item, "kind", None)
+                or item.sizing_trace.get("kind")
+                or ""
+            ).strip().upper()
+            raw_co_qty = item.sizing_trace.get("carry_over_position_qty")
+            pg_pos_entry = pg_pos_by_sym.get(sym)
+            pg_pos_qty = pg_pos_entry[0] if pg_pos_entry is not None else Decimal("0")
+            pg_pos_date = pg_pos_entry[1] if pg_pos_entry is not None else None
+            db_co_qty = db_carry_over_by_sym.get(sym)
+            if raw_co_qty is not None and str(raw_co_qty).strip() != "":
+                abs_carry_over = abs(_to_decimal(raw_co_qty, "0"))
+            elif item_kind in ("CARRY_OVER", "POSITION_MGMT") or co_status in (
+                "CARRY_OVER_EXIT_ONLY",
+                "THESIS_INVALIDATED_EXIT",
+                "RENEWED_ACTIVE",
+            ):
+                abs_carry_over = max(
+                    abs(_to_decimal(item.filled_qty, "0")),
+                    pg_pos_qty,
+                    db_co_qty or Decimal("0"),
+                )
+            elif db_co_qty is not None:
+                abs_carry_over = max(db_co_qty, pg_pos_qty)
+            elif pg_pos_qty > Decimal("0") and (
+                (pg_pos_date is not None and pg_pos_date < session_date)
+                or (
+                    pg_orders_filled_today > Decimal("0")
+                    and pg_pos_qty < abs_pos_broker
+                    and (abs_pos_broker - pg_pos_qty) >= pg_orders_filled_today
+                )
+            ):
+                abs_carry_over = pg_pos_qty
+            else:
+                abs_carry_over = Decimal("0")
+
+            open_leaves = Decimal("0")
+            for order in open_orders:
+                if _normalize_symbol(getattr(order, "instrument_id", "")) != sym:
+                    continue
+                if not self._is_entry_order_obj(order):
+                    continue
+                if _normalize_side_str(getattr(order, "side", "")) != expected_action:
+                    continue
+                status_str = str(getattr(order, "status", "") or "").upper()
+                if "." in status_str:
+                    status_str = status_str.rsplit(".", 1)[-1]
+                if status_str == "INITIALIZED":
+                    continue
+                ord_qty = max(
+                    Decimal("0"), _to_decimal(getattr(order, "quantity", None), "0")
+                )
+                ord_filled = max(
+                    Decimal("0"), _to_decimal(getattr(order, "filled_qty", None), "0")
+                )
+                leaves = max(Decimal("0"), ord_qty - ord_filled)
+                if leaves > Decimal("0"):
+                    open_leaves += leaves
+                    cid = str(getattr(order, "client_order_id", "") or "")
+                    if cid and (
+                        rust_engine is None
+                        or not rust_engine.has_admitted_reservation(cid)
+                    ):
+                        self._startup_entry_reservations[cid] = (sym, ord_qty)
+
+            net_new_pos = max(Decimal("0"), abs_pos_broker - abs_carry_over)
+            reconciled_reserved = (
+                max(cache_fills_today, pg_orders_filled_today, net_new_pos)
+                + open_leaves
+            )
+
+            pyramid_enabled = bool(item.sizing_trace.get("pyramid_enabled", False))
+            if (
+                co_status == "RENEWED_ACTIVE"
+                and not pyramid_enabled
+                and abs_carry_over > Decimal("0")
+            ):
+                reconciled_reserved = max(
+                    reconciled_reserved, item.risk_envelope.approved_qty_cap
+                )
+
+            reconcile_sym_fn(sym, reconciled_reserved, persist_db=self._persist_to_db)
+
+    def sync_plan_expiry_timers(self) -> None:
+        """Schedules `valid_until` expiry alerts for active plan items via `self.clock.set_time_alert_ns`."""
+        if self._plan_gate_backend is None:
+            return
+        clk = self._safe_clock()
+        if clk is None:
+            return
+        items_map = getattr(self._plan_gate_backend, "_items_by_symbol", None) or {}
+        try:
+            now_ns = int(clk.timestamp_ns())
+        except Exception:
+            now_ns = 0
+
+        for raw_sym, item in list(items_map.items()):
+            sym = _normalize_symbol(raw_sym)
+            if not sym:
+                continue
+            status_str = str(getattr(item, "status", "") or "").strip().upper()
+            if status_str in ("EXPIRED", "CANCELLED", "CLOSED", "FILLED"):
+                continue
+            co_status = str(
+                getattr(item, "carry_over_status", None)
+                or item.sizing_trace.get("carry_over_status")
+                or ""
+            ).strip().upper()
+            if co_status in ("CARRY_OVER_EXIT_ONLY", "THESIS_INVALIDATED_EXIT"):
+                continue
+            item_id_str = str(item.item_id)
+            if item_id_str in self._scheduled_expiry_item_ids:
+                continue
+            valid_until = item.risk_envelope.valid_until
+            valid_until_ns = int(valid_until.timestamp() * 1_000_000_000)
+            timer_name = f"plan_item_expired_{item_id_str}"
+            self._scheduled_expiry_item_ids.add(item_id_str)
+            self._expiry_targets_by_timer[timer_name] = (sym, item.item_id, valid_until_ns)
+            if now_ns > 0 and now_ns >= valid_until_ns:
+                self._expiry_targets_by_timer.pop(timer_name, None)
+                self._handle_plan_item_expiry(sym, item.item_id, valid_until_ns)
+            else:
+                try:
+                    if timer_name in set(clk.timer_names()):
+                        clk.cancel_timer(timer_name)
+                except Exception:
+                    pass
+                try:
+                    clk.set_time_alert_ns(
+                        name=timer_name,
+                        alert_time_ns=valid_until_ns,
+                        allow_past=True,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to schedule expiry timer %s for %s: %s",
+                        timer_name,
+                        sym,
+                        exc,
+                    )
+
+    def _persist_item_expired(self, item_id: UUID) -> None:
+        if not self._persist_to_db or self._async_writer is None:
+            return
+        plan_repo = self._plan_repo
+
+        def _expire_task(cur: Any) -> None:
+            if plan_repo is not None:
+                plan_repo.update_item_status_in_tx(
+                    cur,
+                    item_id,
+                    "EXPIRED",
+                    actor="system:telemetry_actor",
+                    reason="VALID_UNTIL_EXPIRED",
+                )
+            else:
+                PlanContractRepository.update_item_status_in_tx(
+                    cur,
+                    item_id,
+                    "EXPIRED",
+                    actor="system:telemetry_actor",
+                    reason="VALID_UNTIL_EXPIRED",
+                )
+
+        self._async_writer.submit(_expire_task)
+
+    def _escalate_expiry_cancel_failure(
+        self,
+        symbol: str,
+        exc: Exception,
+        *,
+        context: str,
+    ) -> None:
+        norm_sym = _normalize_symbol(symbol)
+        reason = f"EXPIRY_CANCEL_CALLBACK_FAILED:{norm_sym}:{context}:{exc}"
+        if self._plan_gate_backend is not None:
+            freeze_fn = getattr(self._plan_gate_backend, "set_entry_freeze", None)
+            if callable(freeze_fn):
+                try:
+                    freeze_fn(
+                        True,
+                        reason=reason,
+                        updated_by=f"nautilus:telemetry_actor:{context}",
+                    )
+                except Exception as freeze_exc:
+                    logger.error(
+                        "Failed setting ENTRY_FREEZE after expiry cancel failure for %s (%s): %s",
+                        norm_sym,
+                        context,
+                        freeze_exc,
+                        exc_info=True,
+                    )
+        if self._persist_to_db and self._async_writer is not None:
+            session_date = self._resolve_session_date()
+            dedup_key = f"expiry_cancel_failed:{norm_sym}:{context}:{session_date.isoformat()}"
+            title = f"Expired entry cancellation failed for {norm_sym}"
+            body = reason
+            payload_json = json.dumps(
+                {
+                    "symbol": norm_sym,
+                    "context": context,
+                    "error": str(exc),
+                    "entry_freeze": True,
+                }
+            )
+
+            def _alert_task(cur: Any) -> None:
+                if not ProtectiveOcoMonitor._table_exists(cur, "alert_outbox"):
+                    return
+                cur.execute(
+                    "SELECT 1 FROM alert_outbox WHERE dedup_key = %s LIMIT 1",
+                    (dedup_key,),
+                )
+                if cur.fetchone() is None:
+                    cur.execute(
+                        """
+                        INSERT INTO alert_outbox (
+                            event_type, severity, source, title, body, payload, dedup_key, status
+                        ) VALUES (
+                            'EXPIRY_CANCEL_FAILED', 'CRITICAL', 'nautilus:telemetry_actor', %s, %s, %s::jsonb, %s, 'PENDING'
+                        )
+                        """,
+                        (title, body, payload_json, dedup_key),
+                    )
+
+            try:
+                self._async_writer.submit(_alert_task)
+            except Exception as writer_exc:
+                logger.error(
+                    "Failed enqueuing expiry cancel alert for %s (%s): %s",
+                    norm_sym,
+                    context,
+                    writer_exc,
+                    exc_info=True,
+                )
+
+    def _handle_plan_item_expiry(
+        self,
+        symbol: str,
+        item_id: UUID,
+        valid_until_ns: int,
+    ) -> None:
+        norm_sym = _normalize_symbol(symbol)
+        if not norm_sym:
+            return
+        if self._plan_gate_backend is not None:
+            mark_fn = getattr(self._plan_gate_backend, "mark_item_expired", None)
+            if callable(mark_fn):
+                mark_fn(norm_sym)
+
+        if self._cancel_symbol_entries_callback is not None:
+            try:
+                self._cancel_symbol_entries_callback(norm_sym)
+            except Exception as exc:
+                logger.error(
+                    "cancel_symbol_entries_callback failed for %s on expiry: %s",
+                    norm_sym,
+                    exc,
+                    exc_info=True,
+                )
+                self._escalate_expiry_cancel_failure(
+                    norm_sym,
+                    exc,
+                    context="plan_item_expiry",
+                )
+
+        remaining_open = self._count_open_entry_leaves_in_cache(norm_sym)
+        if remaining_open > 0:
+            self._pending_expiry_by_symbol[norm_sym] = (item_id, valid_until_ns)
+            self._schedule_pending_expiry_reconcile(norm_sym)
+        else:
+            self._pending_expiry_by_symbol.pop(norm_sym, None)
+            self._persist_item_expired(item_id)
+
+    def _schedule_pending_expiry_reconcile(self, symbol: str) -> None:
+        norm_sym = _normalize_symbol(symbol)
+        if not norm_sym or not self._is_started or norm_sym not in self._pending_expiry_by_symbol:
+            return
+        clk = self._safe_clock()
+        if clk is None:
+            return
+        try:
+            now_ns = int(clk.timestamp_ns())
+        except Exception:
+            now_ns = 0
+        if now_ns <= 0:
+            return
+        timer_name = f"plan_expiry_reconcile_{norm_sym}"
+        try:
+            if timer_name in set(clk.timer_names()):
+                clk.cancel_timer(timer_name)
+        except Exception:
+            pass
+        try:
+            clk.set_time_alert_ns(
+                name=timer_name,
+                alert_time_ns=now_ns + 1_000_000_000,
+                allow_past=True,
+            )
+        except Exception:
+            pass
+
+    def _trigger_pending_expiry_cancel_if_needed(self, meta: Dict[str, Any]) -> None:
+        sym = _normalize_symbol(meta.get("symbol") or meta.get("instrument_id") or "")
+        if not sym or sym not in self._pending_expiry_by_symbol:
+            return
+        if _is_protective_stop_meta(meta):
+            return
+        if bool(meta.get("is_reduce_only", False)) or str(
+            meta.get("intent") or ""
+        ).strip().upper() in EXIT_INTENT_TAGS:
+            return
+        if self._cancel_symbol_entries_callback is not None:
+            try:
+                self._cancel_symbol_entries_callback(sym)
+            except Exception as exc:
+                logger.error(
+                    "cancel_symbol_entries_callback failed for %s during pending expiry: %s",
+                    sym,
+                    exc,
+                    exc_info=True,
+                )
+                self._escalate_expiry_cancel_failure(
+                    sym,
+                    exc,
+                    context="pending_expiry_event",
+                )
+        self._maybe_finalize_pending_expiry(sym)
+
+    def _maybe_finalize_pending_expiry(self, symbol: str) -> None:
+        norm_sym = _normalize_symbol(symbol)
+        if not norm_sym or norm_sym not in self._pending_expiry_by_symbol:
+            return
+        if self._count_open_entry_leaves_in_cache(norm_sym) == 0:
+            item_id, _ = self._pending_expiry_by_symbol.pop(norm_sym)
+            clk = self._safe_clock()
+            if clk is not None:
+                rec_name = f"plan_expiry_reconcile_{norm_sym}"
+                try:
+                    if rec_name in set(clk.timer_names()):
+                        clk.cancel_timer(rec_name)
+                except Exception:
+                    pass
+            self._persist_item_expired(item_id)
 
     def flush(self, timeout_secs: float = 5.0) -> None:
         self.sync_from_cache()
+        self._flush_backend_mutations()
+        if self._plan_gate_backend is not None:
+            backend_flush = getattr(self._plan_gate_backend, "flush", None)
+            if callable(backend_flush):
+                try:
+                    backend_flush(timeout_secs=timeout_secs)
+                except Exception:
+                    pass
         if self._async_writer is not None:
             self._async_writer.flush(timeout_secs=timeout_secs)
         self._oco_monitor.flush(timeout_secs=timeout_secs)
 
+    def _cancel_expiry_timers(self) -> None:
+        clk = self._safe_clock()
+        if clk is None:
+            return
+        try:
+            active_timers = set(clk.timer_names())
+        except Exception:
+            active_timers = None
+        timer_names = set(self._expiry_targets_by_timer.keys())
+        for sym in list(self._pending_expiry_by_symbol.keys()):
+            timer_names.add(f"plan_expiry_reconcile_{sym}")
+        if active_timers is not None:
+            for t_name in active_timers:
+                if t_name.startswith("plan_expiry_") or t_name.startswith("plan_item_expired_"):
+                    timer_names.add(t_name)
+        for timer_name in timer_names:
+            try:
+                if active_timers is None or timer_name in active_timers:
+                    clk.cancel_timer(timer_name)
+            except Exception:
+                pass
+
+    def _unsubscribe_message_buses(self) -> None:
+        if not self._is_owner_thread():
+            return
+        for bus_ref, topic, handler in list(self._msgbus_bindings):
+            bus = bus_ref() if isinstance(bus_ref, weakref.ReferenceType) else bus_ref
+            if bus is None:
+                continue
+            unsub = getattr(bus, "unsubscribe", None)
+            if callable(unsub):
+                try:
+                    unsub(topic, handler)
+                except Exception:
+                    pass
+        self._msgbus_bindings.clear()
+        self._msgbus_subscriptions.clear()
+        self._subscribed_msgbuses.clear()
+
+    def _clear_runtime_collections(self) -> None:
+        self._expiry_targets_by_timer.clear()
+        self._pending_expiry_by_symbol.clear()
+        self._scheduled_expiry_item_ids.clear()
+        self._active_stop_legs_by_symbol.clear()
+        self._active_stop_price_by_leg.clear()
+        self._order_meta.clear()
+        self._fills_by_cid.clear()
+        self._plan_item_cache.clear()
+        self._startup_entry_reservations.clear()
+        self._safe_exit_symbols.clear()
+        self._opened_position_ids.clear()
+
     def on_stop(self) -> None:
         self._is_started = False
         _ACTIVE_TELEMETRY_ACTORS.discard(self)
+        self._cancel_expiry_timers()
         if self._safe_is_registered():
             try:
                 self.unsubscribe_topic("events.order.*", self.on_order_event)
@@ -1442,33 +2315,78 @@ class PostgresTelemetryActor(DataActor):
                 self.unsubscribe_topic("events.account.*", self.on_account_state)
             except Exception:
                 pass
-        self._msgbus_subscriptions.clear()
-        self._subscribed_msgbuses.clear()
+        self._unsubscribe_message_buses()
         self.flush(timeout_secs=2.0)
 
     def on_reset(self) -> None:
         self._is_started = False
         _ACTIVE_TELEMETRY_ACTORS.discard(self)
+        self._cancel_expiry_timers()
 
     def on_dispose(self) -> None:
         self._is_started = False
         _ACTIVE_TELEMETRY_ACTORS.discard(self)
-        self.flush(timeout_secs=2.0)
+        if self._is_owner_thread():
+            self.flush(timeout_secs=2.0)
+            self._cancel_expiry_timers()
+            self._unsubscribe_message_buses()
+            self._cached_cache = None
+            self._cached_clock = None
+        if self._oco_monitor is not None:
+            try:
+                self._oco_monitor.remove_entry_freeze_callback(self._on_oco_entry_freeze)
+            except Exception:
+                pass
+            if self._owns_oco_monitor:
+                try:
+                    self._oco_monitor.close()
+                except Exception:
+                    pass
+                self._async_writer = None
+        else:
+            self._async_writer = None
+        self._cancel_symbol_entries_callback = None
+        self._plan_gate_backend = None
+        self._plan_repo = None
+        self._msgbus_subscriptions.clear()
+        self._subscribed_msgbuses.clear()
+        self._clear_runtime_collections()
 
     def close(self) -> None:
         self._is_started = False
         _ACTIVE_TELEMETRY_ACTORS.discard(self)
-        self.flush(timeout_secs=2.0)
-        self._cached_cache = None
-        self._cached_clock = None
+        if self._is_owner_thread():
+            self.flush(timeout_secs=2.0)
+            self._cancel_expiry_timers()
+            self._unsubscribe_message_buses()
+            self._cached_cache = None
+            self._cached_clock = None
+        else:
+            if self._async_writer is not None:
+                try:
+                    self._async_writer.flush(timeout_secs=2.0)
+                except Exception:
+                    pass
+        if self._oco_monitor is not None:
+            try:
+                self._oco_monitor.remove_entry_freeze_callback(self._on_oco_entry_freeze)
+            except Exception:
+                pass
+            try:
+                self._oco_monitor.close()
+            except Exception:
+                pass
+        self._async_writer = None
+        self._cancel_symbol_entries_callback = None
+        self._plan_gate_backend = None
+        self._plan_repo = None
         self._msgbus_subscriptions.clear()
         self._subscribed_msgbuses.clear()
-        try:
-            self._oco_monitor.close()
-        except Exception:
-            pass
+        self._clear_runtime_collections()
 
     def __del__(self) -> None:
+        if not self._is_owner_thread():
+            return
         try:
             self.close()
         except Exception:
@@ -1481,8 +2399,62 @@ class PostgresTelemetryActor(DataActor):
         _ = quote
 
     def on_time_event(self, event: Any) -> None:
-        _ = event
+        timer_name = str(getattr(event, "name", "") or "")
+        if timer_name in self._expiry_targets_by_timer:
+            sym, item_id, vu_ns = self._expiry_targets_by_timer.pop(timer_name)
+            self._handle_plan_item_expiry(sym, item_id, vu_ns)
+        clk = self._safe_clock()
+        now_ns = int(getattr(event, "ts_event", 0) or (clk.timestamp_ns() if clk else 0) or 0)
+        if now_ns > 0 and self._expiry_targets_by_timer:
+            for t_name, (sym, item_id, vu_ns) in list(self._expiry_targets_by_timer.items()):
+                if now_ns >= vu_ns:
+                    self._expiry_targets_by_timer.pop(t_name, None)
+                    self._handle_plan_item_expiry(sym, item_id, vu_ns)
         self.sync_from_cache()
+        if timer_name.startswith("plan_expiry_reconcile_") or self._pending_expiry_by_symbol:
+            for pend_sym in list(self._pending_expiry_by_symbol.keys()):
+                self._maybe_finalize_pending_expiry(pend_sym)
+                if pend_sym in self._pending_expiry_by_symbol:
+                    # Cancel any open (ACCEPTED) entry orders that may have transitioned without a bus push
+                    cache = self._safe_cache()
+                    has_open_non_pending = False
+                    if cache is not None:
+                        try:
+                            for ord_obj in cache.orders_open() or ():
+                                if (
+                                    _normalize_symbol(getattr(ord_obj, "instrument_id", "")) == pend_sym
+                                    and self._is_entry_order_obj(ord_obj)
+                                    and not bool(getattr(ord_obj, "is_closed", False))
+                                    and not bool(getattr(ord_obj, "is_pending_cancel", False))
+                                ):
+                                    has_open_non_pending = True
+                                    break
+                        except Exception as exc:
+                            logger.warning(
+                                "Failed inspecting open orders during pending expiry reconcile for %s: %s",
+                                pend_sym,
+                                exc,
+                                exc_info=True,
+                            )
+                    if has_open_non_pending and self._cancel_symbol_entries_callback is not None:
+                        try:
+                            self._cancel_symbol_entries_callback(pend_sym)
+                        except Exception as exc:
+                            logger.error(
+                                "cancel_symbol_entries_callback failed for %s during pending expiry reconcile: %s",
+                                pend_sym,
+                                exc,
+                                exc_info=True,
+                            )
+                            self._escalate_expiry_cancel_failure(
+                                pend_sym,
+                                exc,
+                                context="pending_expiry_reconcile",
+                            )
+                        self._maybe_finalize_pending_expiry(pend_sym)
+                if pend_sym in self._pending_expiry_by_symbol:
+                    self._schedule_pending_expiry_reconcile(pend_sym)
+        self._flush_backend_mutations()
 
     def sync_from_cache(self) -> None:
         """Synchronizes any unprocessed position and order events from the Nautilus `Cache`."""
@@ -1678,7 +2650,12 @@ class PostgresTelemetryActor(DataActor):
             if remaining_covered_qty >= pos_qty:
                 return
 
-        if self.is_safe_exit_active(sym) and "CANCELED" in reason.upper():
+        if self.is_safe_exit_active(sym) and (
+            "CANCELED" in reason.upper()
+            or "REJECTED" in reason.upper()
+            or "DENIED" in reason.upper()
+            or "EXPIRED" in reason.upper()
+        ):
             return
 
         if remaining_covered_qty < pos_qty and "CANCELED" in reason.upper():
@@ -1848,10 +2825,21 @@ class PostgresTelemetryActor(DataActor):
             return total_open
         return existing_qty
 
+    @staticmethod
+    def _positive_ns(value: Any) -> Optional[int]:
+        if value is None or isinstance(value, bool):
+            return None
+        try:
+            iv = int(value)
+            return iv if iv > 0 else None
+        except (TypeError, ValueError):
+            return None
+
     def _cache_order_metadata(self, order: Any) -> Dict[str, Any]:
         cid = str(getattr(order, "client_order_id", "") or "")
         if not cid:
             return {}
+        prev_meta = dict(self._order_meta.get(cid, {}))
         inst_id = str(getattr(order, "instrument_id", "") or "")
         symbol = _normalize_symbol(inst_id)
         side = _normalize_side_str(getattr(order, "side", "BUY"))
@@ -1891,22 +2879,54 @@ class PostgresTelemetryActor(DataActor):
                 intent_val = "PROTECTIVE_STOP"
             elif "ENTRY" in tags_upper:
                 intent_val = "ENTRY"
+        signal_ts_ns = (
+            self._positive_ns(prev_meta.get("signal_ts_ns"))
+            or self._positive_ns(
+                exec_params.get("signal_ts_ns")
+                if isinstance(exec_params, Mapping)
+                else None
+            )
+            or self._positive_ns(getattr(order, "ts_init", None))
+        )
+        order_vid = str(getattr(order, "venue_order_id", "") or "")
+        prev_vid = str(prev_meta.get("venue_order_id") or "")
+        is_stale_cache_snapshot = bool(prev_vid and not order_vid)
+        eff_vid = order_vid or prev_vid
+        eff_qty = (
+            _to_decimal(prev_meta.get("quantity"), "0")
+            if is_stale_cache_snapshot and _to_decimal(prev_meta.get("quantity"), "0") > Decimal("0")
+            else qty
+        )
+        eff_filled_qty = max(filled_qty, _to_decimal(prev_meta.get("filled_qty"), "0"))
+        eff_limit_px = (
+            prev_meta.get("limit_price")
+            if is_stale_cache_snapshot and prev_meta.get("limit_price") is not None
+            else limit_px
+        )
+        eff_trigger_px = (
+            prev_meta.get("trigger_price")
+            if is_stale_cache_snapshot and prev_meta.get("trigger_price") is not None
+            else trigger_px
+        )
         meta = {
             "client_order_id": cid,
-            "venue_order_id": str(getattr(order, "venue_order_id", "") or ""),
+            "venue_order_id": eff_vid,
             "strategy_id": str(getattr(order, "strategy_id", "") or ""),
             "instrument_id": inst_id,
             "symbol": symbol,
             "side": side,
             "order_type": order_type,
-            "quantity": qty,
-            "filled_qty": filled_qty,
-            "limit_price": limit_px,
-            "trigger_price": trigger_px,
+            "quantity": eff_qty,
+            "filled_qty": eff_filled_qty,
+            "limit_price": eff_limit_px,
+            "trigger_price": eff_trigger_px,
             "stop_loss_price": stop_loss_px,
             "is_reduce_only": is_reduce_only,
             "parent_order_id": parent_order_id,
             "intent": intent_val,
+            "signal_ts_ns": signal_ts_ns,
+            "gate_admitted_ts_ns": self._positive_ns(prev_meta.get("gate_admitted_ts_ns")),
+            "broker_ack_ts_ns": self._positive_ns(prev_meta.get("broker_ack_ts_ns")),
         }
         self._order_meta[cid] = meta
         return meta
@@ -1917,8 +2937,6 @@ class PostgresTelemetryActor(DataActor):
         try:
             cache = self._safe_cache()
             if cache is not None and cid:
-                from nautilus_trader.model import ClientOrderId
-
                 order_obj = cache.order(ClientOrderId(cid))
                 if order_obj is not None:
                     cached_meta.update(self._cache_order_metadata(order_obj))
@@ -1998,6 +3016,31 @@ class PostgresTelemetryActor(DataActor):
             intent_val = str(
                 ev_exec_params.get("intent") or ev_exec_params.get("action") or ""
             ).strip().upper()
+        signal_ts_ns = (
+            self._positive_ns(cached_meta.get("signal_ts_ns"))
+            or self._positive_ns(
+                ev_exec_params.get("signal_ts_ns")
+                if isinstance(ev_exec_params, Mapping)
+                else None
+            )
+            or (
+                self._positive_ns(getattr(event, "ts_init", None))
+                or self._positive_ns(getattr(event, "ts_event", None))
+                if isinstance(event, OrderInitialized)
+                else None
+            )
+        )
+        gate_admitted_ts_ns = self._positive_ns(cached_meta.get("gate_admitted_ts_ns"))
+        if gate_admitted_ts_ns is None and isinstance(event, OrderSubmitted):
+            gate_admitted_ts_ns = self._positive_ns(
+                getattr(event, "ts_init", None)
+            ) or self._positive_ns(getattr(event, "ts_event", None))
+        broker_ack_ts_ns = self._positive_ns(cached_meta.get("broker_ack_ts_ns"))
+        if broker_ack_ts_ns is None and isinstance(event, OrderAccepted):
+            broker_ack_ts_ns = self._positive_ns(
+                getattr(event, "ts_init", None)
+            ) or self._positive_ns(getattr(event, "ts_event", None))
+
         merged = {
             "client_order_id": cid,
             "venue_order_id": vid,
@@ -2014,6 +3057,9 @@ class PostgresTelemetryActor(DataActor):
             "is_reduce_only": is_reduce_only,
             "parent_order_id": parent_order_id,
             "intent": intent_val,
+            "signal_ts_ns": signal_ts_ns,
+            "gate_admitted_ts_ns": gate_admitted_ts_ns,
+            "broker_ack_ts_ns": broker_ack_ts_ns,
         }
         if cid:
             self._order_meta[cid] = merged
@@ -2381,8 +3427,74 @@ class PostgresTelemetryActor(DataActor):
         elif isinstance(event, PositionClosed):
             self.on_position_closed(event)
 
+    def _release_entry_reservation_on_terminal(
+        self,
+        meta: Dict[str, Any],
+        terminal_reason: str,
+    ) -> None:
+        if _is_protective_stop_meta(meta):
+            return
+        if bool(meta.get("is_reduce_only", False)) or str(
+            meta.get("intent") or ""
+        ).strip().upper() in EXIT_INTENT_TAGS:
+            return
+        cid = str(meta.get("client_order_id") or "").strip()
+        sym = _normalize_symbol(meta.get("symbol") or meta.get("instrument_id") or "")
+        if not cid or not sym:
+            return
+        if cid in self._released_entry_cids:
+            return
+        self._released_entry_cids.add(cid)
+
+        fills_sum = sum(
+            (q for q, _ in self._fills_by_cid.get(cid, {}).values()),
+            Decimal("0"),
+        )
+        cached_order_filled = Decimal("0")
+        cache = self._safe_cache()
+        if cache is not None:
+            try:
+                ord_obj = cache.order(ClientOrderId(cid))
+                if ord_obj is not None:
+                    cached_order_filled = _to_decimal(
+                        getattr(ord_obj, "filled_qty", None), "0"
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "Failed reading cached order %s for reservation release (%s): %s",
+                    cid,
+                    sym,
+                    exc,
+                    exc_info=True,
+                )
+        cum_filled = max(
+            _to_decimal(meta.get("filled_qty"), "0"),
+            fills_sum,
+            cached_order_filled,
+        )
+
+        if self._plan_gate_backend is not None:
+            rust_engine = getattr(self._plan_gate_backend, "rust_engine", None)
+            if rust_engine is not None and rust_engine.has_admitted_reservation(cid):
+                self._plan_gate_backend.reconcile_terminal_order(
+                    client_order_id=cid,
+                    symbol=sym,
+                    filled_qty=cum_filled,
+                )
+                self._startup_entry_reservations.pop(cid, None)
+            elif cid in self._startup_entry_reservations:
+                startup_sym, startup_qty = self._startup_entry_reservations.pop(cid)
+                unfilled = max(Decimal("0"), startup_qty - cum_filled)
+                if unfilled > Decimal("0"):
+                    self._plan_gate_backend.release_reservation(
+                        startup_sym,
+                        unfilled,
+                        reason=terminal_reason,
+                    )
+
     def on_order_initialized(self, event: OrderInitialized) -> None:
         self._resolve_order_metadata(event)
+        self._flush_backend_mutations()
 
     def on_order_submitted(self, event: OrderSubmitted) -> None:
         meta = self._resolve_order_metadata(event)
@@ -2404,6 +3516,9 @@ class PostgresTelemetryActor(DataActor):
             )
             if stop_px is not None and _to_decimal(stop_px, "0") > Decimal("0"):
                 self._register_active_stop_leg(meta, meta["quantity"], stop_px)
+        else:
+            self._trigger_pending_expiry_cancel_if_needed(meta)
+        self._flush_backend_mutations()
 
     def on_order_accepted(self, event: OrderAccepted) -> None:
         meta = self._resolve_order_metadata(event)
@@ -2425,9 +3540,49 @@ class PostgresTelemetryActor(DataActor):
             )
             if stop_px is not None and _to_decimal(stop_px, "0") > Decimal("0"):
                 self._register_active_stop_leg(meta, meta["quantity"], stop_px)
+        else:
+            self._trigger_pending_expiry_cancel_if_needed(meta)
+        self._flush_backend_mutations()
+
+    def _is_local_initialized_parent_update(self, event: Any, meta: Dict[str, Any]) -> bool:
+        ev_vid = getattr(event, "venue_order_id", None)
+        if ev_vid is not None and str(ev_vid) not in ("", "None"):
+            return False
+        cid = str(meta.get("client_order_id") or getattr(event, "client_order_id", "") or "")
+        cached_status = ""
+        cached_vid = ""
+        cache = self._safe_cache()
+        if cache is not None and cid:
+            try:
+                cached_order = cache.order(ClientOrderId(cid))
+                if cached_order is not None:
+                    raw_status = str(getattr(cached_order, "status", "") or "").upper()
+                    cached_status = (
+                        raw_status.rsplit(".", 1)[-1] if "." in raw_status else raw_status
+                    )
+                    raw_vid = getattr(cached_order, "venue_order_id", None)
+                    cached_vid = (
+                        str(raw_vid)
+                        if raw_vid is not None and str(raw_vid) not in ("", "None")
+                        else ""
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "Failed reading cached order %s in _is_local_initialized_parent_update: %s",
+                    cid,
+                    exc,
+                    exc_info=True,
+                )
+        if cached_status == "INITIALIZED":
+            return True
+        if not cached_vid and not meta.get("venue_order_id") and cached_status in ("", "INITIALIZED"):
+            return True
+        return False
 
     def on_order_updated(self, event: OrderUpdated) -> None:
         meta = self._resolve_order_metadata(event)
+        if self._is_local_initialized_parent_update(event, meta):
+            return
         event_id = str(getattr(event, "event_id", "") or f"upd:{meta['client_order_id']}")
         if event_id in self._processed_event_ids:
             return
@@ -2446,6 +3601,7 @@ class PostgresTelemetryActor(DataActor):
             )
             if stop_px is not None and _to_decimal(stop_px, "0") > Decimal("0"):
                 self._register_active_stop_leg(meta, meta["quantity"], stop_px)
+        self._flush_backend_mutations()
 
     def _handle_safe_exit_failure_if_applicable(
         self,
@@ -2500,6 +3656,9 @@ class PostgresTelemetryActor(DataActor):
                 meta=meta,
                 failure_reason=f"Safe exit order {meta['client_order_id']} was DENIED while position open: {reason}",
             )
+            self._release_entry_reservation_on_terminal(meta, f"ORDER_DENIED: {reason}")
+        self._maybe_finalize_pending_expiry(meta["symbol"])
+        self._flush_backend_mutations()
 
     def on_order_canceled(self, event: OrderCanceled) -> None:
         meta = self._resolve_order_metadata(event)
@@ -2523,6 +3682,9 @@ class PostgresTelemetryActor(DataActor):
                 meta=meta,
                 failure_reason=f"Safe exit order {meta['client_order_id']} was CANCELED while position open",
             )
+            self._release_entry_reservation_on_terminal(meta, "ORDER_CANCELED")
+        self._maybe_finalize_pending_expiry(meta["symbol"])
+        self._flush_backend_mutations()
 
     def on_order_expired(self, event: OrderExpired) -> None:
         meta = self._resolve_order_metadata(event)
@@ -2546,6 +3708,9 @@ class PostgresTelemetryActor(DataActor):
                 meta=meta,
                 failure_reason=f"Safe exit order {meta['client_order_id']} EXPIRED while position open",
             )
+            self._release_entry_reservation_on_terminal(meta, "ORDER_EXPIRED")
+        self._maybe_finalize_pending_expiry(meta["symbol"])
+        self._flush_backend_mutations()
 
     def on_order_rejected(self, event: OrderRejected) -> None:
         meta = self._resolve_order_metadata(event)
@@ -2577,6 +3742,9 @@ class PostgresTelemetryActor(DataActor):
                 meta=meta,
                 failure_reason=f"Safe exit order {meta['client_order_id']} was REJECTED while position open: {reason}",
             )
+            self._release_entry_reservation_on_terminal(meta, f"ORDER_REJECTED: {reason}")
+        self._maybe_finalize_pending_expiry(meta["symbol"])
+        self._flush_backend_mutations()
 
     def on_order_filled(self, event: OrderFilled) -> None:
         meta = self._resolve_order_metadata(event)
@@ -2609,6 +3777,8 @@ class PostgresTelemetryActor(DataActor):
         )
         if cid in self._order_meta:
             self._order_meta[cid]["filled_qty"] = cum_qty
+        if total_qty > Decimal("0") and cum_qty >= total_qty and cid:
+            self._startup_entry_reservations.pop(cid, None)
 
         if _is_protective_stop_meta(meta):
             sym = meta["symbol"]
@@ -2765,6 +3935,8 @@ class PostgresTelemetryActor(DataActor):
         if self._persist_to_db and self._async_writer is not None:
             self._async_writer.submit(_task)
         self._processed_event_ids.add(event_id)
+        self._maybe_finalize_pending_expiry(meta["symbol"])
+        self._flush_backend_mutations()
 
     def on_position_opened(self, event: PositionOpened) -> None:
         self._handle_position_lifecycle_event(event, "POSITION_OPENED", is_closed=False)
@@ -2883,6 +4055,8 @@ class PostgresTelemetryActor(DataActor):
         self._processed_event_ids.add(
             f"pos_snap:{pos_id}:{qty}:{is_closed}:{ts_event}"
         )
+        if plan_event_type == "POSITION_OPENED" and pos_id:
+            self._opened_position_ids.add(pos_id)
 
         self._submit_position_upsert_task(
             symbol=symbol,
@@ -2905,6 +4079,10 @@ class PostgresTelemetryActor(DataActor):
                 self._oco_monitor.verify_position_coverage(
                     symbol=symbol, pos_qty=Decimal("0")
                 )
+            if self._plan_gate_backend is not None and hasattr(
+                self._plan_gate_backend, "release_closed_position_capacity"
+            ):
+                self._plan_gate_backend.release_closed_position_capacity(symbol)
         elif self.is_safe_exit_active(symbol):
             self._oco_monitor._positions_qty[symbol] = qty
         elif self._enforce_oco_on_pos or self._oco_monitor.get_coverage(symbol) is not None:
@@ -2912,6 +4090,7 @@ class PostgresTelemetryActor(DataActor):
             self._oco_monitor.verify_position_coverage(symbol=symbol, pos_qty=qty)
         else:
             self._oco_monitor._positions_qty[symbol] = qty
+        self._flush_backend_mutations()
 
     def _sync_position_snapshot(self, pos: Any) -> None:
         inst_id = str(getattr(pos, "instrument_id", "") or "")
@@ -2955,6 +4134,25 @@ class PostgresTelemetryActor(DataActor):
         strategy_id = str(getattr(pos, "strategy_id", "") or "")
         side_raw = str(getattr(pos, "side", "LONG"))
         side = "short" if "SHORT" in side_raw.upper() else "long"
+
+        if is_closed and pos_id and pos_id not in self._opened_position_ids:
+            self._opened_position_ids.add(pos_id)
+            open_qty = abs(_to_decimal(getattr(pos, "peak_qty", None), "0"))
+            ts_opened = int(getattr(pos, "ts_opened", 0) or ts_last or 0)
+            self._submit_position_upsert_task(
+                symbol=symbol,
+                strategy_id=strategy_id,
+                pos_id=pos_id,
+                side=side,
+                qty=open_qty,
+                avg_px_open=avg_px_open,
+                realized_pnl=Decimal("0"),
+                ts_bar=ts_opened,
+                plan_event_type="POSITION_OPENED",
+                event_id=f"pos_open_snap:{pos_id}:{ts_opened}",
+            )
+        elif plan_event_type == "POSITION_OPENED" and pos_id:
+            self._opened_position_ids.add(pos_id)
 
         self._submit_position_upsert_task(
             symbol=symbol,
@@ -3076,6 +4274,9 @@ class PostgresTelemetryActor(DataActor):
         filled_avg_float = (
             float(filled_avg_price) if filled_avg_price is not None else None
         )
+        signal_ts_ns = self._positive_ns(meta.get("signal_ts_ns"))
+        gate_admitted_ts_ns = self._positive_ns(meta.get("gate_admitted_ts_ns"))
+        broker_ack_ts_ns = self._positive_ns(meta.get("broker_ack_ts_ns"))
         if self._trading_date is not None and "trading_date" not in raw_response:
             raw_response = {**raw_response, "trading_date": self._trading_date.isoformat()}
         cur.execute(
@@ -3083,11 +4284,15 @@ class PostgresTelemetryActor(DataActor):
             INSERT INTO orders (
                 order_id, client_order_id, strategy_id, broker, environment,
                 symbol, action, qty, order_type, limit_price, status,
-                filled_qty, filled_avg_price, raw_response, updated_at
+                filled_qty, filled_avg_price,
+                signal_ts_ns, gate_admitted_ts_ns, broker_ack_ts_ns,
+                raw_response, updated_at
             ) VALUES (
                 %s, %s, %s, %s, %s,
                 %s, %s, %s, %s, %s, %s,
-                %s, %s, %s::jsonb, NOW()
+                %s, %s,
+                %s, %s, %s,
+                %s::jsonb, NOW()
             )
             ON CONFLICT (order_id) DO UPDATE SET
                 client_order_id = CASE
@@ -3114,6 +4319,9 @@ class PostgresTelemetryActor(DataActor):
                 END,
                 filled_qty = GREATEST(orders.filled_qty, EXCLUDED.filled_qty),
                 filled_avg_price = COALESCE(EXCLUDED.filled_avg_price, orders.filled_avg_price),
+                signal_ts_ns = COALESCE(orders.signal_ts_ns, EXCLUDED.signal_ts_ns),
+                gate_admitted_ts_ns = COALESCE(orders.gate_admitted_ts_ns, EXCLUDED.gate_admitted_ts_ns),
+                broker_ack_ts_ns = COALESCE(orders.broker_ack_ts_ns, EXCLUDED.broker_ack_ts_ns),
                 raw_response = EXCLUDED.raw_response,
                 updated_at = NOW()
             """,
@@ -3131,6 +4339,9 @@ class PostgresTelemetryActor(DataActor):
                 status,
                 filled_qty_float,
                 filled_avg_float,
+                signal_ts_ns,
+                gate_admitted_ts_ns,
+                broker_ack_ts_ns,
                 json.dumps(raw_response),
             ),
         )
