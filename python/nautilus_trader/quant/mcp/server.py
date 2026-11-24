@@ -1067,7 +1067,13 @@ class NautilusMcpServer:
                 raise McpPlanLockRejectedError(
                     f"circuit_multiplier must be in [0.0, 1.0], got {raw_circuit_mult}"
                 )
-            eff_scale = eff_m_regime * circuit_mult
+            raw_alpha_div = raw_item.get("alpha_diversification_scale")
+            alpha_div_scale = float(raw_alpha_div if raw_alpha_div is not None else 1.0)
+            if not math.isfinite(alpha_div_scale) or alpha_div_scale < 0.0 or alpha_div_scale > 1.0:
+                raise McpPlanLockRejectedError(
+                    f"alpha_diversification_scale must be in [0.0, 1.0], got {raw_alpha_div}"
+                )
+            eff_scale = eff_m_regime * circuit_mult * alpha_div_scale
 
             if falsified_env is not None:
                 falsified_env_fp = compute_strategy_fingerprint(
@@ -1220,39 +1226,55 @@ class NautilusMcpServer:
                 approved_qty_cap = co_filled_qty
                 target_qty = co_filled_qty
             else:
-                scaled_decision_qty = max(
-                    1,
-                    int(math.floor(float(decision.qty) * eff_scale + 1e-9)),
+                should_scale_env = eff_scale < 1.0 and not bool(
+                    raw_item.get("_env_already_scaled_by_m_regime", False)
                 )
+                raw_dec_qty = int(math.floor(float(decision.qty) * eff_scale + 1e-9))
+                scaled_dec_notional = float(decision.notional_usd) * eff_scale
+                raw_env_target_qty = (
+                    int(math.floor(float(req_env.target_qty) * eff_scale + 1e-9))
+                    if should_scale_env
+                    else int(req_env.target_qty)
+                )
+                raw_env_cap_qty = (
+                    int(math.floor(float(req_env.approved_qty_cap) * eff_scale + 1e-9))
+                    if should_scale_env
+                    else int(req_env.approved_qty_cap)
+                )
+                scaled_env_notional = float(req_env.target_notional_usd) * (
+                    eff_scale if should_scale_env else 1.0
+                )
+                eff_raw_qty = min(raw_dec_qty, raw_env_target_qty, raw_env_cap_qty)
+                eff_budget_notional = min(scaled_dec_notional, scaled_env_notional)
+                if (
+                    co_filled_qty <= Decimal("0")
+                    and eff_scale < 1.0
+                    and eff_raw_qty < 1
+                    and eff_budget_notional < entry_ref - 1e-6
+                ):
+                    sizing_decisions[sym] = {
+                        "target_qty": "0",
+                        "approved_qty_cap": "0",
+                        "target_notional_usd": f"{eff_budget_notional:.2f}",
+                        "max_risk_budget_usd": "0.00",
+                        "binding_constraint": "REJECTED_WHOLE_SHARE_BUDGET",
+                        "sizing_trace": dict(decision.trace or {}),
+                    }
+                    scaled_to_zero_items += 1
+                    continue
+                scaled_decision_qty = max(1, raw_dec_qty)
                 total_decision_qty = (
                     Decimal(str(scaled_decision_qty)) + co_filled_qty
                     if co_filled_qty > Decimal("0") and prior_exposure_usd > 0.0
                     else Decimal(str(scaled_decision_qty))
                 )
-                should_scale_env = eff_scale < 1.0 and not bool(
-                    raw_item.get("_env_already_scaled_by_m_regime", False)
-                )
                 scaled_env_target_qty = (
-                    Decimal(
-                        str(
-                            max(
-                                1,
-                                int(math.floor(float(req_env.target_qty) * eff_scale + 1e-9)),
-                            )
-                        )
-                    )
+                    Decimal(str(max(1, raw_env_target_qty)))
                     if should_scale_env
                     else req_env.target_qty
                 )
                 scaled_env_cap_qty = (
-                    Decimal(
-                        str(
-                            max(
-                                1,
-                                int(math.floor(float(req_env.approved_qty_cap) * eff_scale + 1e-9)),
-                            )
-                        )
-                    )
+                    Decimal(str(max(1, raw_env_cap_qty)))
                     if should_scale_env
                     else req_env.approved_qty_cap
                 )
@@ -1305,8 +1327,8 @@ class NautilusMcpServer:
             else:
                 target_qty = max(co_filled_qty, min(scaled_env_target_qty, approved_qty_cap))
                 raw_sized_notional = min(
-                    float(req_env.target_notional_usd),
-                    (float(decision.notional_usd) * eff_scale) + (prior_exposure_usd if co_filled_qty > Decimal("0") else 0.0),
+                    scaled_env_notional if co_filled_qty <= Decimal("0") else float(req_env.target_notional_usd),
+                    scaled_dec_notional + (prior_exposure_usd if co_filled_qty > Decimal("0") else 0.0),
                     float(target_qty) * entry_ref,
                 )
             co_notional_clamped = False
