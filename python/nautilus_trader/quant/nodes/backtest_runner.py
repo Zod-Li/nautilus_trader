@@ -32,7 +32,6 @@ from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
 
-from evolution_engine.config_center.envelope import load_envelope
 from evolution_engine.config_center.schema import SystemConfig
 from nautilus_trader.quant.contracts.models import (
     ArchetypeStrategyConfig,
@@ -948,14 +947,6 @@ class IsomorphicBacktestRunner:
         cloned_primary = items_to_lock[0]
 
         sys_cfg = self._system_config or SystemConfig()
-        env_cfg = load_envelope()
-        env_notional = env_cfg.numeric.get("risk.max_order_notional_usd")
-        if self._system_config is not None:
-            order_notional_cap = float(sys_cfg.risk.max_order_notional_usd)
-        elif isinstance(env_notional, Mapping) and env_notional.get("max") is not None:
-            order_notional_cap = float(env_notional["max"])
-        else:
-            order_notional_cap = float(sys_cfg.risk.max_order_notional_usd)
         max_slices = max(
             1,
             max(

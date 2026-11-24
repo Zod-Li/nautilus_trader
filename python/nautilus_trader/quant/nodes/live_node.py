@@ -33,7 +33,6 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Seque
 import psycopg2
 from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
 
-from evolution_engine.config_center.envelope import load_envelope
 from evolution_engine.config_center.schema import SystemConfig
 from evolution_engine.db.dsn import resolve_database_dsn
 from nautilus_trader.quant.contracts.models import (
@@ -597,14 +596,6 @@ def _build_live_risk_engine_config(
     system_config: Optional[SystemConfig] = None,
 ) -> LiveRiskEngineConfig:
     sys_cfg = system_config or SystemConfig()
-    env_cfg = load_envelope()
-    env_notional = env_cfg.numeric.get("risk.max_order_notional_usd")
-    if system_config is not None:
-        order_notional_cap = float(sys_cfg.risk.max_order_notional_usd)
-    elif isinstance(env_notional, Mapping) and env_notional.get("max") is not None:
-        order_notional_cap = float(env_notional["max"])
-    else:
-        order_notional_cap = float(sys_cfg.risk.max_order_notional_usd)
     max_slices = max(
         [int(getattr(it.execution_spec, "num_slices", 4) or 4) for it in items],
         default=4,
