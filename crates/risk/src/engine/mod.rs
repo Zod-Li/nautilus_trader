@@ -185,16 +185,24 @@ impl RiskEngine {
         );
 
         let weak_order_events = weak.clone();
+        let pre_trade_gate_cb = Rc::clone(&engine.borrow().pre_trade_gate);
         msgbus::subscribe_order_events(
             "events.order.*".into(),
             TypedHandler::from(move |event: &OrderEventAny| {
                 // Risk-generated events can publish while `execute` still owns the engine,
                 // and processing is observational, so skipping reentrant events is safe.
-                // TODO: Revisit this if order-event processing gains stateful behavior
-                if let Some(rc) = weak_order_events.upgrade()
-                    && let Ok(mut engine) = rc.try_borrow_mut()
-                {
-                    engine.process(event.clone());
+                // Reentrant `Updated` events still reconcile pre-trade capacity on the gate.
+                if let Some(rc) = weak_order_events.upgrade() {
+                    if let Ok(mut engine) = rc.try_borrow_mut() {
+                        engine.process(event.clone());
+                    } else if let OrderEventAny::Updated(updated) = event
+                        && let Some(gate) = pre_trade_gate_cb.borrow().as_ref()
+                    {
+                        gate.on_order_updated(
+                            &updated.client_order_id,
+                            updated.quantity.as_decimal(),
+                        );
+                    }
                 }
             }),
             Some(10),
@@ -264,7 +272,10 @@ impl RiskEngine {
                         let timestamp = clock.borrow().timestamp_ns();
 
                         for order in &orders {
-                            if order.status() == OrderStatus::Initialized {
+                            if matches!(
+                                order.status(),
+                                OrderStatus::Initialized | OrderStatus::Released
+                            ) {
                                 if let Some(gate) = gate.as_ref() {
                                     gate.on_order_denied(&order.client_order_id());
                                 }
@@ -633,6 +644,7 @@ impl RiskEngine {
                     "Cannot handle submit order: order not found in cache for {}",
                     command.client_order_id
                 );
+                self.notify_pre_trade_gate_denied_ids(&[command.client_order_id]);
                 return;
             };
             order.clone()
@@ -822,13 +834,15 @@ impl RiskEngine {
             .orders_for_ids(&command.order_list.client_order_ids, &command);
 
         if orders.len() != command.order_list.client_order_ids.len() {
-            self.deny_order_list(
+            self.deny_order_list_with_notify(
                 &orders,
                 &OrderDeniedReason::OrderListIncomplete {
                     order_list_id: command.order_list.id,
                 }
                 .to_string(),
+                false,
             );
+            self.notify_pre_trade_gate_denied_ids(&command.order_list.client_order_ids);
             return; // Denied
         }
 
@@ -836,6 +850,7 @@ impl RiskEngine {
         // risk check uses the representative. See docs/concepts/orders.md
         // (Order lists -> Caveats for mixed-instrument lists).
         let mut instruments: AHashMap<InstrumentId, InstrumentAny> = AHashMap::new();
+        let list_cids = command.order_list.client_order_ids.clone();
 
         for order in &orders {
             let instrument_id = order.instrument_id();
@@ -844,10 +859,12 @@ impl RiskEngine {
             }
             let resolved = self.cache.borrow().instrument(&instrument_id).cloned();
             let Some(instrument) = resolved else {
-                self.deny_command(
+                self.deny_command_with_notify(
                     TradingCommand::SubmitOrderList(command),
                     &OrderDeniedReason::InstrumentNotFound { instrument_id }.to_string(),
+                    false,
                 );
+                self.notify_pre_trade_gate_denied_ids(&list_cids);
                 return; // Denied
             };
             instruments.insert(instrument_id, instrument);
@@ -855,13 +872,15 @@ impl RiskEngine {
 
         for (index, order) in orders.iter().enumerate() {
             let Some(instrument) = instruments.get(&order.instrument_id()) else {
-                self.deny_order(
-                    order,
+                self.deny_order_list_with_notify(
+                    &orders,
                     &OrderDeniedReason::InstrumentNotFound {
                         instrument_id: order.instrument_id(),
                     }
                     .to_string(),
+                    false,
                 );
+                self.notify_pre_trade_gate_denied_ids(&list_cids);
                 return; // Denied
             };
 
@@ -1837,6 +1856,15 @@ impl RiskEngine {
         None
     }
 
+    fn notify_pre_trade_gate_denied_ids(&self, cids: &[ClientOrderId]) {
+        let gate = self.pre_trade_gate.borrow().as_ref().map(Arc::clone);
+        if let Some(gate) = gate {
+            for cid in cids {
+                gate.on_order_denied(cid);
+            }
+        }
+    }
+
     fn reject_pre_trade_gate_command(&self, command: TradingCommand, reason: &str) {
         match command {
             TradingCommand::SubmitOrder(_) | TradingCommand::SubmitOrderList(_) => {
@@ -2004,15 +2032,27 @@ impl RiskEngine {
                     };
 
                     if let Some(order) = order {
-                        self.deny_order(&order, &OrderDeniedReason::TradingHalted.to_string());
+                        self.deny_order_with_notify(
+                            &order,
+                            &OrderDeniedReason::TradingHalted.to_string(),
+                            false,
+                        );
                     }
+                    self.notify_pre_trade_gate_denied_ids(&[submit_order.client_order_id]);
                 }
                 TradingCommand::SubmitOrderList(submit_order_list) => {
                     let orders: Vec<OrderAny> = self.cache.borrow().orders_for_ids(
                         &submit_order_list.order_list.client_order_ids,
                         &submit_order_list,
                     );
-                    self.deny_order_list(&orders, &OrderDeniedReason::TradingHalted.to_string());
+                    self.deny_order_list_with_notify(
+                        &orders,
+                        &OrderDeniedReason::TradingHalted.to_string(),
+                        false,
+                    );
+                    self.notify_pre_trade_gate_denied_ids(
+                        &submit_order_list.order_list.client_order_ids,
+                    );
                 }
                 _ => {}
             },
@@ -2025,6 +2065,7 @@ impl RiskEngine {
                             .map(|order| order.clone())
                     };
                     let Some(order) = order else {
+                        self.notify_pre_trade_gate_denied_ids(&[submit_order.client_order_id]);
                         return;
                     };
 
@@ -2033,14 +2074,16 @@ impl RiskEngine {
                         self.throttler_submit
                             .send(TradingCommand::SubmitOrder(submit_order));
                     } else {
-                        self.deny_order(
+                        self.deny_order_with_notify(
                             &order,
                             &OrderDeniedReason::TradingStateReducing {
                                 order_side: order.order_side(),
                                 instrument_id: order.instrument_id(),
                             }
                             .to_string(),
+                            false,
                         );
+                        self.notify_pre_trade_gate_denied_ids(&[submit_order.client_order_id]);
                     }
                 }
                 TradingCommand::SubmitOrderList(submit_order_list) => {
@@ -2050,15 +2093,19 @@ impl RiskEngine {
                     );
 
                     for order in &orders {
-                        self.deny_order(
+                        self.deny_order_with_notify(
                             order,
                             &OrderDeniedReason::TradingStateReducing {
                                 order_side: order.order_side(),
                                 instrument_id: order.instrument_id(),
                             }
                             .to_string(),
+                            false,
                         );
                     }
+                    self.notify_pre_trade_gate_denied_ids(
+                        &submit_order_list.order_list.client_order_ids,
+                    );
                 }
                 _ => {}
             },

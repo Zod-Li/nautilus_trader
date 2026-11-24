@@ -20,8 +20,8 @@ use nautilus_core::UnixNanos;
 use nautilus_model::{
     enums::{
         AggregationSource, ContingencyType, OrderSide, OrderStatus, OrderType, PositionSide,
-        PriceType,
     },
+    events::OrderEventAny,
     identifiers::{ClientOrderId, InstrumentId},
     orders::{Order, OrderAny},
 };
@@ -235,15 +235,30 @@ fn parse_param_decimal(order: &OrderAny, keys: &[&str]) -> Option<Decimal> {
     None
 }
 
+const DEFAULT_MAX_QUOTE_AGE_NS: u64 = 60_000_000_000;
+
+fn resolve_quote_max_age_ns(order: &OrderAny) -> u64 {
+    if let Some(secs) = parse_param_decimal(order, &["quote_stale_secs"])
+        && secs > Decimal::ZERO
+    {
+        let nanos_dec = (secs * Decimal::from(1_000_000_000_u64)).trunc();
+        if let Ok(nanos) = nanos_dec.to_string().parse::<u64>()
+            && nanos > 0
+        {
+            return nanos;
+        }
+    }
+    DEFAULT_MAX_QUOTE_AGE_NS
+}
+
 fn resolve_eval_timestamp(order: &OrderAny, ts_now: UnixNanos) -> (i64, String) {
     let effective = if ts_now.as_u64() > 0 {
         ts_now
-    } else if order.ts_init().as_u64() > 0 {
-        order.ts_init()
     } else if let Some(raw) = order
         .exec_algorithm_params()
         .and_then(|p| get_param_str(p, "evaluation_ts_ns"))
         .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&v| v > 0)
     {
         UnixNanos::from(raw)
     } else {
@@ -253,36 +268,80 @@ fn resolve_eval_timestamp(order: &OrderAny, ts_now: UnixNanos) -> (i64, String) 
     (ts_i64, effective.to_rfc3339())
 }
 
-fn latest_bar_close(cache: &Cache, instrument_id: &InstrumentId) -> Option<Decimal> {
+fn latest_bar_close(cache: &Cache, instrument_id: &InstrumentId) -> Option<(UnixNanos, Decimal)> {
     let mut best: Option<(UnixNanos, Decimal)> = None;
     for source in [AggregationSource::External, AggregationSource::Internal] {
         for bar_type in cache.bar_types(Some(instrument_id), None, source) {
             if let Some(bar) = cache.bar(bar_type) {
                 let close = bar.close.as_decimal();
-                if close > Decimal::ZERO
-                    && best.is_none_or(|(best_ts, _)| bar.ts_init >= best_ts)
-                {
-                    best = Some((bar.ts_init, close));
+                let bar_ts = if bar.ts_event.as_u64() > 0 {
+                    bar.ts_event
+                } else {
+                    bar.ts_init
+                };
+                if close > Decimal::ZERO && best.is_none_or(|(best_ts, _)| bar_ts >= best_ts) {
+                    best = Some((bar_ts, close));
                 }
             }
         }
     }
-    best.map(|(_, close)| close)
+    best
 }
 
-fn resolve_reference_price(order: &OrderAny, cache: &Cache) -> Option<Decimal> {
+fn resolve_reference_price(
+    order: &OrderAny,
+    cache: &Cache,
+    ts_now: UnixNanos,
+) -> Option<Decimal> {
     let inst_id = order.instrument_id();
-    cache
-        .price(&inst_id, PriceType::Mid)
-        .map(|p| p.as_decimal())
-        .filter(|d| *d > Decimal::ZERO)
-        .or_else(|| {
-            cache
-                .trade(&inst_id)
-                .map(|t| t.price.as_decimal())
-                .filter(|d| *d > Decimal::ZERO)
-        })
-        .or_else(|| latest_bar_close(cache, &inst_id))
+    let max_quote_age_ns = resolve_quote_max_age_ns(order);
+    let now_u64 = ts_now.as_u64();
+
+    let quote_candidate = cache.quote(&inst_id).and_then(|q| {
+        let bid = q.bid_price.as_decimal();
+        let ask = q.ask_price.as_decimal();
+        if bid <= Decimal::ZERO || ask <= Decimal::ZERO || bid > ask {
+            return None;
+        }
+        let ev_ts = if q.ts_event.as_u64() > 0 {
+            q.ts_event
+        } else {
+            q.ts_init
+        };
+        if now_u64 > 0
+            && ev_ts.as_u64() > 0
+            && now_u64.saturating_sub(ev_ts.as_u64()) > max_quote_age_ns
+        {
+            return None;
+        }
+        let mid = (bid + ask) / Decimal::TWO;
+        (mid > Decimal::ZERO).then_some((ev_ts, 2_u8, mid))
+    });
+    let trade_candidate = cache.trade(&inst_id).and_then(|t| {
+        let px = t.price.as_decimal();
+        if px <= Decimal::ZERO {
+            return None;
+        }
+        let ev_ts = if t.ts_event.as_u64() > 0 {
+            t.ts_event
+        } else {
+            t.ts_init
+        };
+        if now_u64 > 0
+            && ev_ts.as_u64() > 0
+            && now_u64.saturating_sub(ev_ts.as_u64()) > max_quote_age_ns
+        {
+            return None;
+        }
+        Some((ev_ts, 1_u8, px))
+    });
+    let bar_candidate = latest_bar_close(cache, &inst_id).map(|(ts, px)| (ts, 0_u8, px));
+
+    [quote_candidate, trade_candidate, bar_candidate]
+        .into_iter()
+        .flatten()
+        .max_by_key(|&(ts, priority, _)| (ts, priority))
+        .map(|(_, _, px)| px)
         .or_else(|| parse_param_decimal(order, &["reference_price"]).filter(|d| *d > Decimal::ZERO))
 }
 
@@ -564,6 +623,32 @@ fn batch_linked_entry_qty(order: &OrderAny, orders: &[OrderAny]) -> Decimal {
         .sum()
 }
 
+fn batch_entry_capacity_for_reduce_only(order: &OrderAny, orders: &[OrderAny]) -> Decimal {
+    let inst_id = order.instrument_id();
+    let side = order.order_side();
+    orders
+        .iter()
+        .filter(|other| {
+            other.client_order_id() != order.client_order_id()
+                && same_instrument_or_symbol(&other.instrument_id(), &inst_id)
+                && other.order_side() != side
+                && !has_exit_intent(other)
+                && other.quantity().as_decimal() > Decimal::ZERO
+                && (is_oto_child_of(order, other)
+                    || (order.parent_order_id().is_none()
+                        && other.contingency_type() != Some(ContingencyType::Oto))
+                    || (order
+                        .parent_order_id()
+                        .is_none_or(|p| p == other.client_order_id())
+                        && orders.iter().any(|child| {
+                            is_oto_child_of(child, other)
+                                && is_mutually_oco_or_ouo_linked(order, child)
+                        })))
+        })
+        .map(|other| other.quantity().as_decimal())
+        .sum()
+}
+
 fn has_open_unlinked_exit(
     engine: &RustPlanGateEngine,
     order: &OrderAny,
@@ -579,19 +664,6 @@ fn has_open_unlinked_exit(
             is_active_unlinked_exit_sibling(engine, order, &existing, exclude_cids)
                 && existing.leaves_qty().as_decimal() > Decimal::ZERO
         })
-}
-
-fn has_batch_unlinked_exit(order: &OrderAny, orders: &[OrderAny]) -> bool {
-    let inst_id = order.instrument_id();
-    let side = order.order_side();
-    orders.iter().any(|other| {
-        other.client_order_id() != order.client_order_id()
-            && same_instrument_or_symbol(&other.instrument_id(), &inst_id)
-            && other.order_side() == side
-            && has_exit_intent(other)
-            && other.quantity().as_decimal() > Decimal::ZERO
-            && !is_mutually_oco_or_ouo_linked(order, other)
-    })
 }
 
 fn has_post_batch_unlinked_exit(order: &OrderAny, post_batch: &[(&OrderAny, Decimal)]) -> bool {
@@ -711,9 +783,15 @@ fn is_verified_exit_for_submit(
     plan_item: Option<&RustPlanItemEnvelope>,
 ) -> Result<bool, String> {
     if order.is_reduce_only() {
+        let order_qty = order.quantity().as_decimal();
+        if order_qty <= Decimal::ZERO {
+            return Err(format!(
+                "INVALID_QUANTITY: reduce-only exit quantity must be > 0, got {order_qty}"
+            ));
+        }
         check_active_oto_child_cap(
             order,
-            order.quantity().as_decimal(),
+            order_qty,
             cache,
             &[],
             &[],
@@ -721,16 +799,8 @@ fn is_verified_exit_for_submit(
             false,
         )?;
         let norm_sym = normalize_symbol(&order.instrument_id());
-        if is_safe_exit_active(cache, &norm_sym)
-            || !has_open_unlinked_exit(engine, order, cache, &[])
-        {
+        if is_safe_exit_active(cache, &norm_sym) {
             return Ok(true);
-        }
-        let order_qty = order.quantity().as_decimal();
-        if order_qty <= Decimal::ZERO {
-            return Err(format!(
-                "INVALID_QUANTITY: reduce-only exit quantity must be > 0, got {order_qty}"
-            ));
         }
         let open_opp = open_opposite_pos_qty(cache, &order.instrument_id(), order.order_side());
         let linked_entry_qty = active_opposite_linked_entry_leaves_qty(order, cache, &[]);
@@ -795,9 +865,15 @@ fn is_verified_exit_for_batch(
         .collect();
 
     if order.is_reduce_only() {
+        let order_qty = order.quantity().as_decimal();
+        if order_qty <= Decimal::ZERO {
+            return Err(format!(
+                "INVALID_QUANTITY: reduce-only exit quantity must be > 0, got {order_qty}"
+            ));
+        }
         check_active_oto_child_cap(
             order,
-            order.quantity().as_decimal(),
+            order_qty,
             cache,
             batch_cids,
             &extra_orders,
@@ -807,20 +883,9 @@ fn is_verified_exit_for_batch(
         if safe_exit {
             return Ok(true);
         }
-        let has_unlinked_exit = has_open_unlinked_exit(engine, order, cache, batch_cids)
-            || has_batch_unlinked_exit(order, orders);
-        if !has_unlinked_exit {
-            return Ok(true);
-        }
-        let order_qty = order.quantity().as_decimal();
-        if order_qty <= Decimal::ZERO {
-            return Err(format!(
-                "INVALID_QUANTITY: reduce-only exit quantity must be > 0, got {order_qty}"
-            ));
-        }
         let open_opp = open_opposite_pos_qty(cache, &inst_id, side);
         let total_opp_capacity = open_opp
-            + batch_linked_entry_qty(order, orders)
+            + batch_entry_capacity_for_reduce_only(order, orders)
             + active_opposite_linked_entry_leaves_qty(order, cache, batch_cids);
         let combined_unlinked_qty = open_unlinked_exit_qty_with_oto_spillover(
             engine,
@@ -1094,7 +1159,7 @@ fn build_gate_request(
 ) -> RustPlanGateOrderRequest {
     let norm_sym = normalize_symbol(&order.instrument_id());
     let (evaluation_ts_ns, evaluation_ts_iso) = resolve_eval_timestamp(order, ts_now);
-    let reference_price = resolve_reference_price(order, cache);
+    let reference_price = resolve_reference_price(order, cache, ts_now);
     let atr = resolve_atr(order, plan_item);
     let stop_loss_price = if is_verified_exit {
         None
@@ -1267,59 +1332,122 @@ fn check_reduce_only_modify_per_order(
         }
     }
 
-    // 2. Monotonic stop invariant: never allow loosening protective stops.
-    if is_stop_order_type(order.order_type())
-        && !is_effective_take_profit(order)
-        && let Some(new_stop) = modify.trigger_price.map(|p| p.as_decimal())
+    // 2. Monotonic stop & protective limit invariant: never allow loosening protective stops
+    //    or setting non-positive / blocking stop-limit prices.
+    if let Some(new_lim) = modify.price.map(|p| p.as_decimal())
+        && new_lim <= Decimal::ZERO
     {
-        if new_stop <= Decimal::ZERO {
-            return Err(format!(
-                "INVALID_STOP_LOSS_PRICE: trigger_price ({new_stop}) must be > 0"
-            ));
-        }
+        return Err(format!(
+            "INVALID_LIMIT_PRICE: reduce-only modify limit_price ({new_lim}) must be > 0"
+        ));
+    }
+
+    if is_stop_order_type(order.order_type()) && !is_effective_take_profit(order) {
         let current_stop = order.trigger_price().map(|p| p.as_decimal());
         let safe_exit = is_safe_exit_active(cache, &norm_sym);
         let plan_item = engine.plan_item_for_symbol(&norm_sym);
 
-        match order.order_side() {
-            OrderSide::Sell => {
-                if let Some(cur) = current_stop
-                    && new_stop < cur
-                {
-                    return Err(format!(
-                        "STOP_LOSS_LOOSENING_PROHIBITED: LONG stop modify {new_stop} < current {cur}"
-                    ));
+        if let Some(new_stop) = modify.trigger_price.map(|p| p.as_decimal()) {
+            if new_stop <= Decimal::ZERO {
+                return Err(format!(
+                    "INVALID_STOP_LOSS_PRICE: trigger_price ({new_stop}) must be > 0"
+                ));
+            }
+            match order.order_side() {
+                OrderSide::Sell => {
+                    if let Some(cur) = current_stop
+                        && new_stop < cur
+                    {
+                        return Err(format!(
+                            "STOP_LOSS_LOOSENING_PROHIBITED: LONG stop modify {new_stop} < current {cur}"
+                        ));
+                    }
+                    if !safe_exit
+                        && let Some(item) = plan_item.as_ref()
+                        && item.initial_stop_price > Decimal::ZERO
+                        && current_stop.is_none_or(|cur| cur >= item.initial_stop_price)
+                        && new_stop < item.initial_stop_price
+                    {
+                        return Err(format!(
+                            "STOP_LOSS_LOOSENING_PROHIBITED: LONG stop modify {new_stop} < initial_stop_price ({})",
+                            item.initial_stop_price
+                        ));
+                    }
                 }
-                if !safe_exit
-                    && let Some(item) = plan_item.as_ref()
-                    && item.initial_stop_price > Decimal::ZERO
-                    && current_stop.is_none_or(|cur| cur >= item.initial_stop_price)
-                    && new_stop < item.initial_stop_price
-                {
-                    return Err(format!(
-                        "STOP_LOSS_LOOSENING_PROHIBITED: LONG stop modify {new_stop} < initial_stop_price ({})",
-                        item.initial_stop_price
-                    ));
+                OrderSide::Buy => {
+                    if let Some(cur) = current_stop
+                        && new_stop > cur
+                    {
+                        return Err(format!(
+                            "STOP_LOSS_LOOSENING_PROHIBITED: SHORT stop modify {new_stop} > current {cur}"
+                        ));
+                    }
+                    if !safe_exit
+                        && let Some(item) = plan_item.as_ref()
+                        && item.initial_stop_price > Decimal::ZERO
+                        && current_stop.is_none_or(|cur| cur <= item.initial_stop_price)
+                        && new_stop > item.initial_stop_price
+                    {
+                        return Err(format!(
+                            "STOP_LOSS_LOOSENING_PROHIBITED: SHORT stop modify {new_stop} > initial_stop_price ({})",
+                            item.initial_stop_price
+                        ));
+                    }
                 }
             }
-            OrderSide::Buy => {
-                if let Some(cur) = current_stop
-                    && new_stop > cur
-                {
-                    return Err(format!(
-                        "STOP_LOSS_LOOSENING_PROHIBITED: SHORT stop modify {new_stop} > current {cur}"
-                    ));
+        }
+
+        if let Some(new_lim) = modify.price.map(|p| p.as_decimal()) {
+            let eff_trig = modify
+                .trigger_price
+                .map(|p| p.as_decimal())
+                .or(current_stop);
+            let cur_lim = order.price().map(|p| p.as_decimal());
+            let trig_tightened = match (
+                order.order_side(),
+                modify.trigger_price.map(|p| p.as_decimal()),
+                current_stop,
+            ) {
+                (OrderSide::Sell, Some(ns), Some(cs)) => ns > cs,
+                (OrderSide::Buy, Some(ns), Some(cs)) => ns < cs,
+                _ => false,
+            };
+            match order.order_side() {
+                OrderSide::Sell => {
+                    if let Some(trig) = eff_trig
+                        && new_lim > trig
+                    {
+                        return Err(format!(
+                            "STOP_LOSS_LOOSENING_PROHIBITED: LONG stop limit_price ({new_lim}) > trigger_price ({trig})"
+                        ));
+                    }
+                    if !safe_exit
+                        && !trig_tightened
+                        && let Some(cur_l) = cur_lim
+                        && new_lim > cur_l
+                    {
+                        return Err(format!(
+                            "STOP_LOSS_LOOSENING_PROHIBITED: LONG stop limit_price ({new_lim}) > current ({cur_l}) without raising trigger_price"
+                        ));
+                    }
                 }
-                if !safe_exit
-                    && let Some(item) = plan_item.as_ref()
-                    && item.initial_stop_price > Decimal::ZERO
-                    && current_stop.is_none_or(|cur| cur <= item.initial_stop_price)
-                    && new_stop > item.initial_stop_price
-                {
-                    return Err(format!(
-                        "STOP_LOSS_LOOSENING_PROHIBITED: SHORT stop modify {new_stop} > initial_stop_price ({})",
-                        item.initial_stop_price
-                    ));
+                OrderSide::Buy => {
+                    if let Some(trig) = eff_trig
+                        && new_lim < trig
+                    {
+                        return Err(format!(
+                            "STOP_LOSS_LOOSENING_PROHIBITED: SHORT stop limit_price ({new_lim}) < trigger_price ({trig})"
+                        ));
+                    }
+                    if !safe_exit
+                        && !trig_tightened
+                        && let Some(cur_l) = cur_lim
+                        && new_lim < cur_l
+                    {
+                        return Err(format!(
+                            "STOP_LOSS_LOOSENING_PROHIBITED: SHORT stop limit_price ({new_lim}) < current ({cur_l}) without lowering trigger_price"
+                        ));
+                    }
                 }
             }
         }
@@ -1458,14 +1586,18 @@ fn check_single_modify(
     }
 
     let (eval_ts_ns, eval_ts_iso) = resolve_eval_timestamp(order, ts_now);
-    let ref_px = resolve_reference_price(order, cache);
+    let ref_px = resolve_reference_price(order, cache, ts_now);
     let atr = resolve_atr(order, plan_item.as_ref());
+    let stop_loss_px = resolve_stop_loss_price(order, cache, None);
 
     engine.validate_entry_modify(
         &norm_sym,
         modify.quantity.map(|q| q.as_decimal()),
         order.quantity().as_decimal(),
         modify.price.map(|p| p.as_decimal()),
+        order.price().map(|p| p.as_decimal()),
+        modify.trigger_price.map(|p| p.as_decimal()),
+        stop_loss_px,
         ref_px,
         atr,
         eval_ts_ns,
@@ -1499,11 +1631,12 @@ fn reconcile_cache_reservations(engine: &RustPlanGateEngine, symbol: &str, cache
                 | OrderStatus::Rejected
                 | OrderStatus::Denied
         ) {
-            engine.reconcile_terminal_order(
-                &cid_str,
-                symbol,
-                filled_qty.min(order_qty).max(Decimal::ZERO),
-            );
+            let effective_filled = filled_qty.min(order_qty).max(Decimal::ZERO);
+            engine.reconcile_terminal_order(&cid_str, symbol, effective_filled);
+        } else if status == OrderStatus::Filled {
+            if filled_qty > Decimal::ZERO && filled_qty < admitted_qty {
+                engine.reconcile_order_updated(&cid_str, symbol, filled_qty);
+            }
         } else if order_qty < admitted_qty {
             engine.reconcile_order_updated(&cid_str, symbol, order_qty);
         }
@@ -1521,7 +1654,7 @@ fn check_modify_orders_batch(
 
     for modify in modifies {
         let Some(order) = cache.order(&modify.client_order_id) else {
-            continue;
+            return Err(format!("ORDER_NOT_IN_CACHE: {}", modify.client_order_id));
         };
         if !order.is_reduce_only() {
             return Err("ENTRY_UPWARD_MODIFY_PROHIBITED".to_string());
@@ -1638,8 +1771,18 @@ impl PreTradeRiskGate for RustPlanGateEngine {
         match command {
             TradingCommand::SubmitOrder(submit) => {
                 prune_admitted_exits_from_cache(self, cache);
-                let Some(order) = cache.order(&submit.client_order_id) else {
-                    return Ok(());
+                let order: OrderAny = if let Some(cached) = cache.order(&submit.client_order_id) {
+                    cached.clone()
+                } else {
+                    OrderAny::from_events(vec![OrderEventAny::Initialized(
+                        submit.order_init.clone(),
+                    )])
+                    .map_err(|e| {
+                        format!(
+                            "ORDER_NOT_IN_CACHE: failed to hydrate {}: {e}",
+                            submit.client_order_id
+                        )
+                    })?
                 };
                 let norm_sym = normalize_symbol(&order.instrument_id());
                 let plan_item = self.plan_item_for_symbol(&norm_sym);
@@ -1675,10 +1818,21 @@ impl PreTradeRiskGate for RustPlanGateEngine {
                 }
                 let mut orders = Vec::with_capacity(cids.len());
                 for cid in cids {
-                    let Some(order) = cache.order(cid) else {
-                        return Ok(());
-                    };
-                    orders.push(order.clone());
+                    if let Some(order) = cache.order(cid) {
+                        orders.push(order.clone());
+                    } else if let Some(order_init) = submit_list
+                        .order_inits
+                        .iter()
+                        .find(|init| init.client_order_id == *cid)
+                    {
+                        let hydrated = OrderAny::from_events(vec![OrderEventAny::Initialized(
+                            order_init.clone(),
+                        )])
+                        .map_err(|e| format!("ORDER_NOT_IN_CACHE: failed to hydrate {cid}: {e}"))?;
+                        orders.push(hydrated);
+                    } else {
+                        return Err(format!("ORDER_NOT_IN_CACHE: {cid}"));
+                    }
                 }
 
                 let mut leg_is_verified_exit = Vec::with_capacity(orders.len());
@@ -1732,7 +1886,7 @@ impl PreTradeRiskGate for RustPlanGateEngine {
             TradingCommand::ModifyOrder(modify) => {
                 prune_admitted_exits_from_cache(self, cache);
                 let Some(order) = cache.order(&modify.client_order_id) else {
-                    return Ok(());
+                    return Err(format!("ORDER_NOT_IN_CACHE: {}", modify.client_order_id));
                 };
                 check_single_modify(self, modify, &order, cache, ts_now)
             }

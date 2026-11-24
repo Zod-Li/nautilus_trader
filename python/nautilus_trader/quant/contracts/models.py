@@ -527,7 +527,7 @@ class MarketableLimitCollar:
         raw = (ref_px + allowed_offset) if side == PlanSide.LONG else (ref_px - allowed_offset)
         if tick_size is not None:
             return quantize_price_rule_612(raw, side=side, tick_size=tick_size)
-        return quantize_price_rule_612(raw, side=None, tick_size=None)
+        return quantize_price_rule_612(raw, side=side, tick_size=None)
 
     def to_dict(self) -> Dict[str, str]:
         return {

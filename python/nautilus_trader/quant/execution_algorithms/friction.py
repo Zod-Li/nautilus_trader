@@ -161,7 +161,13 @@ def compute_ibkr_pro_fixed_commission(
 
     reg_delta = Decimal("0.00")
     if _is_sell_side(side):
-        sec_fee = _ceil_cent(fill_notional * sched.sec_section_31_rate)
+        sec_before = (
+            _ceil_cent(prior_notional * sched.sec_section_31_rate)
+            if prior_q > Decimal("0")
+            else Decimal("0.00")
+        )
+        sec_after = _ceil_cent(cum_notional_after * sched.sec_section_31_rate)
+        sec_delta = max(Decimal("0.00"), sec_after - sec_before)
         taf_before = (
             min(sched.finra_taf_max_per_order_usd, _ceil_cent(sched.finra_taf_per_share_usd * prior_q))
             if prior_q > Decimal("0")
@@ -172,7 +178,7 @@ def compute_ibkr_pro_fixed_commission(
             _ceil_cent(sched.finra_taf_per_share_usd * cum_q_after),
         )
         taf_delta = max(Decimal("0.00"), taf_after - taf_before)
-        reg_delta = sec_fee + taf_delta
+        reg_delta = sec_delta + taf_delta
 
     return (broker_delta + reg_delta).quantize(CENT_QUANT, rounding=ROUND_HALF_EVEN)
 
@@ -230,10 +236,18 @@ def compute_half_spread_and_sqrt_impact(
         if impact_coefficient_y is not None
         else eff_spec.impact_coefficient_y
     )
-    px = max(0.0, float(price))
-    qty = max(0.0, float(quantity))
-    sigma = max(0.0, float(daily_sigma))
-    adv = max(float(eff_spec.min_adv_shares), float(adv_20_shares))
+    if not math.isfinite(eff_half_bps) or eff_half_bps < 0.0:
+        raise ValueError(f"half_spread_bps must be finite >= 0, got {eff_half_bps}")
+    if not math.isfinite(eff_y) or eff_y < 0.0:
+        raise ValueError(f"impact_coefficient_y must be finite >= 0, got {eff_y}")
+    raw_px = float(price)
+    raw_qty = float(quantity)
+    raw_sigma = float(daily_sigma)
+    raw_adv = float(adv_20_shares)
+    px = max(0.0, raw_px) if math.isfinite(raw_px) else 0.0
+    qty = max(0.0, raw_qty) if math.isfinite(raw_qty) else 0.0
+    sigma = max(0.0, raw_sigma) if math.isfinite(raw_sigma) else 0.0
+    adv = max(float(eff_spec.min_adv_shares), raw_adv) if math.isfinite(raw_adv) else float(eff_spec.min_adv_shares)
 
     if px <= 0.0 or qty <= 0.0:
         return MarketImpactBreakdown(
@@ -288,14 +302,32 @@ def compute_vectorized_friction_per_share(
         if impact_spec is None
         else float(eff_spec.impact_coefficient_y)
     )
+    eff_fee_mult = float(fee_multiplier)
+    eff_slip_mult = float(slippage_multiplier)
+    if not math.isfinite(eff_half_bps) or eff_half_bps < 0.0:
+        raise ValueError(f"half_spread_bps must be finite >= 0, got {eff_half_bps}")
+    if not math.isfinite(eff_y) or eff_y < 0.0:
+        raise ValueError(f"impact_coefficient_y must be finite >= 0, got {eff_y}")
+    if not math.isfinite(eff_fee_mult) or eff_fee_mult < 0.0:
+        raise ValueError(f"fee_multiplier must be finite >= 0, got {eff_fee_mult}")
+    if not math.isfinite(eff_slip_mult) or eff_slip_mult < 0.0:
+        raise ValueError(f"slippage_multiplier must be finite >= 0, got {eff_slip_mult}")
 
-    px_in = np.asarray(prices, dtype=np.float64)
-    qty_in = np.maximum(np.asarray(quantities, dtype=np.float64), 0.0)
-    sig_in = np.maximum(np.asarray(daily_sigmas, dtype=np.float64), 0.0)
-    adv_in = np.maximum(np.asarray(adv_20_shares, dtype=np.float64), float(eff_spec.min_adv_shares))
+    raw_px = np.asarray(prices, dtype=np.float64)
+    raw_qty = np.asarray(quantities, dtype=np.float64)
+    raw_sig = np.asarray(daily_sigmas, dtype=np.float64)
+    raw_adv = np.asarray(adv_20_shares, dtype=np.float64)
 
-    px_arr, qty_arr, sig_arr, adv_arr = np.broadcast_arrays(px_in, qty_in, sig_in, adv_in)
-    active = (px_arr > 0.0) & (qty_arr > 0.0)
+    raw_px, raw_qty, raw_sig, raw_adv = np.broadcast_arrays(raw_px, raw_qty, raw_sig, raw_adv)
+    active = np.isfinite(raw_px) & np.isfinite(raw_qty) & (raw_px > 0.0) & (raw_qty > 0.0)
+    px_arr = np.where(active, raw_px, 0.0)
+    qty_arr = np.where(active, raw_qty, 0.0)
+    sig_arr = np.where(np.isfinite(raw_sig), np.maximum(raw_sig, 0.0), 0.0)
+    adv_arr = np.where(
+        np.isfinite(raw_adv),
+        np.maximum(raw_adv, float(eff_spec.min_adv_shares)),
+        float(eff_spec.min_adv_shares),
+    )
     safe_qty = np.where(active, qty_arr, 1.0)
     notional = np.where(active, px_arr * qty_arr, 0.0)
 
@@ -352,15 +384,13 @@ def compute_vectorized_friction_per_share(
 
     comm_per_share = np.where(
         active,
-        (comm_total * max(0.0, float(fee_multiplier))) / safe_qty,
+        (comm_total * eff_fee_mult) / safe_qty,
         0.0,
     )
 
-    half_spread_frac = max(0.0, eff_half_bps) * 1e-4
-    impact_frac = max(0.0, eff_y) * sig_arr * np.sqrt(np.where(active, qty_arr / adv_arr, 0.0))
-    one_way_slip_per_sh = (
-        (half_spread_frac + impact_frac) * px_arr * max(0.0, float(slippage_multiplier))
-    )
+    half_spread_frac = eff_half_bps * 1e-4
+    impact_frac = eff_y * sig_arr * np.sqrt(np.where(active, qty_arr / adv_arr, 0.0))
+    one_way_slip_per_sh = (half_spread_frac + impact_frac) * px_arr * eff_slip_mult
     slip_per_share = np.where(active, one_way_slip_per_sh * (2.0 if round_trip else 1.0), 0.0)
 
     return comm_per_share + slip_per_share

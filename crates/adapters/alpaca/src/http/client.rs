@@ -178,7 +178,7 @@ impl AlpacaHttpClient {
         let mut is_ascending = after.is_some() && until.is_none();
 
         for _page_idx in 0..MAX_ORDER_PAGINATION_PAGES {
-            let mut params = Vec::with_capacity(4);
+            let mut params = Vec::with_capacity(5);
             if let Some(s) = status {
                 params.push(("status".to_string(), s.to_string()));
             }
@@ -189,6 +189,7 @@ impl AlpacaHttpClient {
             if let Some(ref u) = cursor_until {
                 params.push(("until".to_string(), u.clone()));
             }
+            params.push(("nested".to_string(), "true".to_string()));
 
             let page = self
                 .request_json::<(), Vec<AlpacaOrderResponse>>(
@@ -260,7 +261,8 @@ impl AlpacaHttpClient {
     /// Returns [`AlpacaError`] if the order is not found (`404`) or request fails.
     pub async fn get_order(&self, venue_order_id: &str) -> AlpacaResult<AlpacaOrderResponse> {
         let path = format!("/v2/orders/{}", venue_order_id.trim());
-        self.request_json::<(), AlpacaOrderResponse>(Method::GET, &path, None, None)
+        let params = vec![("nested".to_string(), "true".to_string())];
+        self.request_json::<(), AlpacaOrderResponse>(Method::GET, &path, Some(params), None)
             .await
     }
 
@@ -273,10 +275,10 @@ impl AlpacaHttpClient {
         &self,
         client_order_id: &str,
     ) -> AlpacaResult<AlpacaOrderResponse> {
-        let params = Some(vec![(
-            "client_order_id".to_string(),
-            client_order_id.to_string(),
-        )]);
+        let params = Some(vec![
+            ("client_order_id".to_string(), client_order_id.to_string()),
+            ("nested".to_string(), "true".to_string()),
+        ]);
         self.request_json::<(), AlpacaOrderResponse>(
             Method::GET,
             "/v2/orders:by_client_order_id",
@@ -414,7 +416,9 @@ impl AlpacaHttpClient {
         }))
     }
 
-    /// Modifies/replaces an existing order via `PATCH /v2/orders/{venue_order_id}`.
+    /// Modifies/replaces an existing order via `PATCH /v2/orders/{venue_order_id}` with
+    /// idempotent recovery on retry `409`/`422` when a prior ambiguous transport attempt already
+    /// replaced the order on Alpaca.
     ///
     /// # Errors
     ///
@@ -424,14 +428,80 @@ impl AlpacaHttpClient {
         venue_order_id: &str,
         request: &AlpacaReplaceOrderRequest,
     ) -> AlpacaResult<AlpacaOrderResponse> {
-        let path = format!("/v2/orders/{}", venue_order_id.trim());
-        self.request_json::<AlpacaReplaceOrderRequest, AlpacaOrderResponse>(
-            Method::PATCH,
-            &path,
-            None,
-            Some(request),
-        )
-        .await
+        let trimmed_vid = venue_order_id.trim();
+        let path = format!("/v2/orders/{trimmed_vid}");
+        let mut last_err: Option<AlpacaError> = None;
+
+        for attempt in 0..=self.config.max_retries {
+            if attempt > 0 {
+                let delay = self.compute_backoff_delay(attempt);
+                tokio::time::sleep(delay).await;
+            }
+
+            match self
+                .request_once_json::<AlpacaReplaceOrderRequest, AlpacaOrderResponse>(
+                    Method::PATCH,
+                    &path,
+                    None,
+                    Some(request),
+                )
+                .await
+            {
+                Ok(resp) => return Ok(resp),
+                Err(patch_err) => {
+                    if attempt > 0
+                        && !trimmed_vid.is_empty()
+                        && matches!(
+                            &patch_err,
+                            AlpacaError::DeterministicReject { status, .. }
+                                if *status == 409 || *status == 422
+                        )
+                        && let Ok(old_resp) = self
+                            .request_once_json::<(), AlpacaOrderResponse>(
+                                Method::GET,
+                                &path,
+                                None,
+                                None,
+                            )
+                            .await
+                        && old_resp.status.trim().eq_ignore_ascii_case("replaced")
+                        && let Some(ref new_id) = old_resp.replaced_by
+                        && !new_id.trim().is_empty()
+                    {
+                        let new_path = format!("/v2/orders/{}", new_id.trim());
+                        if let Ok(new_resp) = self
+                            .request_once_json::<(), AlpacaOrderResponse>(
+                                Method::GET,
+                                &new_path,
+                                None,
+                                None,
+                            )
+                            .await
+                        {
+                            let cid_matches = request.client_order_id.as_deref().is_none_or(
+                                |req_cid| new_resp.client_order_id == req_cid.trim(),
+                            );
+                            if cid_matches {
+                                log::warn!(
+                                    "Recovered Alpaca replace_order old_id={trimmed_vid} -> new_id={} via post-retry 409/422 probe",
+                                    new_resp.id
+                                );
+                                return Ok(new_resp);
+                            }
+                        }
+                    }
+
+                    if !patch_err.is_retryable() {
+                        return Err(patch_err);
+                    }
+                    last_err = Some(patch_err);
+                }
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| {
+            AlpacaError::Transport("Alpaca replace_order exhausted retry attempts".to_string())
+        }))
     }
 
     /// Cancels an open order via `DELETE /v2/orders/{venue_order_id}`.
@@ -487,10 +557,10 @@ impl AlpacaHttpClient {
         &self,
         client_order_id: &str,
     ) -> AlpacaResult<AlpacaOrderResponse> {
-        let params = Some(vec![(
-            "client_order_id".to_string(),
-            client_order_id.to_string(),
-        )]);
+        let params = Some(vec![
+            ("client_order_id".to_string(), client_order_id.to_string()),
+            ("nested".to_string(), "true".to_string()),
+        ]);
         self.request_once_json::<(), AlpacaOrderResponse>(
             Method::GET,
             "/v2/orders:by_client_order_id",

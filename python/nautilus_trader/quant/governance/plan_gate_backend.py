@@ -7,6 +7,7 @@ from datetime import date, datetime, timezone
 from decimal import Decimal
 import json
 import logging
+import os
 import queue
 import select
 import threading
@@ -395,18 +396,19 @@ class _AsyncPlanGateDbWorker:
             backoff = min(30.0, 0.5 * (2 ** min(self._consecutive_failures, 6)))
             self._next_retry_monotonic = time.monotonic() + backoff
 
-        rust_engine = self._rust_engine
-        if rust_engine is not None:
-            rust_engine.set_entry_freeze(True, reason)
-            rust_engine.set_backend_unavailable(
-                True, f"ENTRY_FREEZE_ACTIVE: {reason}"
-            )
         write_failure_cb = self._resolve_write_failure_cb()
         if write_failure_cb is not None:
             try:
                 write_failure_cb(reason)
             except Exception as cb_exc:
                 logger.error("PlanGate write failure callback error: %s", cb_exc)
+        rust_engine = self._rust_engine
+        if rust_engine is not None:
+            if write_failure_cb is None:
+                rust_engine.set_entry_freeze(True, reason)
+            rust_engine.set_backend_unavailable(
+                True, f"ENTRY_FREEZE_ACTIVE: {reason}"
+            )
 
     def _flush_batch(self, batch: Sequence[Dict[str, Any]]) -> bool:
         with self._state_lock:
@@ -528,6 +530,7 @@ class _AsyncPlanGateDbWorker:
                     status = CASE WHEN status = 'ARMED' THEN 'TRIGGERED' ELSE status END,
                     updated_at = NOW()
                 WHERE item_id = %s
+                  AND status NOT IN ('FILLED', 'EXPIRED', 'CANCELLED', 'CLOSED')
                 """,
                 (
                     Decimal(str(mutation["new_reserved_qty"])),
@@ -622,6 +625,7 @@ class _AsyncPlanGateDbWorker:
                         END,
                         updated_at = NOW()
                     WHERE item_id = %s
+                      AND status NOT IN ('FILLED', 'EXPIRED', 'CANCELLED', 'CLOSED')
                     """,
                     (
                         new_reserved,
@@ -652,6 +656,7 @@ class _AsyncPlanGateDbWorker:
                       AND p.market = %s
                       AND p.status = 'LOCKED'
                       AND i.symbol = %s
+                      AND i.status NOT IN ('FILLED', 'EXPIRED', 'CANCELLED', 'CLOSED')
                     """,
                     (
                         qty_dec,
@@ -676,7 +681,7 @@ class _AsyncPlanGateDbWorker:
                         reserved_notional_usd = %s,
                         updated_at = NOW()
                     WHERE item_id = %s
-                      AND status NOT IN ('EXPIRED', 'CANCELLED', 'CLOSED')
+                      AND status NOT IN ('FILLED', 'EXPIRED', 'CANCELLED', 'CLOSED')
                     """,
                     (new_reserved, new_notional, item_id),
                 )
@@ -773,7 +778,16 @@ class PostgresPlanGateBackend:
         init_reason = str(entry_freeze_reason or ("ENTRY_FREEZE" if init_freeze else ""))
         self._rust_engine = RustPlanGateEngine(init_freeze, init_reason)
         self._listen_conn: Optional[Any] = None
-        self._sync_lock = threading.Lock()
+        self._query_conn: Optional[Any] = None
+        self._listen_stop_event = threading.Event()
+        self._listen_wake_r: Optional[int] = None
+        self._listen_wake_w: Optional[int] = None
+        self._listen_thread: Optional[threading.Thread] = None
+        self._listen_poll_lock = threading.Lock()
+        self._db_query_lock = threading.Lock()
+        self._sync_lock = threading.RLock()
+        self._freeze_lock = threading.RLock()
+        self._freeze_epoch: int = 0
         self._monotonic_freeze_latched: bool = init_freeze
         self._monotonic_freeze_reason: str = init_reason
         self._db_freeze_persisted: bool = False
@@ -785,6 +799,7 @@ class PostgresPlanGateBackend:
         self._removed_runtime_symbols: set[str] = set()
         self._released_cap_by_symbol: Dict[str, Decimal] = {}
         self._reentry_cycle_counts: Dict[str, int] = {}
+        self._closed_cycle_locked_symbols: set[str] = set()
         self._alerts: List[Dict[str, Any]] = []
         for item in plan_items:
             self.upsert_runtime_plan_item(item, reserved_qty=item.filled_qty)
@@ -805,14 +820,18 @@ class PostgresPlanGateBackend:
             self._db_worker = None
 
     def _on_async_write_failure(self, reason: str) -> None:
-        self._monotonic_freeze_latched = True
-        self._monotonic_freeze_reason = str(reason or "ASYNC_DB_WRITER_FAILURE")
-        self._db_freeze_persisted = False
-        self._rust_engine.set_entry_freeze(True, self._monotonic_freeze_reason)
+        with self._freeze_lock:
+            self._freeze_epoch += 1
+            self._monotonic_freeze_latched = True
+            self._monotonic_freeze_reason = str(reason or "ASYNC_DB_WRITER_FAILURE")
+            self._db_freeze_persisted = False
+            self._rust_engine.set_entry_freeze(True, self._monotonic_freeze_reason)
 
     def _on_async_freeze_persisted(self, active: bool) -> None:
         if active:
-            self._db_freeze_persisted = True
+            with self._freeze_lock:
+                if self._monotonic_freeze_latched:
+                    self._db_freeze_persisted = True
 
     @property
     def dsn(self) -> str:
@@ -852,64 +871,65 @@ class PostgresPlanGateBackend:
     def _mirror_rust_mutations_to_python_items(
         self, mutations: Sequence[Mapping[str, Any]]
     ) -> None:
-        for mutation in mutations:
-            kind = str(mutation.get("kind") or "")
-            norm_sym = str(mutation.get("symbol") or "").split(".", 1)[0].strip().upper()
-            if not norm_sym:
-                continue
-            if kind == "ORDER_ADMITTED":
-                new_res_raw = mutation.get("new_reserved_qty")
-                if new_res_raw is None:
+        with self._sync_lock:
+            for mutation in mutations:
+                kind = str(mutation.get("kind") or "")
+                norm_sym = str(mutation.get("symbol") or "").split(".", 1)[0].strip().upper()
+                if not norm_sym:
                     continue
-                new_res_dec = Decimal(str(new_res_raw))
-                self._released_cap_by_symbol.pop(norm_sym, None)
-                if norm_sym in self._items_by_symbol:
-                    cur_item = self._items_by_symbol[norm_sym]
-                    new_status = (
-                        "TRIGGERED" if str(cur_item.status) == "ARMED" else cur_item.status
-                    )
-                    self._items_by_symbol[norm_sym] = replace(
-                        cur_item, filled_qty=new_res_dec, status=new_status
-                    )
-                if norm_sym in self._runtime_items_by_symbol:
-                    rt_item, _ = self._runtime_items_by_symbol[norm_sym]
-                    new_status = (
-                        "TRIGGERED" if str(rt_item.status) == "ARMED" else rt_item.status
-                    )
-                    self._runtime_items_by_symbol[norm_sym] = (
-                        replace(rt_item, filled_qty=new_res_dec, status=new_status),
-                        new_res_dec,
-                    )
-            elif kind == "RELEASE_RESERVATION":
-                new_res_raw = mutation.get("new_reserved_qty")
-                if new_res_raw is None:
-                    continue
-                new_res_dec = Decimal(str(new_res_raw))
-                locked_syms: set[str] = getattr(self, "_closed_cycle_locked_symbols", set())
-                if norm_sym in locked_syms:
-                    continue
-                self._released_cap_by_symbol[norm_sym] = new_res_dec
-                if norm_sym in self._items_by_symbol:
-                    cur_item = self._items_by_symbol[norm_sym]
-                    reverted_status = (
-                        "ARMED"
-                        if new_res_dec == Decimal("0") and str(cur_item.status) == "TRIGGERED"
-                        else cur_item.status
-                    )
-                    self._items_by_symbol[norm_sym] = replace(
-                        cur_item, filled_qty=new_res_dec, status=reverted_status
-                    )
-                if norm_sym in self._runtime_items_by_symbol:
-                    rt_item, _ = self._runtime_items_by_symbol[norm_sym]
-                    reverted_status = (
-                        "ARMED"
-                        if new_res_dec == Decimal("0") and str(rt_item.status) == "TRIGGERED"
-                        else rt_item.status
-                    )
-                    self._runtime_items_by_symbol[norm_sym] = (
-                        replace(rt_item, filled_qty=new_res_dec, status=reverted_status),
-                        new_res_dec,
-                    )
+                if kind == "ORDER_ADMITTED":
+                    new_res_raw = mutation.get("new_reserved_qty")
+                    if new_res_raw is None:
+                        continue
+                    new_res_dec = Decimal(str(new_res_raw))
+                    self._released_cap_by_symbol.pop(norm_sym, None)
+                    if norm_sym in self._items_by_symbol:
+                        cur_item = self._items_by_symbol[norm_sym]
+                        new_status = (
+                            "TRIGGERED" if str(cur_item.status) == "ARMED" else cur_item.status
+                        )
+                        self._items_by_symbol[norm_sym] = replace(
+                            cur_item, filled_qty=new_res_dec, status=new_status
+                        )
+                    if norm_sym in self._runtime_items_by_symbol:
+                        rt_item, _ = self._runtime_items_by_symbol[norm_sym]
+                        new_status = (
+                            "TRIGGERED" if str(rt_item.status) == "ARMED" else rt_item.status
+                        )
+                        self._runtime_items_by_symbol[norm_sym] = (
+                            replace(rt_item, filled_qty=new_res_dec, status=new_status),
+                            new_res_dec,
+                        )
+                elif kind == "RELEASE_RESERVATION":
+                    new_res_raw = mutation.get("new_reserved_qty")
+                    if new_res_raw is None:
+                        continue
+                    new_res_dec = Decimal(str(new_res_raw))
+                    locked_syms: set[str] = getattr(self, "_closed_cycle_locked_symbols", set())
+                    if norm_sym in locked_syms:
+                        continue
+                    self._released_cap_by_symbol[norm_sym] = new_res_dec
+                    if norm_sym in self._items_by_symbol:
+                        cur_item = self._items_by_symbol[norm_sym]
+                        reverted_status = (
+                            "ARMED"
+                            if new_res_dec == Decimal("0") and str(cur_item.status) == "TRIGGERED"
+                            else cur_item.status
+                        )
+                        self._items_by_symbol[norm_sym] = replace(
+                            cur_item, filled_qty=new_res_dec, status=reverted_status
+                        )
+                    if norm_sym in self._runtime_items_by_symbol:
+                        rt_item, _ = self._runtime_items_by_symbol[norm_sym]
+                        reverted_status = (
+                            "ARMED"
+                            if new_res_dec == Decimal("0") and str(rt_item.status) == "TRIGGERED"
+                            else rt_item.status
+                        )
+                        self._runtime_items_by_symbol[norm_sym] = (
+                            replace(rt_item, filled_qty=new_res_dec, status=reverted_status),
+                            new_res_dec,
+                        )
 
     def flush_rust_mutations(self, limit: int = 256) -> int:
         """Drains pending `RustPlanGateEngine` mutations, mirrors state, and enqueues DB writes."""
@@ -968,10 +988,16 @@ class PostgresPlanGateBackend:
         reconciled_reserved_qty: Decimal | int | float | str,
         *,
         persist_db: bool = True,
+        persist_filled_qty: Optional[Decimal | int | float | str] = None,
     ) -> Decimal:
         """Sets the authoritative startup reservation watermark in `RustPlanGateEngine` (and optionally PG)."""
         norm_sym = str(symbol or "").split(".", 1)[0].strip().upper()
         qty_dec = max(Decimal("0"), _to_decimal(reconciled_reserved_qty, "reconciled_reserved_qty"))
+        persist_dec = (
+            max(Decimal("0"), _to_decimal(persist_filled_qty, "persist_filled_qty"))
+            if persist_filled_qty is not None
+            else qty_dec
+        )
         if not norm_sym or norm_sym not in self._items_by_symbol:
             return Decimal("0")
         with self._sync_lock:
@@ -989,20 +1015,25 @@ class PostgresPlanGateBackend:
             else:
                 self._released_cap_by_symbol.pop(norm_sym, None)
 
-        if persist_db and self._async_writer is not None:
+        if (
+            persist_db
+            and self._async_writer is not None
+            and str(item.status or "").strip().upper()
+            not in ("FILLED", "EXPIRED", "CANCELLED", "CLOSED")
+        ):
             ref_px = (
                 item.risk_envelope.target_notional_usd / item.risk_envelope.target_qty
                 if item.risk_envelope.target_qty > Decimal("0")
                 else Decimal("0")
             )
-            new_notional = (ref_px * qty_dec).quantize(Decimal("0.01"))
+            new_notional = (ref_px * persist_dec).quantize(Decimal("0.01"))
             self._async_writer.enqueue_mutations(
                 [
                     {
                         "kind": "RECONCILE_RESERVATION",
                         "item_id": str(item.item_id),
                         "symbol": norm_sym,
-                        "new_reserved_qty": str(qty_dec),
+                        "new_reserved_qty": str(persist_dec),
                         "new_reserved_notional_usd": str(new_notional),
                     }
                 ]
@@ -1048,10 +1079,13 @@ class PostgresPlanGateBackend:
         if self._async_writer is not None:
             self._async_writer.set_trading_date(trading_date)
         if clear_runtime_items:
-            self._runtime_items_by_symbol.clear()
-            self._baseline_items_by_symbol.clear()
-            self._removed_runtime_symbols.clear()
-            self._released_cap_by_symbol.clear()
+            with self._sync_lock:
+                self._runtime_items_by_symbol.clear()
+                self._baseline_items_by_symbol.clear()
+                self._removed_runtime_symbols.clear()
+                self._released_cap_by_symbol.clear()
+                self._closed_cycle_locked_symbols.clear()
+                self._reentry_cycle_counts.clear()
         if sync and self._persist_to_db:
             self.sync_from_db(preserve_higher_reservation=False)
 
@@ -1099,19 +1133,7 @@ class PostgresPlanGateBackend:
                 self._symbol_by_item_id.pop(str(removed_runtime[0].item_id), None)
             if removed_item is not None:
                 self._symbol_by_item_id.pop(str(removed_item.item_id), None)
-            prev_res = {
-                s: Decimal(self._rust_engine.reserved_qty(s))
-                for s in self._items_by_symbol
-            }
-            self._rust_engine.clear_plan_items()
-            for s, item in list(self._items_by_symbol.items()):
-                preserved = max(item.filled_qty, prev_res.get(s, Decimal("0")))
-                adjusted = replace(item, filled_qty=preserved)
-                self._items_by_symbol[s] = adjusted
-                self._rust_engine.upsert_plan_item(
-                    _plan_item_to_rust_envelope(adjusted),
-                    False,
-                )
+            self._rust_engine.remove_plan_item(norm_sym)
 
     def get_plan_item(self, symbol: str) -> Optional[PlanItemContract]:
         norm_sym = str(symbol or "").split(".", 1)[0].strip().upper()
@@ -1153,10 +1175,12 @@ class PostgresPlanGateBackend:
     ) -> None:
         """Monotonically latches `ENTRY_FREEZE` in O(1) Rust memory and enqueues DB persistence."""
         reason_str = str(reason or "ENTRY_FREEZE")
-        self._monotonic_freeze_latched = True
-        self._monotonic_freeze_reason = reason_str
-        self._db_freeze_persisted = False
-        self._rust_engine.set_entry_freeze(True, reason_str)
+        with self._freeze_lock:
+            self._freeze_epoch += 1
+            self._monotonic_freeze_latched = True
+            self._monotonic_freeze_reason = reason_str
+            self._db_freeze_persisted = False
+            self._rust_engine.set_entry_freeze(True, reason_str)
         mutation = {
             "kind": "SET_ENTRY_FREEZE",
             "active": True,
@@ -1203,22 +1227,30 @@ class PostgresPlanGateBackend:
             return
 
         if self._async_writer is None:
-            self._monotonic_freeze_latched = False
-            self._monotonic_freeze_reason = ""
-            self._db_freeze_persisted = False
-            self._rust_engine.set_entry_freeze(False, str(reason))
-            self._rust_engine.set_backend_unavailable(False, "")
+            with self._freeze_lock:
+                self._freeze_epoch += 1
+                self._monotonic_freeze_latched = False
+                self._monotonic_freeze_reason = ""
+                self._db_freeze_persisted = False
+                self._rust_engine.set_entry_freeze(False, str(reason))
+                self._rust_engine.set_backend_unavailable(False, "")
             return
+
+        with self._freeze_lock:
+            freeze_epoch_before = self._freeze_epoch
 
         if self._async_writer.has_failed_writes or self._async_writer.pending_count > 0:
             self._async_writer.flush(
                 timeout_secs=min(float(self._connect_timeout_secs), 2.0)
             )
         if self._async_writer.has_failed_writes:
-            self._monotonic_freeze_latched = True
-            self._rust_engine.set_entry_freeze(
-                True, self._monotonic_freeze_reason or "ASYNC_DB_WRITER_FAILURE"
-            )
+            with self._freeze_lock:
+                self._freeze_epoch += 1
+                self._monotonic_freeze_latched = True
+                self._db_freeze_persisted = False
+                self._rust_engine.set_entry_freeze(
+                    True, self._monotonic_freeze_reason or "ASYNC_DB_WRITER_FAILURE"
+                )
             return
 
         self._async_writer.enqueue_mutations(
@@ -1235,12 +1267,24 @@ class PostgresPlanGateBackend:
             self._async_writer.flush(
                 timeout_secs=min(float(self._connect_timeout_secs), 2.0)
             )
-        if not self._async_writer.has_failed_writes:
-            self._monotonic_freeze_latched = False
-            self._monotonic_freeze_reason = ""
-            self._db_freeze_persisted = False
-            self._rust_engine.set_entry_freeze(False, str(reason))
-            self._rust_engine.set_backend_unavailable(False, "")
+        with self._freeze_lock:
+            if (
+                not self._async_writer.has_failed_writes
+                and self._freeze_epoch == freeze_epoch_before
+            ):
+                self._freeze_epoch += 1
+                self._monotonic_freeze_latched = False
+                self._monotonic_freeze_reason = ""
+                self._db_freeze_persisted = False
+                self._rust_engine.set_entry_freeze(False, str(reason))
+                self._rust_engine.set_backend_unavailable(False, "")
+            elif self._async_writer.has_failed_writes:
+                self._freeze_epoch += 1
+                self._monotonic_freeze_latched = True
+                self._db_freeze_persisted = False
+                self._rust_engine.set_entry_freeze(
+                    True, self._monotonic_freeze_reason or "ASYNC_DB_WRITER_FAILURE"
+                )
 
     def flush(self, timeout_secs: float = 5.0) -> None:
         """Waits for all queued asynchronous DB writes to complete."""
@@ -1249,7 +1293,28 @@ class PostgresPlanGateBackend:
             self._async_writer.flush(timeout_secs=timeout_secs)
 
     def close(self) -> None:
-        """Flushes pending writes and closes background DB and LISTEN connections."""
+        """Flushes pending writes and closes background DB, listener thread, pipe fds, and sockets."""
+        self._listen_stop_event.set()
+        wake_w = self._listen_wake_w
+        if wake_w is not None:
+            try:
+                os.write(wake_w, b"\x01")
+            except OSError:
+                pass
+        listen_thread = self._listen_thread
+        self._listen_thread = None
+        if listen_thread is not None and listen_thread.is_alive():
+            if threading.current_thread() is not listen_thread:
+                listen_thread.join(timeout=2.0)
+        for attr in ("_listen_wake_w", "_listen_wake_r"):
+            fd = getattr(self, attr, None)
+            setattr(self, attr, None)
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
         writer = self._async_writer
         if writer is not None:
             try:
@@ -1263,13 +1328,14 @@ class PostgresPlanGateBackend:
         self._async_writer = None
         self._db_worker = None
         self._oco_monitor = None
-        conn = self._listen_conn
-        self._listen_conn = None
-        if conn is not None:
-            try:
-                conn.close()
-            except Exception:
-                pass
+        for attr in ("_listen_conn", "_query_conn"):
+            conn = getattr(self, attr, None)
+            setattr(self, attr, None)
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
 
     def __del__(self) -> None:
         try:
@@ -1277,42 +1343,174 @@ class PostgresPlanGateBackend:
         except Exception:
             pass
 
+    def _open_listen_conn(self) -> Any:
+        conn = psycopg2.connect(
+            self._dsn,
+            cursor_factory=RealDictCursor,
+            connect_timeout=self._connect_timeout_secs,
+        )
+        conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""
+                LISTEN {NOTIFY_CHANNEL};
+                LISTEN nautilus_plan_locked;
+                LISTEN system_flags_changed;
+                """
+            )
+        return conn
+
+    @staticmethod
+    def _notify_listener_loop_weak(
+        backend_ref: weakref.ReferenceType["PostgresPlanGateBackend"],
+        stop_event: threading.Event,
+    ) -> None:
+        while not stop_event.is_set():
+            backend = backend_ref()
+            if backend is None:
+                break
+            conn = backend._listen_conn
+            if conn is None or getattr(conn, "closed", 1) != 0:
+                try:
+                    with backend._listen_poll_lock:
+                        conn = backend._open_listen_conn()
+                        backend._listen_conn = conn
+                    backend.sync_from_db(preserve_higher_reservation=True)
+                except Exception as exc:
+                    backend._rust_engine.set_backend_unavailable(
+                        True, f"PostgreSQL LISTEN connection failed ({exc})"
+                    )
+                    backend = None
+                    conn = None
+                    if stop_event.wait(1.0):
+                        break
+                    continue
+
+            r_fd = backend._listen_wake_r
+            wait_fds: List[Any] = [conn]
+            if r_fd is not None:
+                wait_fds.append(r_fd)
+            backend = None
+            try:
+                readable, _, _ = select.select(wait_fds, [], [], 5.0)
+            except Exception as exc:
+                wait_fds = []
+                conn = None
+                if stop_event.is_set():
+                    break
+                backend = backend_ref()
+                if backend is None:
+                    break
+                backend._rust_engine.set_backend_unavailable(
+                    True, f"PostgreSQL notification wait failed ({exc})"
+                )
+                with backend._listen_poll_lock:
+                    cur_conn = backend._listen_conn
+                    try:
+                        if cur_conn is not None:
+                            cur_conn.close()
+                    except Exception:
+                        pass
+                    backend._listen_conn = None
+                backend = None
+                if stop_event.wait(0.5):
+                    break
+                continue
+
+            if r_fd is not None and r_fd in readable:
+                try:
+                    os.read(r_fd, 1024)
+                except OSError:
+                    pass
+                if stop_event.is_set():
+                    wait_fds = []
+                    conn = None
+                    break
+
+            if conn in readable:
+                if stop_event.is_set():
+                    wait_fds = []
+                    conn = None
+                    break
+                backend = backend_ref()
+                if backend is None:
+                    wait_fds = []
+                    conn = None
+                    break
+                try:
+                    with backend._listen_poll_lock:
+                        conn.poll()
+                        had_notifies = bool(conn.notifies)
+                        conn.notifies.clear()
+                    if had_notifies and not stop_event.is_set():
+                        backend.sync_from_db(preserve_higher_reservation=True)
+                except Exception as exc:
+                    backend._rust_engine.set_backend_unavailable(
+                        True, f"PostgreSQL notification poll failed ({exc})"
+                    )
+                    with backend._listen_poll_lock:
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+                        backend._listen_conn = None
+                    backend = None
+                    wait_fds = []
+                    conn = None
+                    if stop_event.wait(0.5):
+                        break
+                    continue
+                backend = None
+            wait_fds = []
+            conn = None
+
+    def _notify_listener_loop(self) -> None:
+        self._notify_listener_loop_weak(weakref.ref(self), self._listen_stop_event)
+
+    def _start_notify_listener(self) -> None:
+        if not self._persist_to_db:
+            return
+        if self._listen_thread is not None and self._listen_thread.is_alive():
+            return
+        if self._listen_wake_r is None or self._listen_wake_w is None:
+            self._listen_wake_r, self._listen_wake_w = os.pipe()
+        self._listen_stop_event.clear()
+        thread = threading.Thread(
+            target=PostgresPlanGateBackend._notify_listener_loop_weak,
+            args=(weakref.ref(self), self._listen_stop_event),
+            name="plan-gate-notify-listener",
+            daemon=True,
+        )
+        self._listen_thread = thread
+        thread.start()
+
     def _initialize_sync_and_triggers(self) -> None:
         try:
-            conn = psycopg2.connect(
-                self._dsn,
-                cursor_factory=RealDictCursor,
-                connect_timeout=self._connect_timeout_secs,
-            )
-            conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
-            with conn.cursor() as cur:
-                cur.execute(
-                    f"""
-                    LISTEN {NOTIFY_CHANNEL};
-                    LISTEN nautilus_plan_locked;
-                    LISTEN system_flags_changed;
-                    """
-                )
-            self._listen_conn = conn
+            self._listen_conn = self._open_listen_conn()
             self.sync_from_db(preserve_higher_reservation=True)
         except Exception as exc:
             self._rust_engine.set_backend_unavailable(
                 True, f"PostgreSQL connection failed ({exc})"
             )
+        finally:
+            self._start_notify_listener()
 
     def _poll_notifications_nonblocking(self) -> None:
         if not self._persist_to_db:
+            return
+        if self._listen_thread is not None and self._listen_thread.is_alive():
             return
         conn = self._listen_conn
         if conn is None or getattr(conn, "closed", 1) != 0:
             return
         try:
-            readable, _, _ = select.select([conn], [], [], 0.0)
-            if not readable:
-                return
-            conn.poll()
-            had_notifies = bool(conn.notifies)
-            conn.notifies.clear()
+            with self._listen_poll_lock:
+                readable, _, _ = select.select([conn], [], [], 0.0)
+                if not readable:
+                    return
+                conn.poll()
+                had_notifies = bool(conn.notifies)
+                conn.notifies.clear()
             if had_notifies:
                 self.sync_from_db(preserve_higher_reservation=True)
         except Exception as exc:
@@ -1326,7 +1524,8 @@ class PostgresPlanGateBackend:
         """Synchronizes `system_flags.ENTRY_FREEZE` and locked `trading_plan_items` into `RustPlanGateEngine`."""
         if not self._persist_to_db or self._async_writer is None:
             return
-        with self._sync_lock:
+        with self._db_query_lock:
+            self.flush_rust_mutations(1024)
             if (
                 self._async_writer.has_failed_writes
                 or self._async_writer.pending_count > 0
@@ -1335,7 +1534,7 @@ class PostgresPlanGateBackend:
                     timeout_secs=min(float(self._connect_timeout_secs), 1.0)
                 )
 
-            conn = self._listen_conn
+            conn = self._query_conn
             if conn is None or getattr(conn, "closed", 1) != 0:
                 try:
                     conn = psycopg2.connect(
@@ -1344,32 +1543,26 @@ class PostgresPlanGateBackend:
                         connect_timeout=self._connect_timeout_secs,
                     )
                     conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
-                    with conn.cursor() as cur:
-                        cur.execute(
-                            f"""
-                            LISTEN {NOTIFY_CHANNEL};
-                            LISTEN nautilus_plan_locked;
-                            LISTEN system_flags_changed;
-                            """
-                        )
-                    self._listen_conn = conn
+                    self._query_conn = conn
                 except Exception as exc:
                     self._rust_engine.set_backend_unavailable(
                         True, f"PostgreSQL connection failed ({exc})"
                     )
                     return
 
-            effective_preserve = bool(
-                preserve_higher_reservation
-                or self._monotonic_freeze_latched
-                or self._async_writer.pending_count > 0
-                or self._async_writer.has_failed_or_pending_freeze
-            )
-            can_clear_before_query = (
-                not self._async_writer.has_failed_or_pending_freeze
-                and self._async_writer.pending_count == 0
-                and self._db_freeze_persisted
-            )
+            with self._freeze_lock:
+                freeze_epoch_before = self._freeze_epoch
+                effective_preserve = bool(
+                    preserve_higher_reservation
+                    or self._monotonic_freeze_latched
+                    or self._async_writer.pending_count > 0
+                    or self._async_writer.has_failed_or_pending_freeze
+                )
+                can_clear_before_query = (
+                    not self._async_writer.has_failed_or_pending_freeze
+                    and self._async_writer.pending_count == 0
+                    and self._db_freeze_persisted
+                )
 
             try:
                 with conn.cursor() as cur:
@@ -1384,98 +1577,121 @@ class PostgresPlanGateBackend:
                     db_freeze_active = bool(flag_row["active"]) if flag_row else False
                     db_freeze_reason = str(flag_row["reason"] or "") if flag_row else ""
 
-                    if db_freeze_active:
-                        self._monotonic_freeze_latched = True
-                        self._monotonic_freeze_reason = (
-                            db_freeze_reason
-                            or self._monotonic_freeze_reason
-                            or "ENTRY_FREEZE"
+                    need_persist_latch = False
+                    reason_to_persist = ""
+                    with self._freeze_lock:
+                        writer_freeze_pending = bool(
+                            self._async_writer.has_failed_or_pending_freeze
                         )
-                        self._db_freeze_persisted = True
-                        self._rust_engine.set_entry_freeze(
-                            True, self._monotonic_freeze_reason
-                        )
-                    elif self._monotonic_freeze_latched:
-                        can_clear_latch = (
-                            can_clear_before_query
-                            and not self._async_writer.has_failed_or_pending_freeze
-                            and self._async_writer.pending_count == 0
-                            and self._db_freeze_persisted
-                        )
-                        if can_clear_latch:
-                            self._monotonic_freeze_latched = False
-                            self._monotonic_freeze_reason = ""
-                            self._db_freeze_persisted = False
-                            self._rust_engine.set_entry_freeze(False, "")
-                        else:
-                            reason_to_keep = (
-                                self._monotonic_freeze_reason or "ENTRY_FREEZE"
+                        if db_freeze_active or writer_freeze_pending:
+                            self._monotonic_freeze_latched = True
+                            self._monotonic_freeze_reason = (
+                                db_freeze_reason
+                                or self._monotonic_freeze_reason
+                                or "ENTRY_FREEZE"
                             )
-                            self._rust_engine.set_entry_freeze(True, reason_to_keep)
-                            if not self._db_freeze_persisted:
-                                cur.execute(
-                                    """
-                                    INSERT INTO system_flags (
-                                        flag, active, reason, set_by, updated_at
-                                    ) VALUES (
-                                        'ENTRY_FREEZE', TRUE, %s, 'nautilus:plan_gate:monotonic_latch', NOW()
-                                    )
-                                    ON CONFLICT (flag) DO UPDATE SET
-                                        active = TRUE,
-                                        reason = EXCLUDED.reason,
-                                        set_by = EXCLUDED.set_by,
-                                        updated_at = NOW()
-                                    """,
-                                    (reason_to_keep,),
+                            self._db_freeze_persisted = bool(db_freeze_active)
+                            self._rust_engine.set_entry_freeze(
+                                True, self._monotonic_freeze_reason
+                            )
+                            if not db_freeze_active:
+                                need_persist_latch = True
+                                reason_to_persist = self._monotonic_freeze_reason
+                        elif self._monotonic_freeze_latched:
+                            can_clear_latch = (
+                                self._freeze_epoch == freeze_epoch_before
+                                and can_clear_before_query
+                                and not self._async_writer.has_failed_or_pending_freeze
+                                and self._async_writer.pending_count == 0
+                                and self._db_freeze_persisted
+                            )
+                            if can_clear_latch:
+                                self._freeze_epoch += 1
+                                self._monotonic_freeze_latched = False
+                                self._monotonic_freeze_reason = ""
+                                self._db_freeze_persisted = False
+                                self._rust_engine.set_entry_freeze(False, "")
+                            else:
+                                reason_to_keep = (
+                                    self._monotonic_freeze_reason or "ENTRY_FREEZE"
                                 )
-                                cur.execute(
-                                    """
-                                    INSERT INTO system_flag_events (
-                                        flag, active, reason, set_by, ts
-                                    ) VALUES (
-                                        'ENTRY_FREEZE', TRUE, %s, 'nautilus:plan_gate:monotonic_latch', NOW()
-                                    )
-                                    """,
-                                    (reason_to_keep,),
-                                )
-                                cur.execute(
-                                    """
-                                    INSERT INTO alert_outbox (
-                                        event_type, severity, source, title, body, payload, dedup_key, status
-                                    ) VALUES (
-                                        'PLAN_GATE_ENTRY_FREEZE',
-                                        'CRITICAL',
-                                        'nautilus:plan_gate:monotonic_latch',
-                                        'PlanGate monotonic ENTRY_FREEZE latch persisted',
-                                        %s,
-                                        %s::jsonb,
-                                        %s,
-                                        'PENDING'
-                                    )
-                                    """,
-                                    (
-                                        reason_to_keep,
-                                        json.dumps(
-                                            {
-                                                "flag": "ENTRY_FREEZE",
-                                                "active": True,
-                                                "reason": reason_to_keep,
-                                            }
-                                        ),
-                                        f"plan_gate_latch:{reason_to_keep[:64]}",
-                                    ),
-                                )
-                                self._db_freeze_persisted = True
-                    else:
-                        self._rust_engine.set_entry_freeze(False, "")
+                                self._rust_engine.set_entry_freeze(True, reason_to_keep)
+                                if not self._db_freeze_persisted:
+                                    need_persist_latch = True
+                                    reason_to_persist = reason_to_keep
+                        elif (
+                            self._freeze_epoch == freeze_epoch_before
+                            and not self._async_writer.has_failed_or_pending_freeze
+                        ):
+                            self._rust_engine.set_entry_freeze(False, "")
 
-                    if not self._async_writer.has_failed_writes:
-                        self._rust_engine.set_backend_unavailable(False, "")
-                    else:
-                        self._rust_engine.set_backend_unavailable(
-                            True,
-                            f"ENTRY_FREEZE_ACTIVE: {self._monotonic_freeze_reason or 'ASYNC_DB_WRITER_FAILURE'}",
+                    if need_persist_latch:
+                        cur.execute(
+                            """
+                            INSERT INTO system_flags (
+                                flag, active, reason, set_by, updated_at
+                            ) VALUES (
+                                'ENTRY_FREEZE', TRUE, %s, 'nautilus:plan_gate:monotonic_latch', NOW()
+                            )
+                            ON CONFLICT (flag) DO UPDATE SET
+                                active = TRUE,
+                                reason = EXCLUDED.reason,
+                                set_by = EXCLUDED.set_by,
+                                updated_at = NOW()
+                            """,
+                            (reason_to_persist,),
                         )
+                        cur.execute(
+                            """
+                            INSERT INTO system_flag_events (
+                                flag, active, reason, set_by, ts
+                            ) VALUES (
+                                'ENTRY_FREEZE', TRUE, %s, 'nautilus:plan_gate:monotonic_latch', NOW()
+                            )
+                            """,
+                            (reason_to_persist,),
+                        )
+                        cur.execute(
+                            """
+                            INSERT INTO alert_outbox (
+                                event_type, severity, source, title, body, payload, dedup_key, status
+                            ) VALUES (
+                                'PLAN_GATE_ENTRY_FREEZE',
+                                'CRITICAL',
+                                'nautilus:plan_gate:monotonic_latch',
+                                'PlanGate monotonic ENTRY_FREEZE latch persisted',
+                                %s,
+                                %s::jsonb,
+                                %s,
+                                'PENDING'
+                            )
+                            """,
+                            (
+                                reason_to_persist,
+                                json.dumps(
+                                    {
+                                        "flag": "ENTRY_FREEZE",
+                                        "active": True,
+                                        "reason": reason_to_persist,
+                                    }
+                                ),
+                                f"plan_gate_latch:{reason_to_persist[:64]}",
+                            ),
+                        )
+                        with self._freeze_lock:
+                            if self._monotonic_freeze_latched:
+                                self._db_freeze_persisted = True
+
+                    with self._freeze_lock:
+                        if not self._async_writer.has_failed_writes and not self._monotonic_freeze_latched:
+                            self._rust_engine.set_backend_unavailable(False, "")
+                        elif self._async_writer.has_failed_writes:
+                            self._rust_engine.set_backend_unavailable(
+                                True,
+                                f"ENTRY_FREEZE_ACTIVE: {self._monotonic_freeze_reason or 'ASYNC_DB_WRITER_FAILURE'}",
+                            )
+                        else:
+                            self._rust_engine.set_backend_unavailable(False, "")
 
                     if self._trading_date is not None:
                         cur.execute(
@@ -1503,154 +1719,192 @@ class PostgresPlanGateBackend:
                             (self._market,),
                         )
                     rows = cur.fetchall() or []
-                    prev_reserved: Dict[str, Decimal] = {}
-                    if effective_preserve:
-                        for sym in list(self._known_symbols):
-                            prev_reserved[sym] = Decimal(
-                                self._rust_engine.reserved_qty(sym)
+                    with self._sync_lock:
+                        late_pending = self._drain_rust_mutations(1024)
+                        if late_pending:
+                            self._mirror_rust_mutations_to_python_items(late_pending)
+                            self._alerts.extend(late_pending)
+                            if self._async_writer is not None:
+                                self._async_writer.enqueue_mutations(late_pending)
+                        with self._freeze_lock:
+                            effective_preserve = bool(
+                                effective_preserve
+                                or bool(late_pending)
+                                or self._monotonic_freeze_latched
+                                or self._async_writer.pending_count > 0
+                                or self._async_writer.has_failed_or_pending_freeze
                             )
+                        prev_reserved: Dict[str, Decimal] = {}
+                        if effective_preserve:
+                            for sym in list(self._known_symbols):
+                                prev_reserved[sym] = Decimal(
+                                    self._rust_engine.reserved_qty(sym)
+                                )
+                            for sym in list(self._runtime_items_by_symbol.keys()):
+                                if sym not in prev_reserved:
+                                    prev_reserved[sym] = Decimal(
+                                        self._rust_engine.reserved_qty(sym)
+                                    )
+                            for row in rows:
+                                row_sym = str(row.get("symbol") or "").strip().upper()
+                                if row_sym and row_sym not in prev_reserved:
+                                    prev_reserved[row_sym] = Decimal(
+                                        self._rust_engine.reserved_qty(row_sym)
+                                    )
+                        prior_known_symbols = set(self._known_symbols)
+                        self._known_symbols.clear()
+                        self._symbol_by_item_id.clear()
+                        self._items_by_symbol.clear()
+                        loaded_by_symbol: Dict[str, Tuple[PlanItemContract, bool]] = {}
                         for row in rows:
-                            row_sym = str(row.get("symbol") or "").strip().upper()
-                            if row_sym and row_sym not in prev_reserved:
-                                prev_reserved[row_sym] = Decimal(
-                                    self._rust_engine.reserved_qty(row_sym)
-                                )
-                    prior_known_symbols = set(self._known_symbols)
-                    if not effective_preserve:
-                        self._rust_engine.clear_plan_items()
-                    self._known_symbols.clear()
-                    self._symbol_by_item_id.clear()
-                    self._items_by_symbol.clear()
-                    loaded_by_symbol: Dict[str, PlanItemContract] = {}
-                    for row in rows:
-                        try:
-                            plan_item = PlanItemContract.from_db_row(row)
-                            norm_sym = plan_item.symbol
-                            if norm_sym in self._removed_runtime_symbols:
-                                continue
-                            released_cap = self._released_cap_by_symbol.get(norm_sym)
-                            if released_cap is not None:
-                                capped_qty = min(plan_item.filled_qty, released_cap)
-                                capped_status = (
-                                    "ARMED"
-                                    if capped_qty == Decimal("0")
-                                    and str(plan_item.status) == "TRIGGERED"
-                                    else plan_item.status
-                                )
-                                plan_item = replace(
-                                    plan_item,
-                                    filled_qty=capped_qty,
-                                    status=capped_status,
-                                )
-                                item_preserve = False
-                            elif effective_preserve:
-                                prior_reserved = prev_reserved.get(
-                                    norm_sym, Decimal("0")
-                                )
-                                if prior_reserved > plan_item.filled_qty:
+                            try:
+                                plan_item = PlanItemContract.from_db_row(row)
+                                norm_sym = plan_item.symbol
+                                if norm_sym in self._removed_runtime_symbols:
+                                    continue
+                                released_cap = self._released_cap_by_symbol.get(norm_sym)
+                                if released_cap is not None:
+                                    capped_qty = min(plan_item.filled_qty, released_cap)
+                                    capped_status = (
+                                        "ARMED"
+                                        if capped_qty == Decimal("0")
+                                        and str(plan_item.status) == "TRIGGERED"
+                                        else plan_item.status
+                                    )
                                     plan_item = replace(
                                         plan_item,
-                                        filled_qty=prior_reserved,
+                                        filled_qty=capped_qty,
+                                        status=capped_status,
                                     )
-                                item_preserve = True
-                            else:
-                                item_preserve = False
-                            self._rust_engine.upsert_plan_item(
-                                _plan_item_to_rust_envelope(plan_item),
-                                item_preserve,
-                            )
-                            self._known_symbols.add(norm_sym)
-                            self._symbol_by_item_id[str(plan_item.item_id)] = norm_sym
-                            self._items_by_symbol[norm_sym] = plan_item
-                            loaded_by_symbol[norm_sym] = plan_item
-                        except Exception as item_exc:
-                            logger.warning(
-                                "Skipping invalid PlanItemContract row: %s", item_exc
-                            )
-                    for norm_sym, (runtime_item, runtime_reserved) in list(
-                        self._runtime_items_by_symbol.items()
-                    ):
-                        prior_res = prev_reserved.get(norm_sym, Decimal("0"))
-                        released_cap = self._released_cap_by_symbol.get(norm_sym)
-                        if norm_sym in loaded_by_symbol:
-                            db_item = loaded_by_symbol[norm_sym]
-                            db_stop = db_item.risk_envelope.initial_stop_price
-                            rt_stop = runtime_item.risk_envelope.initial_stop_price
-                            if db_item.risk_envelope.side == PlanSide.LONG:
-                                merged_stop = max(db_stop, rt_stop)
-                            else:
-                                if db_stop > Decimal("0") and rt_stop > Decimal("0"):
-                                    merged_stop = min(db_stop, rt_stop)
+                                    item_preserve = False
+                                elif effective_preserve:
+                                    prior_reserved = prev_reserved.get(
+                                        norm_sym, Decimal("0")
+                                    )
+                                    if prior_reserved > plan_item.filled_qty:
+                                        plan_item = replace(
+                                            plan_item,
+                                            filled_qty=prior_reserved,
+                                        )
+                                    item_preserve = True
                                 else:
-                                    merged_stop = max(db_stop, rt_stop)
-                            merged_env = (
-                                replace(
-                                    db_item.risk_envelope,
-                                    initial_stop_price=merged_stop,
+                                    item_preserve = False
+                                loaded_by_symbol[norm_sym] = (plan_item, item_preserve)
+                            except Exception as item_exc:
+                                logger.warning(
+                                    "Skipping invalid PlanItemContract row: %s", item_exc
                                 )
-                                if merged_stop != db_stop
-                                else db_item.risk_envelope
-                            )
-                            rt_res = (
-                                runtime_reserved
-                                if runtime_reserved is not None
-                                else Decimal("0")
-                            )
-                            effective_res = (
-                                max(prior_res, db_item.filled_qty, rt_res)
-                                if effective_preserve
-                                else max(db_item.filled_qty, rt_res)
-                            )
-                            if released_cap is not None:
-                                effective_res = min(effective_res, released_cap)
-                            merged_status = (
-                                "ARMED"
-                                if effective_res == Decimal("0")
-                                and str(db_item.status) == "TRIGGERED"
-                                else db_item.status
-                            )
-                            overlaid_item = replace(
-                                db_item,
-                                risk_envelope=merged_env,
-                                filled_qty=effective_res,
-                                status=merged_status,
-                            )
-                            self._runtime_items_by_symbol[norm_sym] = (
-                                overlaid_item,
-                                effective_res,
-                            )
-                        else:
-                            effective_res = (
-                                max(prior_res, runtime_reserved)
-                                if (effective_preserve and runtime_reserved is not None)
-                                else (
+
+                        final_upserts: Dict[str, Tuple[PlanItemContract, bool]] = {}
+                        for norm_sym, (runtime_item, runtime_reserved) in list(
+                            self._runtime_items_by_symbol.items()
+                        ):
+                            prior_res = prev_reserved.get(norm_sym, Decimal("0"))
+                            released_cap = self._released_cap_by_symbol.get(norm_sym)
+                            if norm_sym in loaded_by_symbol:
+                                db_item, _ = loaded_by_symbol.pop(norm_sym)
+                                db_stop = db_item.risk_envelope.initial_stop_price
+                                rt_stop = runtime_item.risk_envelope.initial_stop_price
+                                if db_item.risk_envelope.side == PlanSide.LONG:
+                                    merged_stop = max(db_stop, rt_stop)
+                                else:
+                                    if db_stop > Decimal("0") and rt_stop > Decimal("0"):
+                                        merged_stop = min(db_stop, rt_stop)
+                                    else:
+                                        merged_stop = max(db_stop, rt_stop)
+                                merged_qty_cap = min(
+                                    db_item.risk_envelope.approved_qty_cap,
+                                    runtime_item.risk_envelope.approved_qty_cap,
+                                )
+                                merged_env = (
+                                    replace(
+                                        db_item.risk_envelope,
+                                        initial_stop_price=merged_stop,
+                                        approved_qty_cap=merged_qty_cap,
+                                    )
+                                    if (
+                                        merged_stop != db_stop
+                                        or merged_qty_cap
+                                        != db_item.risk_envelope.approved_qty_cap
+                                    )
+                                    else db_item.risk_envelope
+                                )
+                                rt_res = (
                                     runtime_reserved
                                     if runtime_reserved is not None
-                                    else max(prior_res, runtime_item.filled_qty)
+                                    else Decimal("0")
                                 )
-                            )
-                            if released_cap is not None:
-                                effective_res = min(effective_res, released_cap)
-                            merged_status = (
-                                "ARMED"
-                                if effective_res == Decimal("0")
-                                and str(runtime_item.status) == "TRIGGERED"
-                                else runtime_item.status
-                            )
-                            overlaid_item = replace(
-                                runtime_item,
-                                filled_qty=effective_res,
-                                status=merged_status,
-                            )
-                        self._rust_engine.upsert_plan_item(
-                            _plan_item_to_rust_envelope(overlaid_item),
-                            False,
-                        )
-                        self._known_symbols.add(norm_sym)
-                        self._symbol_by_item_id[str(overlaid_item.item_id)] = norm_sym
-                        self._items_by_symbol[norm_sym] = overlaid_item
+                                effective_res = (
+                                    max(prior_res, db_item.filled_qty, rt_res)
+                                    if effective_preserve
+                                    else max(db_item.filled_qty, rt_res)
+                                )
+                                if released_cap is not None:
+                                    effective_res = min(effective_res, released_cap)
+                                rt_status = str(runtime_item.status or "").strip().upper()
+                                if rt_status in ("EXPIRED", "CANCELLED", "CLOSED"):
+                                    merged_status = rt_status
+                                elif effective_res == Decimal("0") and str(db_item.status) == "TRIGGERED":
+                                    merged_status = "ARMED"
+                                else:
+                                    merged_status = db_item.status
+                                overlaid_item = replace(
+                                    db_item,
+                                    risk_envelope=merged_env,
+                                    filled_qty=effective_res,
+                                    status=merged_status,
+                                )
+                                self._runtime_items_by_symbol[norm_sym] = (
+                                    overlaid_item,
+                                    effective_res,
+                                )
+                            else:
+                                effective_res = (
+                                    max(prior_res, runtime_reserved)
+                                    if (effective_preserve and runtime_reserved is not None)
+                                    else (
+                                        runtime_reserved
+                                        if runtime_reserved is not None
+                                        else max(prior_res, runtime_item.filled_qty)
+                                    )
+                                )
+                                if released_cap is not None:
+                                    effective_res = min(effective_res, released_cap)
+                                merged_status = (
+                                    "ARMED"
+                                    if effective_res == Decimal("0")
+                                    and str(runtime_item.status) == "TRIGGERED"
+                                    else runtime_item.status
+                                )
+                                overlaid_item = replace(
+                                    runtime_item,
+                                    filled_qty=effective_res,
+                                    status=merged_status,
+                                )
+                            overlay_preserve = bool(effective_preserve and released_cap is None)
+                            final_upserts[norm_sym] = (overlaid_item, overlay_preserve)
 
-                    if effective_preserve:
+                        for norm_sym, (plan_item, item_preserve) in loaded_by_symbol.items():
+                            final_upserts[norm_sym] = (plan_item, item_preserve)
+
+                        for norm_sym, (final_item, final_preserve) in final_upserts.items():
+                            self._rust_engine.upsert_plan_item(
+                                _plan_item_to_rust_envelope(final_item),
+                                final_preserve,
+                            )
+                            if final_preserve:
+                                rust_res = Decimal(self._rust_engine.reserved_qty(norm_sym))
+                                if rust_res > final_item.filled_qty:
+                                    final_item = replace(final_item, filled_qty=rust_res)
+                                    if norm_sym in self._runtime_items_by_symbol:
+                                        self._runtime_items_by_symbol[norm_sym] = (
+                                            final_item,
+                                            rust_res,
+                                        )
+                            self._known_symbols.add(norm_sym)
+                            self._symbol_by_item_id[str(final_item.item_id)] = norm_sym
+                            self._items_by_symbol[norm_sym] = final_item
+
                         for stale_sym in prior_known_symbols - self._known_symbols:
                             self._rust_engine.remove_plan_item(stale_sym)
 
@@ -1956,65 +2210,67 @@ class PostgresPlanGateBackend:
         if qty_dec <= Decimal("0"):
             return
         self._poll_notifications_nonblocking()
-        resolved_symbol = str(symbol or "").strip().upper()
-        if not resolved_symbol and item_id is not None:
-            resolved_symbol = self._symbol_by_item_id.get(str(item_id), "")
-        if not resolved_symbol:
-            return
-        locked_syms: set[str] = getattr(self, "_closed_cycle_locked_symbols", set())
-        was_cycle_locked = resolved_symbol in locked_syms
-        prior_locked_qty = Decimal("0")
-        if was_cycle_locked and resolved_symbol in self._items_by_symbol:
-            cur_item_pre = self._items_by_symbol[resolved_symbol]
-            prior_locked_qty = max(
-                self.reserved_qty(resolved_symbol),
-                cur_item_pre.risk_envelope.approved_qty_cap,
+        pending: List[Dict[str, Any]] = []
+        with self._sync_lock:
+            resolved_symbol = str(symbol or "").strip().upper()
+            if not resolved_symbol and item_id is not None:
+                resolved_symbol = self._symbol_by_item_id.get(str(item_id), "")
+            if not resolved_symbol:
+                return
+            locked_syms: set[str] = getattr(self, "_closed_cycle_locked_symbols", set())
+            was_cycle_locked = resolved_symbol in locked_syms
+            prior_locked_qty = Decimal("0")
+            if was_cycle_locked and resolved_symbol in self._items_by_symbol:
+                cur_item_pre = self._items_by_symbol[resolved_symbol]
+                prior_locked_qty = max(
+                    self.reserved_qty(resolved_symbol),
+                    cur_item_pre.risk_envelope.approved_qty_cap,
+                )
+                self._rust_engine.upsert_plan_item(
+                    _plan_item_to_rust_envelope(cur_item_pre),
+                    False,
+                )
+                self._rust_engine.drain_pending_mutations(64)
+            new_res = Decimal(
+                str(self._rust_engine.release_reservation(resolved_symbol, str(qty_dec)))
             )
-            self._rust_engine.upsert_plan_item(
-                _plan_item_to_rust_envelope(cur_item_pre),
-                False,
-            )
-            self._rust_engine.drain_pending_mutations(64)
-        new_res = Decimal(
-            str(self._rust_engine.release_reservation(resolved_symbol, str(qty_dec)))
-        )
-        self._released_cap_by_symbol[resolved_symbol] = new_res
-        if resolved_symbol in self._items_by_symbol:
-            cur_item = self._items_by_symbol[resolved_symbol]
-            reverted_status = (
-                "ARMED"
-                if new_res == Decimal("0") and str(cur_item.status) == "TRIGGERED"
-                else cur_item.status
-            )
-            self._items_by_symbol[resolved_symbol] = replace(
-                cur_item, filled_qty=new_res, status=reverted_status
-            )
-        if resolved_symbol in self._runtime_items_by_symbol:
-            rt_item, _ = self._runtime_items_by_symbol[resolved_symbol]
-            reverted_status = (
-                "ARMED"
-                if new_res == Decimal("0") and str(rt_item.status) == "TRIGGERED"
-                else rt_item.status
-            )
-            self._runtime_items_by_symbol[resolved_symbol] = (
-                replace(rt_item, filled_qty=new_res, status=reverted_status),
-                prior_locked_qty if was_cycle_locked else new_res,
-            )
-        pending = self._drain_rust_mutations(64)
-        if was_cycle_locked and resolved_symbol in self._items_by_symbol:
-            cur_item_post = self._items_by_symbol[resolved_symbol]
-            relock_qty = max(
-                prior_locked_qty,
-                new_res,
-                cur_item_post.risk_envelope.approved_qty_cap,
-            )
-            self._rust_engine.upsert_plan_item(
-                _plan_item_to_rust_envelope(
-                    replace(cur_item_post, filled_qty=relock_qty)
-                ),
-                True,
-            )
-            self._rust_engine.drain_pending_mutations(64)
+            self._released_cap_by_symbol[resolved_symbol] = new_res
+            if resolved_symbol in self._items_by_symbol:
+                cur_item = self._items_by_symbol[resolved_symbol]
+                reverted_status = (
+                    "ARMED"
+                    if new_res == Decimal("0") and str(cur_item.status) == "TRIGGERED"
+                    else cur_item.status
+                )
+                self._items_by_symbol[resolved_symbol] = replace(
+                    cur_item, filled_qty=new_res, status=reverted_status
+                )
+            if resolved_symbol in self._runtime_items_by_symbol:
+                rt_item, _ = self._runtime_items_by_symbol[resolved_symbol]
+                reverted_status = (
+                    "ARMED"
+                    if new_res == Decimal("0") and str(rt_item.status) == "TRIGGERED"
+                    else rt_item.status
+                )
+                self._runtime_items_by_symbol[resolved_symbol] = (
+                    replace(rt_item, filled_qty=new_res, status=reverted_status),
+                    prior_locked_qty if was_cycle_locked else new_res,
+                )
+            pending = self._drain_rust_mutations(64)
+            if was_cycle_locked and resolved_symbol in self._items_by_symbol:
+                cur_item_post = self._items_by_symbol[resolved_symbol]
+                relock_qty = max(
+                    prior_locked_qty,
+                    new_res,
+                    cur_item_post.risk_envelope.approved_qty_cap,
+                )
+                self._rust_engine.upsert_plan_item(
+                    _plan_item_to_rust_envelope(
+                        replace(cur_item_post, filled_qty=relock_qty)
+                    ),
+                    True,
+                )
+                self._rust_engine.drain_pending_mutations(64)
         if pending:
             self._alerts.extend(pending)
             if self._async_writer is not None:
@@ -2031,56 +2287,57 @@ class PostgresPlanGateBackend:
         """Releases closed-cycle entry reservation in multi-cycle backtest mode; locks single-cycle quota in live mode."""
         raw_sym = str(symbol or "").strip()
         norm_sym = raw_sym.split(".", 1)[0].strip().upper()
-        if norm_sym not in self._items_by_symbol and item_id is not None:
-            norm_sym = self._symbol_by_item_id.get(str(item_id), norm_sym)
-        if norm_sym not in self._items_by_symbol:
-            norm_sym = self._symbol_by_item_id.get(raw_sym, norm_sym)
-        item = self._items_by_symbol.get(norm_sym)
-        if item is None:
-            return
-        if not self._allow_multi_cycle_reentry:
-            if not hasattr(self, "_closed_cycle_locked_symbols"):
-                self._closed_cycle_locked_symbols: set[str] = set()
-            self._closed_cycle_locked_symbols.add(norm_sym)
-            locked_qty = max(
-                self.reserved_qty(norm_sym),
-                item.filled_qty,
-                item.risk_envelope.approved_qty_cap,
+        with self._sync_lock:
+            if norm_sym not in self._items_by_symbol and item_id is not None:
+                norm_sym = self._symbol_by_item_id.get(str(item_id), norm_sym)
+            if norm_sym not in self._items_by_symbol:
+                norm_sym = self._symbol_by_item_id.get(raw_sym, norm_sym)
+            item = self._items_by_symbol.get(norm_sym)
+            if item is None:
+                return
+            if not self._allow_multi_cycle_reentry:
+                if not hasattr(self, "_closed_cycle_locked_symbols"):
+                    self._closed_cycle_locked_symbols: set[str] = set()
+                self._closed_cycle_locked_symbols.add(norm_sym)
+                locked_qty = max(
+                    self.reserved_qty(norm_sym),
+                    item.filled_qty,
+                    item.risk_envelope.approved_qty_cap,
+                )
+                self.upsert_runtime_plan_item(
+                    item,
+                    reserved_qty=locked_qty,
+                    preserve_higher_reservation=True,
+                )
+                self._items_by_symbol[norm_sym] = item
+                self._rust_engine.drain_pending_mutations(64)
+                return
+
+            cur_res = self.reserved_qty(norm_sym)
+            if cur_res > Decimal("0"):
+                self._rust_engine.release_reservation(norm_sym, str(cur_res))
+                self._rust_engine.drain_pending_mutations(64)
+            orig_baseline = self._baseline_items_by_symbol.get(norm_sym, item)
+            cycle_idx = self._reentry_cycle_counts.get(norm_sym, 0) + 1
+            self._reentry_cycle_counts[norm_sym] = cycle_idx
+            next_item_id = uuid5(orig_baseline.item_id, f"reentry-cycle-{cycle_idx}")
+            self._symbol_by_item_id.pop(str(item.item_id), None)
+            reverted_status = "ARMED" if str(item.status) == "TRIGGERED" else item.status
+            reset_item = replace(
+                item,
+                item_id=next_item_id,
+                filled_qty=Decimal("0"),
+                status=reverted_status,
             )
             self.upsert_runtime_plan_item(
-                item,
-                reserved_qty=locked_qty,
-                preserve_higher_reservation=True,
+                reset_item,
+                reserved_qty=Decimal("0"),
+                preserve_higher_reservation=False,
             )
-            self._items_by_symbol[norm_sym] = item
+            self._baseline_items_by_symbol[norm_sym] = replace(
+                orig_baseline,
+                item_id=next_item_id,
+                filled_qty=Decimal("0"),
+                status=reverted_status,
+            )
             self._rust_engine.drain_pending_mutations(64)
-            return
-
-        cur_res = self.reserved_qty(norm_sym)
-        if cur_res > Decimal("0"):
-            self._rust_engine.release_reservation(norm_sym, str(cur_res))
-            self._rust_engine.drain_pending_mutations(64)
-        orig_baseline = self._baseline_items_by_symbol.get(norm_sym, item)
-        cycle_idx = self._reentry_cycle_counts.get(norm_sym, 0) + 1
-        self._reentry_cycle_counts[norm_sym] = cycle_idx
-        next_item_id = uuid5(orig_baseline.item_id, f"reentry-cycle-{cycle_idx}")
-        self._symbol_by_item_id.pop(str(item.item_id), None)
-        reverted_status = "ARMED" if str(item.status) == "TRIGGERED" else item.status
-        reset_item = replace(
-            item,
-            item_id=next_item_id,
-            filled_qty=Decimal("0"),
-            status=reverted_status,
-        )
-        self.upsert_runtime_plan_item(
-            reset_item,
-            reserved_qty=Decimal("0"),
-            preserve_higher_reservation=False,
-        )
-        self._baseline_items_by_symbol[norm_sym] = replace(
-            orig_baseline,
-            item_id=next_item_id,
-            filled_qty=Decimal("0"),
-            status=reverted_status,
-        )
-        self._rust_engine.drain_pending_mutations(64)

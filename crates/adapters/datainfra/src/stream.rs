@@ -40,7 +40,8 @@ use crate::{
     },
     error::{DataInfraError, DataInfraResult},
     mapping::{
-        DataInfraTimeframe, parse_datainfra_bar_type, timeframe_step_ns, to_instrument_id,
+        DataInfraTimeframe, compute_rth_bar_close_ns, parse_datainfra_bar_type,
+        to_instrument_id,
     },
 };
 
@@ -144,11 +145,7 @@ impl CanonicalBarWire {
     ) -> DataInfraResult<Bar> {
         let bar_type = parse_datainfra_bar_type(&self.symbol, venue, &self.timeframe)?;
         let bar_open_ns = normalize_epoch_to_unix_nanos(self.bar_ts, "bar_ts")?;
-        let ts_event = UnixNanos::from(
-            bar_open_ns
-                .as_u64()
-                .saturating_add(timeframe_step_ns(&bar_type)),
-        );
+        let ts_event = UnixNanos::from(compute_rth_bar_close_ns(&bar_type, bar_open_ns.as_u64()));
         let ts_init = if self.ingest_ts_ms > 0 {
             let init_ns = normalize_epoch_to_unix_nanos(self.ingest_ts_ms, "ingest_ts_ms")?;
             ts_event.max(init_ns)

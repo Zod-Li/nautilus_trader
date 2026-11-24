@@ -272,18 +272,21 @@ pub fn bar_type_step_ns(bar_type: &BarType) -> u64 {
 }
 
 /// Returns `true` if `date` is a scheduled NYSE 13:00 ET early-close half-day
-/// (Day after Thanksgiving, July 3 when Mon-Fri, or Dec 24 when Mon-Fri).
+/// (Day after Thanksgiving, July 3 when Mon-Thu, or Dec 24 when Mon-Thu).
 #[must_use]
 pub fn is_nyse_early_close_date(date: jiff::civil::Date) -> bool {
-    let is_weekday = !matches!(
+    let is_mon_to_thu = matches!(
         date.weekday(),
-        jiff::civil::Weekday::Saturday | jiff::civil::Weekday::Sunday
+        jiff::civil::Weekday::Monday
+            | jiff::civil::Weekday::Tuesday
+            | jiff::civil::Weekday::Wednesday
+            | jiff::civil::Weekday::Thursday
     );
     let is_black_friday = date.month() == 11
         && date.weekday() == jiff::civil::Weekday::Friday
         && (23..=29).contains(&date.day());
-    let is_july_3_early = date.month() == 7 && date.day() == 3 && is_weekday;
-    let is_dec_24_early = date.month() == 12 && date.day() == 24 && is_weekday;
+    let is_july_3_early = date.month() == 7 && date.day() == 3 && is_mon_to_thu;
+    let is_dec_24_early = date.month() == 12 && date.day() == 24 && is_mon_to_thu;
     is_black_friday || is_july_3_early || is_dec_24_early
 }
 
@@ -313,6 +316,28 @@ pub fn rth_day_bounds_ns(bar_open_ns: u64) -> Option<(u64, u64)> {
 #[must_use]
 pub fn compute_rth_bar_close_ns(bar_type: &BarType, bar_open_ns: u64) -> u64 {
     let step_ns = timeframe_step_ns(bar_type);
+    if step_ns == 86_400_000_000_000
+        && let Ok(ts) = jiff::Timestamp::from_nanosecond(i128::from(bar_open_ns))
+    {
+        let ny_d = if bar_open_ns.is_multiple_of(86_400_000_000_000) {
+            ts.to_zoned(jiff::tz::TimeZone::UTC).date()
+        } else {
+            ts.in_tz("America/New_York")
+                .map(|z| z.date())
+                .unwrap_or_else(|_| ts.to_zoned(jiff::tz::TimeZone::UTC).date())
+        };
+        let close_hour = if is_nyse_early_close_date(ny_d) {
+            13
+        } else {
+            16
+        };
+        if let Ok(close_zoned) = ny_d.at(close_hour, 0, 0, 0).in_tz("America/New_York")
+            && let Ok(close_ns) = u64::try_from(close_zoned.timestamp().as_nanosecond())
+            && close_ns > bar_open_ns
+        {
+            return close_ns;
+        }
+    }
     let natural_close_ns = bar_open_ns.saturating_add(step_ns);
     if (3_600_000_000_000..=86_400_000_000_000).contains(&step_ns)
         && let Some((rth_open_ns, rth_close_ns)) = rth_day_bounds_ns(bar_open_ns)
@@ -322,4 +347,28 @@ pub fn compute_rth_bar_close_ns(bar_type: &BarType, bar_open_ns: u64) -> u64 {
         return natural_close_ns.min(rth_close_ns);
     }
     natural_close_ns
+}
+
+/// Reverses [`compute_rth_bar_close_ns`] to recover the canonical `bar_open_ns` for `bar_close_ns`,
+/// handling RTH-clamped `1h`/`4h`/`1d` bars accurately.
+#[must_use]
+pub fn compute_rth_bar_open_ns(bar_type: &BarType, bar_close_ns: u64) -> u64 {
+    let step_ns = timeframe_step_ns(bar_type);
+    if (3_600_000_000_000..=86_400_000_000_000).contains(&step_ns)
+        && bar_close_ns > 0
+        && let Some((rth_open_ns, rth_close_ns)) =
+            rth_day_bounds_ns(bar_close_ns.saturating_sub(1))
+        && bar_close_ns == rth_close_ns
+        && rth_close_ns > rth_open_ns
+    {
+        if step_ns == 86_400_000_000_000 {
+            return rth_open_ns;
+        }
+        let session_span = rth_close_ns - rth_open_ns;
+        let rem = session_span % step_ns;
+        if rem > 0 {
+            return bar_close_ns.saturating_sub(rem);
+        }
+    }
+    bar_close_ns.saturating_sub(step_ns)
 }

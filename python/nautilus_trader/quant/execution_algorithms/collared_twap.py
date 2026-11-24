@@ -426,21 +426,37 @@ class CollaredTwapExecAlgorithm(ExecutionAlgorithm):
                 if alt_px > Decimal("0"):
                     return alt_px
 
+        try:
+            trade = cache.trade(state.instrument_id)
+        except Exception:
+            trade = None
+        if trade is not None:
+            t_ts = int(getattr(trade, "ts_init", 0) or getattr(trade, "ts_event", 0) or 0)
+            t_fresh = now_ns <= 0 or t_ts <= 0 or (now_ns - t_ts) <= state.quote_stale_ns
+            if t_fresh:
+                trade_px = _to_dec(getattr(trade, "price", None), "0")
+                if trade_px > Decimal("0"):
+                    return trade_px
+
         latest_bar = None
         latest_ts = -1
-        try:
-            bar_types = cache.bar_types(
-                AggregationSource.EXTERNAL,
-                instrument_id=state.instrument_id,
-                price_type=PriceType.LAST,
-            )
-            if not bar_types:
-                bar_types = cache.bar_types(
-                    AggregationSource.EXTERNAL,
+        bar_types: List[Any] = []
+        for agg_src in (AggregationSource.EXTERNAL, AggregationSource.INTERNAL):
+            try:
+                found = cache.bar_types(
+                    agg_src,
                     instrument_id=state.instrument_id,
+                    price_type=PriceType.LAST,
                 )
-        except Exception:
-            bar_types = []
+                if not found:
+                    found = cache.bar_types(
+                        agg_src,
+                        instrument_id=state.instrument_id,
+                    )
+                if found:
+                    bar_types.extend(found)
+            except Exception:
+                continue
 
         for bt in bar_types or ():
             try:
@@ -854,6 +870,19 @@ class CollaredTwapExecAlgorithm(ExecutionAlgorithm):
 
         self._spawn_or_advance_slice(state, primary)
 
+    def _deny_held_primary_if_open(self, primary_cid: str, reason: str) -> None:
+        cache = getattr(self, "cache", None)
+        if cache is None or not primary_cid:
+            return
+        primary = cache.order(ClientOrderId(primary_cid))
+        if primary is None or bool(getattr(primary, "is_closed", False)):
+            return
+        status = getattr(primary, "status", None)
+        if status in (OrderStatus.INITIALIZED, OrderStatus.RELEASED):
+            self.deny_order(primary, reason)
+        elif self._is_cancelable_order(primary):
+            self.cancel_order(primary)
+
     def on_order_canceled(self, event: Any) -> None:
         cid = str(getattr(event, "client_order_id", "") or "")
         if not cid:
@@ -877,6 +906,10 @@ class CollaredTwapExecAlgorithm(ExecutionAlgorithm):
             state.active_child_cid = None
             state.waiting_for_cancel = False
         if state.cancel_requested or state.completed:
+            self._deny_held_primary_if_open(
+                primary_cid,
+                f"CollaredTwap child slice {cid} canceled during aborted schedule",
+            )
             self._cleanup_schedule(primary_cid)
             return
 
@@ -970,11 +1003,18 @@ class CollaredTwapExecAlgorithm(ExecutionAlgorithm):
         if child_leaves > Decimal("0") and bool(getattr(child, "is_open", False)):
             return
 
+        was_waiting = False
         self._primary_by_child.pop(cid, None)
         if state.active_child_cid == cid:
+            was_waiting = bool(state.waiting_for_cancel)
             state.active_child_cid = None
             state.waiting_for_cancel = False
         if state.cancel_requested or state.completed:
+            self._deny_held_primary_if_open(
+                primary_cid,
+                f"CollaredTwap child slice {cid} filled on completed/canceled schedule",
+            )
+            self._cleanup_schedule(primary_cid)
             return
 
         primary = cache.order(ClientOrderId(primary_cid)) if cache is not None else None
@@ -983,7 +1023,10 @@ class CollaredTwapExecAlgorithm(ExecutionAlgorithm):
             return
 
         state.slice_index += 1
-        self._spawn_or_advance_slice(state, primary)
+        if was_waiting:
+            self._spawn_or_advance_slice(state, primary)
+        elif state.timer_name not in self._primary_by_timer:
+            self._schedule_next_interval(state)
 
     def on_order_denied(self, event: Any) -> None:
         self._handle_child_or_parent_failure(event, terminal_abort=True)
@@ -1024,6 +1067,10 @@ class CollaredTwapExecAlgorithm(ExecutionAlgorithm):
         if terminal_abort or state.cancel_requested or state.completed:
             state.cancel_requested = True
             state.completed = True
+            self._deny_held_primary_if_open(
+                primary_cid,
+                f"CollaredTwap child slice {cid} aborted ({'terminal' if terminal_abort else 'canceled'})",
+            )
             self._cleanup_schedule(primary_cid)
             return
 
@@ -1071,18 +1118,23 @@ class CollaredTwapExecAlgorithm(ExecutionAlgorithm):
         cache = getattr(self, "cache", None)
         if cache is None:
             return
+        sent_cids: Set[str] = set()
         if state.active_child_cid:
             child = cache.order(ClientOrderId(state.active_child_cid))
             if self._is_cancelable_order(child):
+                sent_cids.add(state.active_child_cid)
                 self.cancel_order(child)
         try:
             spawned = cache.orders_for_exec_spawn(ClientOrderId(state.primary_cid)) or ()
         except Exception:
             spawned = ()
         for order_obj in spawned:
-            if str(getattr(order_obj, "client_order_id", "")) == state.primary_cid:
+            cid = str(getattr(order_obj, "client_order_id", "") or "")
+            if cid == state.primary_cid or cid in sent_cids:
                 continue
             if self._is_cancelable_order(order_obj):
+                if cid:
+                    sent_cids.add(cid)
                 self.cancel_order(order_obj)
 
     def cancel_symbol_entries(self, symbol: str) -> int:
@@ -1110,6 +1162,18 @@ class CollaredTwapExecAlgorithm(ExecutionAlgorithm):
                 primary = cache.order(ClientOrderId(primary_cid))
                 if self._is_cancelable_order(primary):
                     self.cancel_order(primary)
+                    canceled_cids.add(primary_cid)
+                    canceled += 1
+                elif (
+                    primary is not None
+                    and not bool(getattr(primary, "is_closed", False))
+                    and getattr(primary, "status", None)
+                    in (OrderStatus.INITIALIZED, OrderStatus.RELEASED)
+                ):
+                    self.deny_order(
+                        primary,
+                        f"CollaredTwap symbol entry canceled for {norm_sym}",
+                    )
                     canceled_cids.add(primary_cid)
                     canceled += 1
             self._cleanup_schedule(primary_cid)

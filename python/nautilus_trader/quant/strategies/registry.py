@@ -84,7 +84,7 @@ def _default_parameter_bounds() -> Dict[str, Dict[str, Any]]:
             "min_exclusive": "0.00",
             "max_exclusive": "entry_quantile_threshold",
             "default": "0.35",
-            "description": "Empirical CDF rank quantile below which open positions exit.",
+            "description": "Empirical CDF rank quantile filter threshold (confirmation gate on Trend/Breakout; shared config field unused for 15m oscillator exits under M3 Chandelier policy).",
         },
         "atr_stop_multiplier": {
             "type": "decimal",

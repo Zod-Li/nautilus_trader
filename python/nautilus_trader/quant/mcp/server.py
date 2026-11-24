@@ -15,6 +15,7 @@ Implements Ticket #15 (`15-nautilus-mcp-server-and-tool-schema-seam.md`):
 from __future__ import annotations
 
 import concurrent.futures
+from contextlib import closing
 import hashlib
 import hmac
 import inspect
@@ -76,7 +77,10 @@ from nautilus_trader.quant.nodes.backtest_runner import (
     _sort_bars_deterministic,
     build_datainfra_config_from_env,
 )
-from nautilus_trader.quant.nodes.live_node import SipFeederSubscriptionClient
+from nautilus_trader.quant.nodes.live_node import (
+    SipFeederSubscriptionClient,
+    resolve_trading_mode,
+)
 from nautilus_trader.quant.strategies.empirical import rolling_atr
 from nautilus_trader.quant.strategies.registry import (
     get_archetype_descriptor,
@@ -245,10 +249,16 @@ class NautilusMcpServer:
         portfolio_state_provider: Optional[Callable[..., Any]] = None,
         sip_feeder_url: Optional[str] = None,
         sip_feeder_client: Optional[SipFeederSubscriptionClient] = None,
+        environment: Optional[str] = None,
     ) -> None:
         self._dsn = resolve_database_dsn(dsn) if dsn is not None else None
         self._datainfra_config = datainfra_config
         self._venue_name = str(venue_name or "ALPACA").strip().upper()
+        self._environment = (
+            str(environment).strip().upper()
+            if environment is not None and str(environment).strip()
+            else None
+        )
         self._capital_basis_usd = Decimal(str(capital_basis_usd))
         self._system_config = system_config or SystemConfig()
         self._custom_runner_injected = backtest_runner is not None
@@ -672,10 +682,14 @@ class NautilusMcpServer:
             lookback_days=int(lookback_days),
             execution_spec=resolved_exec_spec,
         )
+        pit_end_ns = _parse_date_to_ns(end_date, end_of_day=True) or (
+            max(int(b.ts_init) for b in bars) if bars else None
+        )
         resolved_daily_atr = self._resolve_daily_atr_14(
             sym,
             raw_envelope=risk_envelope,
             lookback_days=max(60, int(lookback_days)),
+            end_ns=pit_end_ns,
         )
         env = self._build_risk_envelope(
             sym,
@@ -779,10 +793,12 @@ class NautilusMcpServer:
             lookback_days=int(lookback_days),
             execution_spec=resolved_exec_spec,
         )
+        pit_end_ns = max(int(b.ts_init) for b in bars) if bars else None
         resolved_daily_atr = self._resolve_daily_atr_14(
             sym,
             raw_envelope=risk_envelope,
             lookback_days=max(60, int(lookback_days)),
+            end_ns=pit_end_ns,
         )
         env = self._build_risk_envelope(
             sym,
@@ -961,6 +977,12 @@ class NautilusMcpServer:
         committed_by_venue: Dict[str, float] = {"alpaca": 0.0}
         new_risk_used_today = 0.0
 
+        co_dec_map = {
+            str(d.get("symbol", "")).strip().upper(): d
+            for d in (committee_attestation.get("carry_over_decisions") or [])
+            if isinstance(d, Mapping) and str(d.get("symbol", "")).strip()
+        }
+
         locked_items: List[PlanItemContract] = []
         sizing_decisions: Dict[str, Dict[str, Any]] = {}
         scaled_to_zero_items: int = 0
@@ -1052,9 +1074,15 @@ class NautilusMcpServer:
                     sym, strat_cfg, risk_envelope=falsified_env
                 )
                 if fp != falsified_env_fp:
+                    is_valid_downscale_flags = (
+                        (
+                            bool(raw_item.get("_env_already_scaled_by_m_regime", False))
+                            and 0.0 < eff_scale < 1.0
+                        )
+                        or bool(raw_item.get("_env_already_scaled_by_headroom", False))
+                    )
                     is_valid_regime_downscale = (
-                        bool(raw_item.get("_env_already_scaled_by_m_regime", False))
-                        and 0.0 < eff_scale < 1.0
+                        is_valid_downscale_flags
                         and req_env.side == falsified_env.side
                         and req_env.initial_stop_price == falsified_env.initial_stop_price
                         and req_env.take_profit_price == falsified_env.take_profit_price
@@ -1108,97 +1136,18 @@ class NautilusMcpServer:
                 conviction=conviction,
                 fractionable=False,
             )
-            decision: SizingDecision = size_position(
-                sizing_req,
-                portfolio_state,
-                self._system_config,
-            )
-            if not decision.approved or decision.qty <= 0:
-                raise McpPlanLockRejectedError(
-                    f"Deterministic capital sizing rejected {sym}: "
-                    f"{decision.reject_reason or 'ZERO_QTY'}"
-                )
-
-            if eff_scale == 0.0:
-                scaled_to_zero_items += 1
-                continue
-            scaled_decision_qty = max(
-                1,
-                int(math.floor(float(decision.qty) * eff_scale + 1e-9)),
-            )
-            should_scale_env = eff_scale < 1.0 and not bool(
-                raw_item.get("_env_already_scaled_by_m_regime", False)
-            )
-            scaled_env_target_qty = (
-                Decimal(
-                    str(
-                        max(
-                            1,
-                            int(math.floor(float(req_env.target_qty) * eff_scale + 1e-9)),
-                        )
-                    )
-                )
-                if should_scale_env
-                else req_env.target_qty
-            )
-            scaled_env_cap_qty = (
-                Decimal(
-                    str(
-                        max(
-                            1,
-                            int(math.floor(float(req_env.approved_qty_cap) * eff_scale + 1e-9)),
-                        )
-                    )
-                )
-                if should_scale_env
-                else req_env.approved_qty_cap
-            )
-            approved_qty_cap = min(
-                scaled_env_cap_qty,
-                scaled_env_target_qty,
-                Decimal(str(scaled_decision_qty)),
-            )
-            if approved_qty_cap <= Decimal("0"):
-                raise McpPlanLockRejectedError(
-                    f"Approved quantity cap for {sym} is non-positive: {approved_qty_cap}"
-                )
-            target_qty = min(scaled_env_target_qty, approved_qty_cap)
-            raw_sized_notional = min(
-                float(req_env.target_notional_usd),
-                float(decision.notional_usd) * eff_scale,
-                float(target_qty) * entry_ref,
-            )
-            approved_notional = Decimal(f"{raw_sized_notional:.2f}")
-            min_order_notional = Decimal(
-                str(load_envelope().numeric["risk.max_order_notional_usd"]["min"])
-            )
-            if approved_notional < min_order_notional:
-                sizing_decisions[sym] = {
-                    "target_qty": "0",
-                    "approved_qty_cap": "0",
-                    "target_notional_usd": str(approved_notional),
-                    "max_risk_budget_usd": "0.00",
-                    "binding_constraint": "REJECTED_DUST_NOTIONAL",
-                    "sizing_trace": dict(decision.trace or {}),
-                }
-                continue
-            approved_risk_budget = min(
-                req_env.max_risk_budget_usd,
-                approved_notional,
-                Decimal(
-                    f"{max(decision.risk_budget_usd * eff_scale, decision.risk_usd * eff_scale, 1.0):.2f}"
-                ),
-            )
-
-            co_dec_map = {
-                str(d.get("symbol", "")).strip().upper(): d
-                for d in (committee_attestation.get("carry_over_decisions") or [])
-                if isinstance(d, Mapping) and str(d.get("symbol", "")).strip()
-            }
             matched_co = co_dec_map.get(sym)
             effective_stop_px = req_env.initial_stop_price
             co_filled_qty = Decimal("0")
+            co_dec_status = ""
             if matched_co is not None:
+                co_dec_status = str(
+                    matched_co.get("decision")
+                    or matched_co.get("lifecycle_state")
+                    or matched_co.get("action")
+                    or matched_co.get("status")
+                    or ""
+                ).strip().upper()
                 raw_co_stop = matched_co.get("current_stop_price")
                 if raw_co_stop is not None and str(raw_co_stop).strip() != "":
                     try:
@@ -1217,6 +1166,178 @@ class NautilusMcpServer:
                     except Exception:
                         co_filled_qty = Decimal("0")
 
+            decision: SizingDecision = size_position(
+                sizing_req,
+                portfolio_state,
+                self._system_config,
+            )
+            zero_incremental_carry_over = False
+            if not decision.approved or decision.qty <= 0:
+                reject_reason_upper = str(decision.reject_reason or "").strip().upper()
+                is_headroom_reject = reject_reason_upper in (
+                    "SINGLE_NAME_CAP",
+                    "SECTOR_CAP",
+                    "GROSS_EXPOSURE_CAP",
+                    "VENUE_CASH",
+                    "BELOW_MIN_LOT",
+                )
+                is_invalidated_co = co_dec_status in (
+                    "THESIS_INVALIDATED_EXIT",
+                    "EXIT_AT_OPEN",
+                    "VETO",
+                    "VETOED",
+                    "INVALIDATED",
+                    "FORCE_EXIT",
+                    "IMMEDIATE_EXIT",
+                )
+                if (
+                    co_filled_qty > Decimal("0")
+                    and is_headroom_reject
+                    and not is_invalidated_co
+                ):
+                    zero_incremental_carry_over = True
+                else:
+                    raise McpPlanLockRejectedError(
+                        f"Deterministic capital sizing rejected {sym}: "
+                        f"{decision.reject_reason or 'ZERO_QTY'}"
+                    )
+
+            effective_tp_px = req_env.take_profit_price
+            tp_cleared_on_stop_tighten = False
+            if effective_tp_px is not None:
+                if (req_env.side == PlanSide.LONG and effective_tp_px <= effective_stop_px) or (
+                    req_env.side == PlanSide.SHORT and effective_tp_px >= effective_stop_px
+                ):
+                    effective_tp_px = None
+                    tp_cleared_on_stop_tighten = True
+
+            if eff_scale == 0.0:
+                scaled_to_zero_items += 1
+                continue
+            prior_exposure_usd = float(symbol_exposure_usd.get(sym, 0.0) or 0.0)
+            if zero_incremental_carry_over:
+                scaled_decision_qty = 0
+                approved_qty_cap = co_filled_qty
+                target_qty = co_filled_qty
+            else:
+                scaled_decision_qty = max(
+                    1,
+                    int(math.floor(float(decision.qty) * eff_scale + 1e-9)),
+                )
+                total_decision_qty = (
+                    Decimal(str(scaled_decision_qty)) + co_filled_qty
+                    if co_filled_qty > Decimal("0") and prior_exposure_usd > 0.0
+                    else Decimal(str(scaled_decision_qty))
+                )
+                should_scale_env = eff_scale < 1.0 and not bool(
+                    raw_item.get("_env_already_scaled_by_m_regime", False)
+                )
+                scaled_env_target_qty = (
+                    Decimal(
+                        str(
+                            max(
+                                1,
+                                int(math.floor(float(req_env.target_qty) * eff_scale + 1e-9)),
+                            )
+                        )
+                    )
+                    if should_scale_env
+                    else req_env.target_qty
+                )
+                scaled_env_cap_qty = (
+                    Decimal(
+                        str(
+                            max(
+                                1,
+                                int(math.floor(float(req_env.approved_qty_cap) * eff_scale + 1e-9)),
+                            )
+                        )
+                    )
+                    if should_scale_env
+                    else req_env.approved_qty_cap
+                )
+                approved_qty_cap = min(
+                    scaled_env_cap_qty,
+                    scaled_env_target_qty,
+                    total_decision_qty,
+                )
+                if co_filled_qty > Decimal("0"):
+                    approved_qty_cap = max(approved_qty_cap, co_filled_qty)
+            if approved_qty_cap <= Decimal("0"):
+                raise McpPlanLockRejectedError(
+                    f"Approved quantity cap for {sym} is non-positive: {approved_qty_cap}"
+                )
+            safety_env = load_envelope()
+            min_order_notional = Decimal(
+                str(safety_env.numeric["risk.max_order_notional_usd"]["min"])
+            )
+            env_max_notional = float(safety_env.numeric["risk.max_order_notional_usd"]["max"])
+            sys_max_notional = float(
+                getattr(
+                    self._system_config.risk,
+                    "max_order_notional_usd",
+                    env_max_notional,
+                )
+                or env_max_notional
+            )
+            env_single_name_pct = float(safety_env.numeric["risk.max_single_name_pct"]["max"])
+            sys_single_name_pct = float(
+                getattr(
+                    self._system_config.risk,
+                    "max_single_name_pct",
+                    env_single_name_pct,
+                )
+                or env_single_name_pct
+            )
+            hard_notional_ceiling = max(
+                float(min_order_notional),
+                min(
+                    env_max_notional,
+                    sys_max_notional,
+                    equity_usd * (min(env_single_name_pct, sys_single_name_pct) / 100.0),
+                ),
+            )
+            if zero_incremental_carry_over:
+                raw_sized_notional = min(
+                    float(req_env.target_notional_usd),
+                    float(target_qty) * entry_ref,
+                )
+            else:
+                target_qty = max(co_filled_qty, min(scaled_env_target_qty, approved_qty_cap))
+                raw_sized_notional = min(
+                    float(req_env.target_notional_usd),
+                    (float(decision.notional_usd) * eff_scale) + (prior_exposure_usd if co_filled_qty > Decimal("0") else 0.0),
+                    float(target_qty) * entry_ref,
+                )
+            co_notional_clamped = False
+            co_unclamped_notional: Optional[float] = None
+            if co_filled_qty > Decimal("0") and entry_ref > 0.0:
+                raw_sized_notional = max(raw_sized_notional, float(co_filled_qty) * entry_ref)
+                if raw_sized_notional > hard_notional_ceiling:
+                    co_notional_clamped = True
+                    co_unclamped_notional = raw_sized_notional
+                    raw_sized_notional = hard_notional_ceiling
+                    approved_qty_cap = co_filled_qty
+                    target_qty = co_filled_qty
+            approved_notional = Decimal(f"{raw_sized_notional:.2f}")
+            if approved_notional < min_order_notional and not zero_incremental_carry_over:
+                sizing_decisions[sym] = {
+                    "target_qty": "0",
+                    "approved_qty_cap": "0",
+                    "target_notional_usd": str(approved_notional),
+                    "max_risk_budget_usd": "0.00",
+                    "binding_constraint": "REJECTED_DUST_NOTIONAL",
+                    "sizing_trace": dict(decision.trace or {}),
+                }
+                continue
+            approved_risk_budget = min(
+                req_env.max_risk_budget_usd,
+                approved_notional,
+                Decimal(
+                    f"{max(decision.risk_budget_usd * eff_scale, decision.risk_usd * eff_scale, 1.0):.2f}"
+                ),
+            )
+
             sized_envelope = PlanRiskEnvelope(
                 side=req_env.side,
                 target_qty=target_qty,
@@ -1224,7 +1345,7 @@ class NautilusMcpServer:
                 target_notional_usd=approved_notional,
                 max_risk_budget_usd=approved_risk_budget,
                 initial_stop_price=effective_stop_px,
-                take_profit_price=req_env.take_profit_price,
+                take_profit_price=effective_tp_px,
                 collar=req_env.collar,
                 valid_until=req_env.valid_until,
                 daily_atr_14=req_env.daily_atr_14,
@@ -1267,11 +1388,25 @@ class NautilusMcpServer:
                     "committee_attestation": dict(committee_attestation),
                 }
             )
+            if tp_cleared_on_stop_tighten:
+                enriched_trace["take_profit_cleared_on_stop_tighten"] = True
+            if zero_incremental_carry_over:
+                enriched_trace["pyramid_enabled"] = False
+                enriched_trace["carry_over_zero_incremental"] = True
+                if decision.reject_reason:
+                    enriched_trace["carry_over_headroom_reject_reason"] = str(decision.reject_reason)
+            if co_notional_clamped and co_unclamped_notional is not None:
+                enriched_trace["carry_over_notional_clamped"] = True
+                enriched_trace["carry_over_unclamped_notional_usd"] = round(
+                    co_unclamped_notional, 2
+                )
+                enriched_trace["pyramid_enabled"] = False
             if trace_atr is not None and trace_atr > 0.0 and math.isfinite(trace_atr):
                 enriched_trace["atr"] = round(trace_atr, 6)
             if matched_co is not None:
                 enriched_trace["carry_over_status"] = str(
-                    matched_co.get("lifecycle_state") or "RENEWED_ACTIVE"
+                    matched_co.get("lifecycle_state")
+                    or (co_dec_status if co_dec_status else "RENEWED_ACTIVE")
                 )
                 if matched_co.get("qty") is not None:
                     enriched_trace["carry_over_position_qty"] = str(matched_co.get("qty"))
@@ -1298,9 +1433,14 @@ class NautilusMcpServer:
                 "sizing_trace": enriched_trace,
             }
 
-            committed_by_symbol[sym] = committed_by_symbol.get(sym, 0.0) + float(approved_notional)
-            committed_by_sector[sector] = committed_by_sector.get(sector, 0.0) + float(approved_notional)
-            committed_by_venue["alpaca"] = committed_by_venue.get("alpaca", 0.0) + float(approved_notional)
+            incremental_committed_usd = (
+                max(0.0, float(approved_notional) - prior_exposure_usd)
+                if co_filled_qty > Decimal("0")
+                else float(approved_notional)
+            )
+            committed_by_symbol[sym] = committed_by_symbol.get(sym, 0.0) + incremental_committed_usd
+            committed_by_sector[sector] = committed_by_sector.get(sector, 0.0) + incremental_committed_usd
+            committed_by_venue["alpaca"] = committed_by_venue.get("alpaca", 0.0) + incremental_committed_usd
             new_risk_used_today += float(approved_risk_budget)
 
         all_scaled_to_zero = bool(validated_items) and scaled_to_zero_items == len(validated_items)
@@ -1813,6 +1953,7 @@ class NautilusMcpServer:
         raw_envelope: Optional[Mapping[str, Any]] = None,
         raw_item: Optional[Mapping[str, Any]] = None,
         lookback_days: int = 60,
+        end_ns: Optional[int] = None,
     ) -> Optional[Decimal]:
         for src in (raw_item, raw_envelope):
             if isinstance(src, Mapping) and src.get("daily_atr_14") is not None:
@@ -1830,6 +1971,7 @@ class NautilusMcpServer:
                 symbol=symbol,
                 bar_timeframe="1d",
                 lookback_days=max(30, int(lookback_days)),
+                end_ns=end_ns,
             )
         except Exception as exc:
             logger.debug("Unable to load 1d bars for daily_atr_14 (%s): %s", symbol, exc)
@@ -2186,7 +2328,7 @@ class NautilusMcpServer:
             import psycopg2
             from psycopg2.extras import RealDictCursor
 
-            with psycopg2.connect(self._dsn) as conn:
+            with closing(psycopg2.connect(self._dsn)) as conn:
                 with conn.cursor(cursor_factory=RealDictCursor) as cur:
                     cur.execute(
                         """
@@ -2303,7 +2445,7 @@ class NautilusMcpServer:
             cash_usd = cap_float
             has_explicit_cash = False
 
-            with psycopg2.connect(self._dsn) as conn:
+            with closing(psycopg2.connect(self._dsn)) as conn:
                 with conn.cursor(cursor_factory=RealDictCursor) as cur:
                     cur.execute(
                         """
@@ -2318,8 +2460,22 @@ class NautilusMcpServer:
                     )
                     reg = cur.fetchone() or {}
 
+                    broker_filter = self._venue_name.lower()
                     if reg.get("acct_reg") is not None:
-                        cur.execute("SELECT * FROM trading_accounts ORDER BY updated_at DESC NULLS LAST LIMIT 1")
+                        acct_params: List[Any] = [broker_filter]
+                        acct_env_clause = ""
+                        if self._environment is not None:
+                            acct_env_clause = " AND UPPER(environment) = %s"
+                            acct_params.append(self._environment)
+                        cur.execute(
+                            f"""
+                            SELECT * FROM trading_accounts
+                            WHERE LOWER(broker) = %s{acct_env_clause}
+                            ORDER BY updated_at DESC NULLS LAST
+                            LIMIT 1
+                            """,
+                            tuple(acct_params),
+                        )
                         acct_row = cur.fetchone()
                         if acct_row:
                             eq_val = next(
@@ -2348,19 +2504,37 @@ class NautilusMcpServer:
 
                     position_rows: List[Dict[str, Any]] = []
                     if reg.get("tp_reg") is not None:
-                        cur.execute("SELECT * FROM trading_positions")
+                        tp_params: List[Any] = [broker_filter]
+                        tp_env_clause = ""
+                        if self._environment is not None:
+                            tp_env_clause = " AND UPPER(environment) = %s"
+                            tp_params.append(self._environment)
+                        cur.execute(
+                            f"SELECT * FROM trading_positions WHERE LOWER(broker) = %s{tp_env_clause}",
+                            tuple(tp_params),
+                        )
                         position_rows.extend(cur.fetchall() or [])
                     if reg.get("pos_reg") is not None:
                         cur.execute("SELECT * FROM positions")
                         position_rows.extend(cur.fetchall() or [])
 
                     seen_pos_symbols: set[str] = set()
+                    known_flat_symbols: set[str] = set()
                     for row in position_rows:
-                        status_str = str(row.get("status") or "OPEN").strip().upper()
-                        if status_str in ("CLOSED", "FLAT", "CANCELED", "CANCELLED", "EXPIRED"):
+                        row_broker = str(row.get("broker") or "").strip().lower()
+                        if row_broker and row_broker != broker_filter:
+                            continue
+                        row_env = str(row.get("environment") or "").strip().upper()
+                        if self._environment is not None and row_env and row_env != self._environment:
                             continue
                         sym = str(row.get("symbol") or "").strip().upper()
-                        if not sym or sym in seen_pos_symbols:
+                        if not sym:
+                            continue
+                        status_str = str(row.get("status") or "OPEN").strip().upper()
+                        if status_str in ("CLOSED", "FLAT", "CANCELED", "CANCELLED", "EXPIRED"):
+                            known_flat_symbols.add(sym)
+                            continue
+                        if sym in seen_pos_symbols:
                             continue
                         qty_raw = (
                             row.get("qty")
@@ -2392,15 +2566,18 @@ class NautilusMcpServer:
                         qty_f = float(qty_raw or 0.0)
                         if mv_raw is not None and abs(float(mv_raw)) > 0.0:
                             if qty_raw is not None and abs(qty_f) <= 1e-9:
+                                known_flat_symbols.add(sym)
                                 continue
                             mv_f = abs(float(mv_raw))
                         else:
                             if abs(qty_f) <= 1e-9:
+                                known_flat_symbols.add(sym)
                                 continue
                             px_f = max(0.0, float(px_raw or 0.0))
                             mv_f = abs(qty_f) * px_f if px_f > 0.0 else abs(qty_f)
 
                         if mv_f <= 0.0:
+                            known_flat_symbols.add(sym)
                             continue
                         seen_pos_symbols.add(sym)
                         symbol_exposure[sym] = symbol_exposure.get(sym, 0.0) + mv_f
@@ -2411,20 +2588,28 @@ class NautilusMcpServer:
                             explicit_sector_by_symbol[sym] = row_sec
                         else:
                             unresolved_symbols.append(sym)
+                    known_flat_symbols -= seen_pos_symbols
 
                     if reg.get("tpi_reg") is not None and reg.get("tpl_reg") is not None:
-                        cur.execute(
-                            """
+                        mkt_norm = str(market or "US_EQUITY").strip()
+                        tpi_sql = """
                             SELECT i.*
                             FROM trading_plan_items i
                             JOIN trading_plans p ON p.plan_id = i.plan_id
                             WHERE COALESCE(i.filled_qty, 0) > 0
+                              AND UPPER(COALESCE(p.status, '')) = 'LOCKED'
+                              AND (p.market = %s OR (%s IN ('US', 'US_EQUITY') AND p.market IN ('US', 'US_EQUITY')))
+                              AND LOWER(COALESCE(i.broker, %s)) = %s
                               AND UPPER(COALESCE(i.status, '')) NOT IN ('CLOSED', 'EXPIRED', 'CANCELED', 'CANCELLED', 'SUPERSEDED')
-                            """
-                        )
+                        """
+                        tpi_params: List[Any] = [mkt_norm, mkt_norm, broker_filter, broker_filter]
+                        if trading_date is not None:
+                            tpi_sql += " AND p.trading_date = %s::date"
+                            tpi_params.append(trading_date)
+                        cur.execute(tpi_sql, tuple(tpi_params))
                         for item_row in cur.fetchall() or []:
                             sym = str(item_row.get("symbol") or "").strip().upper()
-                            if not sym or sym in seen_pos_symbols:
+                            if not sym or sym in seen_pos_symbols or sym in known_flat_symbols:
                                 continue
                             f_qty = abs(float(item_row.get("filled_qty") or 0.0))
                             if f_qty <= 1e-9:
@@ -2454,7 +2639,22 @@ class NautilusMcpServer:
                                 unresolved_symbols.append(sym)
 
                     if reg.get("ord_reg") is not None:
-                        cur.execute("SELECT * FROM orders")
+                        ord_params: List[Any] = [broker_filter, broker_filter]
+                        ord_env_clause = ""
+                        if self._environment is not None:
+                            ord_env_clause = " AND UPPER(COALESCE(environment, %s)) = %s"
+                            ord_params.extend([self._environment, self._environment])
+                        cur.execute(
+                            f"""
+                            SELECT * FROM orders
+                            WHERE UPPER(COALESCE(status, '')) IN (
+                                'SUBMITTED', 'ACCEPTED', 'PARTIALLY_FILLED',
+                                'NEW', 'OPEN', 'PENDING', 'WORKING'
+                            )
+                              AND LOWER(COALESCE(broker, %s)) = %s{ord_env_clause}
+                            """,
+                            tuple(ord_params),
+                        )
                         for ord_row in cur.fetchall() or []:
                             ord_status = str(ord_row.get("status") or "").strip().upper()
                             if ord_status not in (
@@ -2542,18 +2742,27 @@ class NautilusMcpServer:
         end_ns: Optional[int] = None,
     ) -> List[Bar]:
         if self._bar_provider is not None:
-            return list(self._bar_provider(symbol, bar_timeframe, lookback_days))
+            bars = list(self._bar_provider(symbol, bar_timeframe, lookback_days))
+            if start_ns is not None:
+                bars = [b for b in bars if int(b.ts_init) >= int(start_ns)]
+            if end_ns is not None:
+                bars = [b for b in bars if int(b.ts_init) <= int(end_ns)]
+            return sorted(bars, key=lambda b: b.ts_init)
         if self._datainfra_config is None:
             raise ValueError(
                 "Either DataInfraConfig or bar_provider must be configured on NautilusMcpServer"
             )
+        effective_start_ns = start_ns
+        if effective_start_ns is None and end_ns is not None and lookback_days > 0:
+            cal_days = max(int(lookback_days) * 2, int(lookback_days) + 30)
+            effective_start_ns = int(end_ns) - cal_days * 86_400_000_000_000
         catalog = DataInfraCatalog(self._datainfra_config)
         try:
             catalog.register_equity(symbol, venue=self._venue_name, lot_size=1)
             bars = sorted(
                 catalog.query_bars(
                     [symbol],
-                    start_ts_ns=start_ns,
+                    start_ts_ns=effective_start_ns,
                     end_ts_ns=end_ns,
                     timeframe=bar_timeframe,
                     adjustment="adjusted",
@@ -2564,7 +2773,7 @@ class NautilusMcpServer:
             )
         finally:
             del catalog
-        if start_ns is None and end_ns is None and lookback_days > 0:
+        if start_ns is None and lookback_days > 0:
             tf_norm = str(bar_timeframe or "15m").strip().lower()
             bars_per_day = int(
                 math.ceil(BARS_PER_TRADING_YEAR.get(tf_norm, 252.0 * 26.0) / 252.0)
@@ -2701,14 +2910,19 @@ class NautilusMcpServer:
 
 
 
-def create_production_mcp_server(dsn: Optional[str] = None) -> NautilusMcpServer:
+def create_production_mcp_server(
+    dsn: Optional[str] = None,
+    environment: Optional[str] = None,
+) -> NautilusMcpServer:
     """Instantiates `NautilusMcpServer` backed by PostgreSQL and `DataInfraConfig`."""
     resolved_dsn = resolve_database_dsn(dsn)
     datainfra_cfg = build_datainfra_config_from_env()
     capital_basis = Decimal(os.environ.get("CAPITAL_BASIS_USD", "100000.00"))
+    resolved_env = str(environment or resolve_trading_mode()).strip().upper()
     return NautilusMcpServer(
         dsn=resolved_dsn,
         datainfra_config=datainfra_cfg,
         capital_basis_usd=capital_basis,
         venue_name=os.environ.get("DEFAULT_VENUE", "ALPACA"),
+        environment=resolved_env,
     )

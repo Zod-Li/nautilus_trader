@@ -944,10 +944,13 @@ impl PyLiveNode {
         &self,
         gate: Option<nautilus_risk::gate::PyPreTradeRiskGateHandle>,
     ) -> PyResult<()> {
-        self.node()?
-            .kernel()
+        let node = self.node()?;
+        node.kernel()
             .risk_engine()
-            .borrow_mut()
+            .try_borrow_mut()
+            .map_err(|e| {
+                to_pyruntime_err(format!("Cannot set pre_trade_risk_gate while RiskEngine is borrowed: {e}"))
+            })?
             .set_pre_trade_gate(gate.map(|h| h.0));
         Ok(())
     }

@@ -71,7 +71,9 @@ use crate::{
     error::{DataInfraError, DataInfraResult},
     instrument::DataInfraEquityMetadata,
     kafka::{KafkaPayloadSource, TcpKafkaPayloadSource},
-    mapping::{from_bar_type, from_instrument_id, timeframe_step_ns},
+    mapping::{
+        compute_rth_bar_open_ns, from_bar_type, from_instrument_id, timeframe_step_ns,
+    },
     stream::{
         CanonicalStreamDecoder, DEFAULT_DECODER_PRICE_PRECISION, DEFAULT_DECODER_SIZE_PRECISION,
         DEFAULT_VERSION_TRACKER_CAPACITY, DataInfraStreamEvent, KafkaStreamSessionCoordinator,
@@ -97,7 +99,10 @@ fn can_rollup_from_1m(source_bar_type: &BarType, target_bar_type: &BarType) -> b
     }
     let src_step = timeframe_step_ns(source_bar_type);
     let dst_step = timeframe_step_ns(target_bar_type);
-    src_step == M1_STEP_NS && dst_step > M1_STEP_NS && dst_step.is_multiple_of(M1_STEP_NS)
+    src_step == M1_STEP_NS
+        && dst_step > M1_STEP_NS
+        && dst_step <= 86_400_000_000_000
+        && dst_step.is_multiple_of(M1_STEP_NS)
 }
 
 fn rth_day_bounds_ns(bar_open_ns: u64) -> Option<(u64, u64)> {
@@ -802,11 +807,10 @@ impl DataInfraDataClient {
         if let DataInfraStreamEvent::Bar(bar) | DataInfraStreamEvent::UpdatedBar { bar, .. } = event
             && (self.enforce_calendar_on_connect || self.calendar_gate.cached_status().is_some())
         {
-            let bar_open_ns = UnixNanos::from(
-                bar.ts_event
-                    .as_u64()
-                    .saturating_sub(timeframe_step_ns(&bar.bar_type)),
-            );
+            let bar_open_ns = UnixNanos::from(compute_rth_bar_open_ns(
+                &bar.bar_type,
+                bar.ts_event.as_u64(),
+            ));
             if self.calendar_gate.should_refresh_for_bar_open(bar_open_ns) {
                 let gate = self.calendar_gate.clone();
                 let at_ts = Some((bar_open_ns.as_u64() / 1_000_000_000) as i64);
@@ -867,9 +871,10 @@ impl DataInfraDataClient {
                                             && (enforce_calendar || calendar_gate.cached_status().is_some())
                                         {
                                             let bar_open_ns = UnixNanos::from(
-                                                bar.ts_event
-                                                    .as_u64()
-                                                    .saturating_sub(timeframe_step_ns(&bar.bar_type)),
+                                                compute_rth_bar_open_ns(
+                                                    &bar.bar_type,
+                                                    bar.ts_event.as_u64(),
+                                                ),
                                             );
                                             if calendar_gate.should_refresh_for_bar_open(bar_open_ns) {
                                                 let at_ts = Some((bar_open_ns.as_u64() / 1_000_000_000) as i64);
@@ -1259,7 +1264,11 @@ impl DataClient for DataInfraDataClient {
                 BarsQueryRequest::new(vec![symbol], tf, venue, PriceAdjustmentMode::Adjusted)
                     .with_time_range(start_ns, end_ns);
             if let Some(lim) = limit_u32 {
-                req = req.with_limit_per_symbol(lim);
+                req = req.with_limit_per_symbol(if end_ns.is_none() {
+                    lim.saturating_add(2)
+                } else {
+                    lim
+                });
             }
             let transport = Arc::clone(&self.clickhouse_transport);
             let mut bars =
@@ -1268,7 +1277,7 @@ impl DataClient for DataInfraDataClient {
                 let now_u64 = ts_init.as_u64();
                 bars.retain(|b| {
                     let close_ns = b.ts_event.as_u64();
-                    let open_ns = close_ns.saturating_sub(timeframe_step_ns(&b.bar_type));
+                    let open_ns = compute_rth_bar_open_ns(&b.bar_type, close_ns);
                     !(open_ns < now_u64 && now_u64 < close_ns)
                 });
             }

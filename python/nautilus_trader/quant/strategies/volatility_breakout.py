@@ -72,8 +72,7 @@ class VolatilityBreakoutStrategy(BaseArchetypeStrategy):
         if self._in_warmup:
             return
 
-        bar_ts = int(getattr(bar, "ts_event", 0) or getattr(bar, "ts_init", 0) or 0)
-        tod_vol_q = self._update_rth_tod_volume(bar_ts, curr_vol)
+        tod_vol_q = self._last_tod_volume_quantile
 
         if self._open_position_signed_qty() != Decimal("0"):
             return
@@ -94,8 +93,12 @@ class VolatilityBreakoutStrategy(BaseArchetypeStrategy):
         close_window = self._closes[-lookback_len:]
         vol_ratio_window = self._vol_ratios[-min(len(self._vol_ratios), cfg.lookback_window) :]
 
-        price_quantile = empirical_rank_quantile(close_window, close_px)
-        vol_quantile = empirical_rank_quantile(vol_ratio_window, vol_ratio)
+        causal_close_window = close_window[:-1] if len(close_window) >= 2 else close_window
+        causal_vol_window = (
+            vol_ratio_window[:-1] if len(vol_ratio_window) >= 2 else vol_ratio_window
+        )
+        price_quantile = empirical_rank_quantile(causal_close_window, close_px)
+        vol_quantile = empirical_rank_quantile(causal_vol_window, vol_ratio)
 
         entry_q = quantile_to_float(cfg.entry_quantile_threshold)
         exit_q = quantile_to_float(cfg.exit_quantile_threshold)

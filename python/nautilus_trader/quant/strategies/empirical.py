@@ -14,12 +14,15 @@ from typing import Sequence
 
 def empirical_rank_quantile(window: Sequence[float], value: float) -> float:
     """Computes the empirical CDF rank quantile of `value` within `window` in [0.0, 1.0]."""
-    n = len(window)
+    if not math.isfinite(float(value)):
+        return 0.5
+    finite_vals = [float(item) for item in window if math.isfinite(float(item))]
+    n = len(finite_vals)
     if n == 0:
         return 0.5
     less_count = 0
     equal_count = 0
-    for item in window:
+    for item in finite_vals:
         if item < value:
             less_count += 1
         elif item == value:

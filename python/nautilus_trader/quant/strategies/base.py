@@ -8,6 +8,7 @@ from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 import logging
 import math
 import threading
+import time
 from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 from zoneinfo import ZoneInfo
 
@@ -102,6 +103,25 @@ class BaseArchetypeStrategyConfig(StrategyConfig):
 
     ARCHETYPE_ID: StrategyArchetypeId = StrategyArchetypeId.TREND_MOMENTUM
 
+    @classmethod
+    def _resolve_strategy_id(
+        cls,
+        strategy_id: Optional[str | StrategyId],
+        default_tag: str,
+    ) -> StrategyId:
+        if isinstance(strategy_id, StrategyId):
+            return strategy_id
+        if strategy_id:
+            raw_sid = str(strategy_id).strip()
+            if "-" not in raw_sid:
+                if "_" in raw_sid:
+                    head, tail = raw_sid.rsplit("_", 1)
+                    raw_sid = f"{head}-{tail}" if head and tail else f"{raw_sid}-{default_tag}"
+                else:
+                    raw_sid = f"{raw_sid}-{default_tag}"
+            return StrategyId(raw_sid)
+        return StrategyId(f"{cls.ARCHETYPE_ID.value}-{default_tag}")
+
     def __new__(
         cls,
         instrument_id: str | InstrumentId,
@@ -137,13 +157,7 @@ class BaseArchetypeStrategyConfig(StrategyConfig):
         inst_str = str(instrument_id).strip()
         sym_clean = inst_str.split(".", 1)[0].replace("/", "")
         default_tag = str(order_id_tag or sym_clean[:8] or "001")
-        resolved_strategy_id = (
-            strategy_id
-            if isinstance(strategy_id, StrategyId)
-            else StrategyId(
-                str(strategy_id or f"{cls.ARCHETYPE_ID.value}-{default_tag}")
-            )
-        )
+        resolved_strategy_id = cls._resolve_strategy_id(strategy_id, default_tag)
         return super().__new__(
             cls,
             strategy_id=resolved_strategy_id,
@@ -238,12 +252,9 @@ class BaseArchetypeStrategyConfig(StrategyConfig):
         sym_clean = inst_str.split(".", 1)[0].replace("/", "")
         default_tag = str(order_id_tag or sym_clean[:8] or "001")
         self._resolved_order_id_tag: str = default_tag
-        self._resolved_strategy_id: StrategyId = (
-            strategy_id
-            if isinstance(strategy_id, StrategyId)
-            else StrategyId(
-                str(strategy_id or f"{self.ARCHETYPE_ID.value}-{default_tag}")
-            )
+        self._resolved_strategy_id: StrategyId = self._resolve_strategy_id(
+            strategy_id,
+            default_tag,
         )
         self._plan_risk_envelope: Optional[PlanRiskEnvelope] = None
         self._plan_initial_stop_price: Optional[Decimal] = None
@@ -251,10 +262,17 @@ class BaseArchetypeStrategyConfig(StrategyConfig):
         self._plan_item_id: Optional[str] = None
         self._plan_id: Optional[str] = None
         if daily_atr_14 is not None and str(daily_atr_14).strip() != "":
-            d_atr = _to_decimal(daily_atr_14, "0")
-            self._plan_daily_atr_14: Optional[Decimal] = (
-                d_atr if d_atr > Decimal("0") else None
-            )
+            try:
+                d_atr_f = float(daily_atr_14)
+            except (TypeError, ValueError):
+                d_atr_f = 0.0
+            if math.isfinite(d_atr_f) and d_atr_f > 0.0:
+                d_atr = _to_decimal(daily_atr_14, "0")
+                self._plan_daily_atr_14: Optional[Decimal] = (
+                    d_atr if d_atr > Decimal("0") else None
+                )
+            else:
+                self._plan_daily_atr_14 = None
         else:
             self._plan_daily_atr_14 = None
 
@@ -299,6 +317,7 @@ class BaseArchetypeStrategyConfig(StrategyConfig):
             exec_algorithm_id=exec_algo_id,
             execution_spec=exec_spec,
             daily_atr_14=daily_atr,
+            strategy_id=plan_item.strategy_id if getattr(plan_item, "strategy_id", None) else None,
             order_id_tag=plan_item.symbol[:8],
         )
         instance._plan_risk_envelope = plan_item.risk_envelope
@@ -341,7 +360,9 @@ class BaseArchetypeStrategy(Strategy):
         self._stop_orders_by_cid: Dict[str, Any] = {}
         self._stop_qty_by_cid: Dict[str, Decimal] = {}
         self._pending_safe_exits: Dict[str, Dict[str, Any]] = {}
+        self._safe_exit_ttl_alert_names: Dict[str, str] = {}
         self._active_exit_orders_by_inst: Dict[str, str] = {}
+        self._exit_retry_count_by_inst: Dict[str, int] = {}
         self._active_entry_orders_by_inst: Dict[str, Dict[str, Any]] = {}
         self._telemetry_actor_ref: Optional[Any] = None
         self._last_bar_ts_ns: int = 0
@@ -357,6 +378,14 @@ class BaseArchetypeStrategy(Strategy):
         self._rth_cum_vol_date: Optional[date] = None
         self._rth_cum_vol_today: float = 0.0
         self._rth_cum_vol_history_by_tod: Dict[int, List[float]] = {}
+        self._daily_ohlc_date: Optional[date] = None
+        self._daily_cur_high: float = 0.0
+        self._daily_cur_low: float = 0.0
+        self._daily_cur_close: float = 0.0
+        self._completed_daily_highs: List[float] = []
+        self._completed_daily_lows: List[float] = []
+        self._completed_daily_closes: List[float] = []
+        self._last_tod_volume_quantile: Optional[float] = None
         self._in_warmup: bool = False
         self._warmup_bar_count: int = 0
         self._warmup_loader: Optional[Callable[[], Sequence[Bar]]] = None
@@ -404,6 +433,8 @@ class BaseArchetypeStrategy(Strategy):
         self._pending_protective_stop_sync: Optional[Tuple[float, float]] = None
         self._deferred_protective_stop_submission: Optional[Tuple[float, float]] = None
         self._deferred_protective_stop_by_cid: Dict[str, Dict[str, Any]] = {}
+        self._deferred_protective_stop_groups: Dict[str, Dict[str, Any]] = {}
+        self._replaced_protective_stop_cids: set[str] = _BoundedFifoSet(MAX_TRACKED_ORDER_HISTORY)
         self._instrument_halted: bool = False
         self._halted_by_inst: Dict[str, bool] = {}
         self._accepted_order_ids: set[str] = _BoundedFifoSet(MAX_TRACKED_ORDER_HISTORY)
@@ -412,6 +443,8 @@ class BaseArchetypeStrategy(Strategy):
         self._venue_order_id_by_cid: Dict[str, Any] = _BoundedFifoDict(MAX_TRACKED_ORDER_HISTORY)
         self._stop_price_by_cid: Dict[str, float] = {}
         self._prior_stop_qty_by_cid: Dict[str, Decimal] = {}
+        self._prior_stop_price_by_cid: Dict[str, float] = _BoundedFifoDict(MAX_TRACKED_ORDER_HISTORY)
+        self._attempted_stop_price_by_cid: Dict[str, float] = _BoundedFifoDict(MAX_TRACKED_ORDER_HISTORY)
         self._modified_orders_audit: List[Dict[str, Any]] = _BoundedFifoList(MAX_TRACKED_ORDER_HISTORY)
 
     @property
@@ -527,27 +560,40 @@ class BaseArchetypeStrategy(Strategy):
         self._peak_favorable_price = None
         self._armed_entry_signal = None
         self._warmup_bar_count = 0
+        self._daily_ohlc_date = None
+        self._daily_cur_high = 0.0
+        self._daily_cur_low = 0.0
+        self._daily_cur_close = 0.0
+        self._completed_daily_highs.clear()
+        self._completed_daily_lows.clear()
+        self._completed_daily_closes.clear()
+        self._last_tod_volume_quantile = None
 
     def bind_dual_track_bar_extremes(
         self,
         *,
-        cleaned_by_ts_ns: Optional[Mapping[int, Tuple[float, float]]] = None,
-        raw_by_ts_ns: Optional[Mapping[int, Tuple[float, float]]] = None,
+        cleaned_by_ts_ns: Optional[Mapping[Any, Tuple[float, float]]] = None,
+        raw_by_ts_ns: Optional[Mapping[Any, Tuple[float, float]]] = None,
     ) -> None:
-        """Binds dual-track bar extremes keyed by bar timestamp (`ts_ns`).
+        """Binds dual-track bar extremes keyed by `(bar_type_str, ts_ns)` or `ts_ns`.
 
         Rolling indicators (`rolling_atr`, `vwap_anchor`) consume cleaned `(high, low)`,
         while stop-loss triggers inspect un-smoothed `(raw_high, raw_low)` to preserve
         1:1 backtest-to-live isomorphism with broker `STOP_MARKET` execution.
         """
-        cleaned_dict: Dict[int, Tuple[float, float]] = _BoundedFifoDict(MAX_TRACKED_ORDER_HISTORY)
+        def _normalize_dt_key(raw_key: Any) -> Any:
+            if isinstance(raw_key, tuple) and len(raw_key) == 2:
+                return (str(raw_key[0]), int(raw_key[1]))
+            return int(raw_key)
+
+        cleaned_dict: Dict[Any, Tuple[float, float]] = {}
         if cleaned_by_ts_ns:
             for k, v in cleaned_by_ts_ns.items():
-                cleaned_dict[int(k)] = (float(v[0]), float(v[1]))
-        raw_dict: Dict[int, Tuple[float, float]] = _BoundedFifoDict(MAX_TRACKED_ORDER_HISTORY)
+                cleaned_dict[_normalize_dt_key(k)] = (float(v[0]), float(v[1]))
+        raw_dict: Dict[Any, Tuple[float, float]] = {}
         if raw_by_ts_ns:
             for k, v in raw_by_ts_ns.items():
-                raw_dict[int(k)] = (float(v[0]), float(v[1]))
+                raw_dict[_normalize_dt_key(k)] = (float(v[0]), float(v[1]))
         self._cleaned_bar_extremes_by_ts_ns = cleaned_dict
         self._raw_bar_extremes_by_ts_ns = raw_dict
 
@@ -557,10 +603,17 @@ class BaseArchetypeStrategy(Strategy):
         *,
         is_primary: bool = True,
         bar_ts_ns: Optional[int] = None,
+        bar_type: Optional[Any] = None,
     ) -> float:
         if not is_primary:
             if bar_ts_ns is not None and int(bar_ts_ns) > 0:
-                raw_pair = self._raw_bar_extremes_by_ts_ns.get(int(bar_ts_ns))
+                raw_pair = (
+                    self._raw_bar_extremes_by_ts_ns.get((str(bar_type), int(bar_ts_ns)))
+                    if bar_type is not None
+                    else None
+                )
+                if raw_pair is None:
+                    raw_pair = self._raw_bar_extremes_by_ts_ns.get(int(bar_ts_ns))
                 if raw_pair is not None:
                     return float(raw_pair[1])
             if fallback is not None:
@@ -578,10 +631,17 @@ class BaseArchetypeStrategy(Strategy):
         *,
         is_primary: bool = True,
         bar_ts_ns: Optional[int] = None,
+        bar_type: Optional[Any] = None,
     ) -> float:
         if not is_primary:
             if bar_ts_ns is not None and int(bar_ts_ns) > 0:
-                raw_pair = self._raw_bar_extremes_by_ts_ns.get(int(bar_ts_ns))
+                raw_pair = (
+                    self._raw_bar_extremes_by_ts_ns.get((str(bar_type), int(bar_ts_ns)))
+                    if bar_type is not None
+                    else None
+                )
+                if raw_pair is None:
+                    raw_pair = self._raw_bar_extremes_by_ts_ns.get(int(bar_ts_ns))
                 if raw_pair is not None:
                     return float(raw_pair[0])
             if fallback is not None:
@@ -606,6 +666,8 @@ class BaseArchetypeStrategy(Strategy):
             self._tracked_signed_qty_by_inst.pop(inst_key, None)
         else:
             self._tracked_signed_qty_by_inst[inst_key] = qty_dec
+        if inst_key == str(self._archetype_config.instrument_id):
+            self._entry_filled_qty = float(abs(qty_dec))
 
     @property
     def trailing_stop_price(self) -> Optional[float]:
@@ -769,7 +831,7 @@ class BaseArchetypeStrategy(Strategy):
         return ExecutionSpec(bar_timeframe=self._archetype_config.bar_timeframe)
 
     def _resolve_daily_atr_14(self, reference_price: Optional[float] = None) -> float:
-        """Resolves `daily_atr_14` from the locked plan contract, falling back causally to primary-bar `rolling_atr` when unset."""
+        """Resolves `daily_atr_14` from the locked plan contract, falling back causally only when bars are daily/weekly."""
         _ = reference_price
         env = self._risk_envelope or getattr(
             self._archetype_config, "_plan_risk_envelope", None
@@ -783,19 +845,69 @@ class BaseArchetypeStrategy(Strategy):
             val = float(cfg_atr)
             if val > 0.0 and math.isfinite(val):
                 return val
+        bar_tf = str(getattr(self._archetype_config, "bar_timeframe", "") or "").strip().lower()
         n = len(self._closes)
-        if n >= 2:
+        if bar_tf in ("1d", "1w"):
+            if n >= 2:
+                slow_w = int(getattr(self._archetype_config, "slow_window", 0) or 0)
+                fast_w = int(getattr(self._archetype_config, "fast_window", 0) or 0)
+                base_w = slow_w if slow_w >= 2 else (fast_w if fast_w >= 2 else n)
+                atr_win = max(2, min(base_w, n))
+                causal_atr = rolling_atr(self._highs, self._lows, self._closes, atr_win)
+                if causal_atr > 0.0 and math.isfinite(causal_atr):
+                    return causal_atr
+            elif n == 1 and len(self._highs) >= 1 and len(self._lows) >= 1:
+                bar_range = max(0.0, float(self._highs[0]) - float(self._lows[0]))
+                if bar_range > 0.0 and math.isfinite(bar_range):
+                    return bar_range
+            return 0.0
+
+        # Priority 3a: Completed prior-day OHLC bars built causally as dates advance.
+        if len(self._completed_daily_closes) >= 2:
+            d_win = min(14, len(self._completed_daily_closes))
+            daily_causal = rolling_atr(
+                self._completed_daily_highs,
+                self._completed_daily_lows,
+                self._completed_daily_closes,
+                d_win,
+            )
+            if daily_causal > 0.0 and math.isfinite(daily_causal):
+                return daily_causal
+
+        # Priority 3b: Intraday causal ATR scaled by sqrt(RTH bars per trading day)
+        # derived strictly from bar_timeframe (e.g., for short <2-day backtests).
+        step_secs_map = {
+            "1m": 60.0,
+            "5m": 300.0,
+            "15m": 900.0,
+            "1h": 3600.0,
+            "4h": 14400.0,
+        }
+        step_secs = step_secs_map.get(bar_tf)
+        if step_secs is None or step_secs <= 0.0:
+            return 0.0
+        rth_bars_per_day = max(1.0, (6.5 * 3600.0) / step_secs)
+        scale = math.sqrt(rth_bars_per_day)
+        if n >= 3:
             slow_w = int(getattr(self._archetype_config, "slow_window", 0) or 0)
             fast_w = int(getattr(self._archetype_config, "fast_window", 0) or 0)
             base_w = slow_w if slow_w >= 2 else (fast_w if fast_w >= 2 else n)
-            atr_win = max(2, min(base_w, n))
-            causal_atr = rolling_atr(self._highs, self._lows, self._closes, atr_win)
+            causal_atr = rolling_atr(
+                self._highs[:-1],
+                self._lows[:-1],
+                self._closes[:-1],
+                max(2, min(base_w, n - 1)),
+            )
             if causal_atr > 0.0 and math.isfinite(causal_atr):
-                return causal_atr
+                return causal_atr * scale
+        elif n == 2:
+            causal_atr = rolling_atr(self._highs, self._lows, self._closes, 2)
+            if causal_atr > 0.0 and math.isfinite(causal_atr):
+                return causal_atr * scale
         elif n == 1 and len(self._highs) >= 1 and len(self._lows) >= 1:
             bar_range = max(0.0, float(self._highs[0]) - float(self._lows[0]))
             if bar_range > 0.0 and math.isfinite(bar_range):
-                return bar_range
+                return bar_range * scale
         return 0.0
 
     def _is_entry_past_valid_until(self, now_ts_ns: Optional[int] = None) -> bool:
@@ -910,7 +1022,10 @@ class BaseArchetypeStrategy(Strategy):
     ) -> float:
         """Formats the strategy's ATR-derived stop-loss price without clamping, delegating floor/budget enforcement to `PlanGate`."""
         _ = (reference_price, quantity, instrument_id)
-        return float(Decimal(f"{float(raw_stop_price):.4f}"))
+        val = float(raw_stop_price)
+        if not math.isfinite(val) or val <= 0.0:
+            raise ValueError(f"raw_stop_price must be positive finite, got {raw_stop_price!r}")
+        return float(Decimal(f"{val:.4f}"))
 
     def _resolve_protective_stop_price(
         self,
@@ -1049,6 +1164,155 @@ class BaseArchetypeStrategy(Strategy):
             except Exception:
                 pass
 
+    def _infer_entry_side_for_position(self, signed_pos: Decimal) -> OrderSide:
+        """Infers the original entry OrderSide from signed position quantity, falling back to plan_side when flat."""
+        if signed_pos > Decimal("0"):
+            return OrderSide.BUY
+        if signed_pos < Decimal("0"):
+            return OrderSide.SELL
+        return (
+            OrderSide.BUY
+            if self._archetype_config.plan_side == PlanSide.LONG
+            else OrderSide.SELL
+        )
+
+    @staticmethod
+    def _clear_crossed_take_profit(
+        side: PlanSide,
+        stop_price: Decimal,
+        take_profit_price: Optional[Decimal],
+    ) -> Optional[Decimal]:
+        if take_profit_price is None or stop_price <= Decimal("0"):
+            return take_profit_price
+        if (side == PlanSide.LONG and stop_price >= take_profit_price) or (
+            side == PlanSide.SHORT and stop_price <= take_profit_price
+        ):
+            return None
+        return take_profit_price
+
+    def _resolve_timer_clock(self) -> Optional[Any]:
+        clock_obj: Optional[Any] = None
+        try:
+            clock_obj = getattr(self, "clock", None)
+        except Exception:
+            clock_obj = None
+        if clock_obj is None:
+            clock_obj = self._cached_clock or self._standalone_clock
+        return clock_obj
+
+    def _cancel_safe_exit_ttl_timer(self, inst_key: str) -> None:
+        alert_name = self._safe_exit_ttl_alert_names.pop(inst_key, None)
+        if not alert_name or not self._is_owner_thread():
+            return
+        clock_obj = self._resolve_timer_clock()
+        if clock_obj is not None and hasattr(clock_obj, "cancel_timer"):
+            try:
+                clock_obj.cancel_timer(alert_name)
+            except Exception:
+                pass
+
+    def _schedule_safe_exit_ttl_timer(
+        self, target_inst: InstrumentId, sym: str
+    ) -> None:
+        inst_key = str(target_inst)
+        if not self._is_owner_thread():
+            return
+        clock_obj = self._resolve_timer_clock()
+        if clock_obj is None or not hasattr(clock_obj, "set_time_alert_ns"):
+            return
+        try:
+            now_ns = (
+                int(clock_obj.timestamp_ns() or 0)
+                if hasattr(clock_obj, "timestamp_ns")
+                else 0
+            )
+            if now_ns <= 0:
+                now_ns = int(time.time() * 1_000_000_000)
+            alert_ns = now_ns + 15_000_000_000
+            alert_name = f"safe_exit_ttl_{sym}_{inst_key}"
+            if hasattr(clock_obj, "cancel_timer"):
+                try:
+                    clock_obj.cancel_timer(alert_name)
+                except Exception:
+                    pass
+            self._safe_exit_ttl_alert_names[inst_key] = alert_name
+            clock_obj.set_time_alert_ns(
+                name=alert_name,
+                alert_time_ns=alert_ns,
+                callback=self._on_safe_exit_ttl_expired,
+            )
+        except Exception as exc:
+            logger.debug("Skipping safe-exit TTL timer registration: %s", exc)
+
+    def _on_safe_exit_ttl_expired(self, event: Any = None) -> None:
+        ev_name = str(getattr(event, "name", "") or "")
+        matched_keys = [
+            inst_key
+            for inst_key, alert_name in list(self._safe_exit_ttl_alert_names.items())
+            if (not ev_name or alert_name == ev_name) and inst_key in self._pending_safe_exits
+        ]
+        for inst_key in matched_keys:
+            self._safe_exit_ttl_alert_names.pop(inst_key, None)
+            spec = self._pending_safe_exits.pop(inst_key, None)
+            if spec is None:
+                continue
+            target_inst: InstrumentId = spec["instrument_id"]
+            sym: str = spec["symbol"]
+            pending_cids = sorted(spec.get("pending_stop_cids", set()))
+            logger.error(
+                "Safe-exit TTL (15s) expired for %s while awaiting protective stop cancel %s; forcing fail-closed exit & freeze",
+                sym,
+                pending_cids,
+            )
+            self._exit_only_mode = True
+            current_abs_pos = abs(self._open_position_signed_qty(target_inst))
+            had_cache_pos = bool(spec.get("had_open_position_in_cache", False))
+            requested_qty = _to_decimal(spec.get("quantity"), "0")
+            if current_abs_pos > Decimal("0"):
+                remaining_qty = current_abs_pos
+            elif not had_cache_pos:
+                remaining_qty = requested_qty
+            else:
+                remaining_qty = Decimal("0")
+            exit_qty = (
+                min(requested_qty, remaining_qty)
+                if requested_qty > Decimal("0") and remaining_qty > Decimal("0")
+                else remaining_qty
+            )
+            self._notify_safe_exit_end(sym)
+            if exit_qty > Decimal("0"):
+                exit_cid = self._execute_exit_order_submission(
+                    instrument_id=target_inst,
+                    exit_side=spec["exit_side"],
+                    quantity=exit_qty,
+                    reference_price=spec["reference_price"],
+                    reason_tag=f"{spec['reason_tag']}_TTL_TIMEOUT",
+                    signal_tags=spec.get("signal_tags"),
+                )
+                spec["submitted_exit_cid"] = exit_cid
+            actor = self._resolve_telemetry_actor()
+            oco_mon = getattr(actor, "oco_monitor", None) if actor is not None else None
+            if oco_mon is not None:
+                try:
+                    if pending_cids and hasattr(oco_mon, "invalidate_protective_order"):
+                        oco_mon.invalidate_protective_order(
+                            symbol=sym,
+                            broker_order_id=pending_cids[0],
+                            reason=f"SAFE_EXIT_TTL_TIMEOUT:{','.join(pending_cids)}",
+                        )
+                    if hasattr(oco_mon, "verify_position_coverage"):
+                        oco_mon.verify_position_coverage(
+                            symbol=sym,
+                            pos_qty=max(current_abs_pos, exit_qty),
+                            override_reason=f"SAFE_EXIT_TTL_TIMEOUT:{','.join(pending_cids)}",
+                        )
+                except Exception as exc:
+                    logger.error(
+                        "Failed triggering fail-closed OCO alert on safe-exit TTL timeout for %s: %s",
+                        sym,
+                        exc,
+                    )
+
     def _notify_stop_leg_replaced(
         self,
         symbol: str,
@@ -1058,6 +1322,17 @@ class BaseArchetypeStrategy(Strategy):
         stop_price: Any = None,
         status: Optional[str] = None,
     ) -> None:
+        old_cid_str = str(old_cid or "").strip()
+        new_cid_str = str(new_cid or "").strip()
+        if (
+            old_cid_str
+            and new_cid_str
+            and new_cid_str != old_cid_str
+            and not new_cid_str.startswith("deferred-replace-")
+        ):
+            self._replaced_protective_stop_cids.add(old_cid_str)
+        if new_cid_str and not new_cid_str.startswith("deferred-replace-"):
+            self._replaced_protective_stop_cids.discard(new_cid_str)
         actor = self._resolve_telemetry_actor()
         qty_dec = _to_decimal(new_covered_qty, "0")
         px_dec = _to_decimal(stop_price, "0")
@@ -1116,12 +1391,25 @@ class BaseArchetypeStrategy(Strategy):
                     new_cid,
                     new_covered_qty=new_covered_qty,
                     stop_price=stop_price,
+                    status=target_status,
                 )
                 return
             except TypeError:
                 try:
-                    actor.mark_stop_leg_replaced(symbol, old_cid, new_cid)
+                    actor.mark_stop_leg_replaced(
+                        symbol,
+                        old_cid,
+                        new_cid,
+                        new_covered_qty=new_covered_qty,
+                        stop_price=stop_price,
+                    )
                     return
+                except TypeError:
+                    try:
+                        actor.mark_stop_leg_replaced(symbol, old_cid, new_cid)
+                        return
+                    except Exception:
+                        pass
                 except Exception:
                     pass
             except Exception:
@@ -1350,20 +1638,13 @@ class BaseArchetypeStrategy(Strategy):
                     )
                 except Exception:
                     pass
-        elif oco_mon is not None and hasattr(oco_mon, "invalidate_protective_order"):
-            try:
-                oco_mon.invalidate_protective_order(
-                    symbol=sym,
-                    reason=f"CARRY_OVER_PROTECTIVE_STOP_SUBMISSION_FAILED:{sym}",
-                )
-                if hasattr(oco_mon, "verify_position_coverage"):
-                    oco_mon.verify_position_coverage(
-                        symbol=sym,
-                        pos_qty=abs_pos,
-                        override_reason=f"CARRY_OVER_PROTECTIVE_STOP_SUBMISSION_FAILED:{sym}",
-                    )
-            except Exception:
-                pass
+        elif pos_qty_fallback := (abs_pos if abs_pos > Decimal("0") else None):
+            self._fail_closed_unprotected_position(
+                target_inst=target_inst,
+                cid=None,
+                reason=f"CARRY_OVER_PROTECTIVE_STOP_SUBMISSION_FAILED:{sym}",
+                pos_qty=pos_qty_fallback,
+            )
         return new_cid
 
     def on_stop(self) -> None:
@@ -1406,6 +1687,35 @@ class BaseArchetypeStrategy(Strategy):
                         exc,
                     )
 
+    def on_reset(self) -> None:
+        parent_reset = getattr(super(), "on_reset", None)
+        if callable(parent_reset):
+            parent_reset()
+        self._deferred_protective_stop_groups.clear()
+        self._deferred_protective_stop_by_cid.clear()
+        self._deferred_protective_stop_submission = None
+        self._pending_protective_stop_sync = None
+        self._prior_stop_qty_by_cid.clear()
+        self._prior_stop_price_by_cid.clear()
+        self._attempted_stop_price_by_cid.clear()
+        self._active_protective_stops_by_inst.clear()
+        self._stop_orders_by_cid.clear()
+        self._stop_qty_by_cid.clear()
+        self._stop_price_by_cid.clear()
+        self._unconfirmed_stop_cids.clear()
+        self._stop_submitted_bar_seq_by_cid.clear()
+        self._active_entry_orders_by_inst.clear()
+        self._active_exit_orders_by_inst.clear()
+        self._pending_protective_stops.clear()
+        self._pending_safe_exits.clear()
+        self._tracked_signed_qty_by_inst.clear()
+        self._entry_filled_qty = 0.0
+        self._trailing_stop_price = None
+        self._stop_price = None
+        self._peak_favorable_price = None
+        self._armed_entry_signal = None
+        self._pending_thesis_exit = False
+
     def on_dispose(self) -> None:
         if self._is_owner_thread():
             alert_name = (
@@ -1432,6 +1742,12 @@ class BaseArchetypeStrategy(Strategy):
                         clk.cancel_timer(alert_name)
                     except Exception:
                         pass
+                    for safe_alert_name in list(self._safe_exit_ttl_alert_names.values()):
+                        try:
+                            clk.cancel_timer(safe_alert_name)
+                        except Exception:
+                            pass
+            self._safe_exit_ttl_alert_names.clear()
             self._standalone_clock = None
             self._cached_order_factory = None
             self._cached_clock = None
@@ -1591,43 +1907,103 @@ class BaseArchetypeStrategy(Strategy):
         raw_ts_event = int(getattr(bar, "ts_event", 0) or 0)
         raw_ts_init = int(getattr(bar, "ts_init", 0) or 0)
         bar_ts = raw_ts_event if raw_ts_event > 0 else raw_ts_init
+        bar_open_val = float(bar.open.as_double()) if hasattr(bar, "open") else float(bar.close.as_double())
         bar_high_val = float(bar.high.as_double())
         bar_low_val = float(bar.low.as_double())
+        close_px = float(bar.close.as_double())
+        if (
+            not all(
+                math.isfinite(p) and p > 0.0
+                for p in (bar_open_val, bar_high_val, bar_low_val, close_px)
+            )
+            or bar_high_val < bar_low_val
+        ):
+            logger.warning(
+                "Skipping malformed bar in stop/take-profit check for %s: OHLC=(%s, %s, %s, %s)",
+                target_inst,
+                bar_open_val,
+                bar_high_val,
+                bar_low_val,
+                close_px,
+            )
+            return False
         attr_rh = getattr(bar, "raw_high", None)
         attr_rl = getattr(bar, "raw_low", None)
         if attr_rh is not None:
-            bar_high_val = max(bar_high_val, float(attr_rh))
+            rh_f = float(attr_rh)
+            if math.isfinite(rh_f) and rh_f > 0.0:
+                bar_high_val = max(bar_high_val, rh_f)
         if attr_rl is not None:
-            bar_low_val = min(bar_low_val, float(attr_rl))
-        close_px = float(bar.close.as_double())
+            rl_f = float(attr_rl)
+            if math.isfinite(rl_f) and rl_f > 0.0:
+                bar_low_val = min(bar_low_val, rl_f)
         raw_high_px = self._current_bar_raw_high(
             bar_high_val,
             is_primary=is_primary_bar,
             bar_ts_ns=bar_ts,
+            bar_type=getattr(bar, "bar_type", None),
         )
         raw_low_px = self._current_bar_raw_low(
             bar_low_val,
             is_primary=is_primary_bar,
             bar_ts_ns=bar_ts,
+            bar_type=getattr(bar, "bar_type", None),
         )
 
-        if (
-            include_stop_check
-            and stop_reason_tag != "CORRECTED_BAR_STOP_EXIT"
-            and bar_ts > 0
-            and self._is_owner_thread()
-        ):
+        if bar_ts > 0 and self._is_owner_thread():
             try:
                 open_positions = list(
                     self.cache.positions_open(instrument_id=target_inst) or []
                 )
             except Exception:
                 open_positions = []
-            if any(
-                int(getattr(pos, "ts_opened", 0) or 0) >= bar_ts > 0
+            bar_bt = getattr(bar, "bar_type", None)
+            step_ns = 0
+            bar_spec = getattr(bar_bt, "spec", None)
+            if bar_spec is not None:
+                try:
+                    raw_step = int(getattr(bar_spec, "step", 0) or 0)
+                    agg_str = str(getattr(bar_spec, "aggregation", "") or "").upper()
+                    if raw_step > 0:
+                        if "MINUTE" in agg_str:
+                            step_ns = raw_step * 60_000_000_000
+                        elif "HOUR" in agg_str:
+                            step_ns = raw_step * 3_600_000_000_000
+                        elif "DAY" in agg_str:
+                            step_ns = raw_step * 86_400_000_000_000
+                except (TypeError, ValueError):
+                    step_ns = 0
+            if step_ns <= 0 and is_primary_bar:
+                tf_key = str(getattr(self._archetype_config, "bar_timeframe", "") or "").strip().lower()
+                step_ns = {
+                    "1m": 60_000_000_000,
+                    "5m": 300_000_000_000,
+                    "15m": 900_000_000_000,
+                    "30m": 1_800_000_000_000,
+                    "1h": 3_600_000_000_000,
+                    "4h": 14_400_000_000_000,
+                    "1d": 86_400_000_000_000,
+                }.get(tf_key, 0)
+            bar_start_ts = bar_ts - step_ns if step_ns > 0 else bar_ts
+            exec_bt = getattr(self._archetype_config, "execution_bar_type", None)
+            has_multi_min_exec_sub = (
+                is_primary_bar
+                and exec_bt is not None
+                and exec_bt != self._archetype_config.bar_type
+                and step_ns > 60_000_000_000
+            )
+            has_same_or_pre_entry_open = any(
+                (
+                    int(getattr(pos, "ts_opened", 0) or 0) >= bar_ts
+                    or (
+                        has_multi_min_exec_sub
+                        and int(getattr(pos, "ts_opened", 0) or 0) > bar_start_ts
+                    )
+                )
                 for pos in open_positions
-            ):
-                include_stop_check = False
+            )
+            if has_same_or_pre_entry_open:
+                return False
 
         if include_stop_check and self._trailing_stop_price is not None and self._trailing_stop_price > 0.0:
             stop_hit = (raw_low_px <= self._trailing_stop_price) if is_long else (raw_high_px >= self._trailing_stop_price)
@@ -2004,6 +2380,8 @@ class BaseArchetypeStrategy(Strategy):
             else close_px + (atr_mult * stop_atr)
         )
         stop_px = self._resolve_entry_stop_price(close_px, raw_stop)
+        prev_stop = self._trailing_stop_price
+        prev_peak = self._peak_favorable_price
         self._trailing_stop_price = stop_px
         self._peak_favorable_price = high_px if order_side == OrderSide.BUY else low_px
         use_implicit_atr = (
@@ -2011,7 +2389,7 @@ class BaseArchetypeStrategy(Strategy):
             or self._has_explicit_plan_atr()
         )
         daily_atr = stop_atr if use_implicit_atr else 0.0
-        self._submit_plan_gated_entry(
+        entry_cid = self._submit_plan_gated_entry(
             order_side=order_side,
             reference_price=close_px,
             atr=daily_atr,
@@ -2019,6 +2397,9 @@ class BaseArchetypeStrategy(Strategy):
             stop_loss_price=stop_px,
             tags=armed.get("tags"),
         )
+        if not entry_cid or self._is_order_denied_or_rejected(entry_cid):
+            self._trailing_stop_price = prev_stop
+            self._peak_favorable_price = prev_peak
 
     def on_bar(self, bar: Bar) -> None:
         if not hasattr(bar, "bar_type"):
@@ -2026,7 +2407,6 @@ class BaseArchetypeStrategy(Strategy):
         exec_bar_type = getattr(self._archetype_config, "execution_bar_type", None)
         if bar.bar_type == self._archetype_config.bar_type:
             if hasattr(bar, "high") and hasattr(bar, "low") and hasattr(bar, "close"):
-                prev_primary_ts_ns = self._last_bar_ts_ns
                 if not self._record_primary_bar(bar):
                     raw_ts_event = int(getattr(bar, "ts_event", 0) or 0)
                     raw_ts_init = int(getattr(bar, "ts_init", 0) or 0)
@@ -2056,15 +2436,9 @@ class BaseArchetypeStrategy(Strategy):
                     return
                 if self._check_and_execute_pending_thesis_exit(bar):
                     return
-                has_intrabar_exec_stream = (
-                    exec_bar_type is not None
-                    and exec_bar_type != self._archetype_config.bar_type
-                    and self._last_exec_bar_ts_ns > prev_primary_ts_ns
-                    and self._last_exec_bar_ts_ns > 0
-                )
                 if self._check_and_execute_take_profit_or_corrected_stop(
                     bar,
-                    include_stop_check=not has_intrabar_exec_stream,
+                    include_stop_check=True,
                     stop_reason_tag=None,
                 ):
                     return
@@ -2090,10 +2464,29 @@ class BaseArchetypeStrategy(Strategy):
             raw_ts_event = int(getattr(bar, "ts_event", 0) or 0)
             raw_ts_init = int(getattr(bar, "ts_init", 0) or 0)
             bar_ts = raw_ts_event if raw_ts_event > 0 else raw_ts_init
+            open_px = float(bar.open.as_double())
             high_px = float(bar.high.as_double())
             low_px = float(bar.low.as_double())
             close_px = float(bar.close.as_double())
             vol_px = float(bar.volume.as_double())
+            if (
+                not all(
+                    math.isfinite(p) and p > 0.0
+                    for p in (open_px, high_px, low_px, close_px)
+                )
+                or not (math.isfinite(vol_px) and vol_px >= 0.0)
+                or high_px < low_px
+            ):
+                logger.warning(
+                    "Ignoring malformed execution bar for %s: OHLC=(%s, %s, %s, %s), vol=%s",
+                    bar.bar_type,
+                    open_px,
+                    high_px,
+                    low_px,
+                    close_px,
+                    vol_px,
+                )
+                return
             if bar_ts > 0:
                 self._last_exec_bar_ts_ns = bar_ts
             self._last_exec_close = close_px
@@ -2273,7 +2666,14 @@ class BaseArchetypeStrategy(Strategy):
         bar_ts = raw_ts_event if raw_ts_event > 0 else raw_ts_init
         bar_high = float(bar.high.as_double())
         bar_low = float(bar.low.as_double())
-        cleaned_pair = self._cleaned_bar_extremes_by_ts_ns.get(bar_ts)
+        dt_key = (str(bar.bar_type), bar_ts) if hasattr(bar, "bar_type") else None
+        cleaned_pair = (
+            self._cleaned_bar_extremes_by_ts_ns.get(dt_key)
+            if dt_key is not None
+            else None
+        )
+        if cleaned_pair is None:
+            cleaned_pair = self._cleaned_bar_extremes_by_ts_ns.get(bar_ts)
         if cleaned_pair is not None:
             cleaned_high, cleaned_low = float(cleaned_pair[0]), float(cleaned_pair[1])
         else:
@@ -2282,7 +2682,13 @@ class BaseArchetypeStrategy(Strategy):
             cleaned_high = float(attr_ch) if attr_ch is not None else bar_high
             cleaned_low = float(attr_cl) if attr_cl is not None else bar_low
 
-        raw_pair = self._raw_bar_extremes_by_ts_ns.get(bar_ts)
+        raw_pair = (
+            self._raw_bar_extremes_by_ts_ns.get(dt_key)
+            if dt_key is not None
+            else None
+        )
+        if raw_pair is None:
+            raw_pair = self._raw_bar_extremes_by_ts_ns.get(bar_ts)
         if raw_pair is not None:
             raw_high, raw_low = float(raw_pair[0]), float(raw_pair[1])
         else:
@@ -2299,8 +2705,38 @@ class BaseArchetypeStrategy(Strategy):
                 else min(bar_low, cleaned_low)
             )
 
+        bar_open = float(bar.open.as_double())
         close_val = float(bar.close.as_double())
         vol_val = float(bar.volume.as_double())
+        if (
+            not all(
+                math.isfinite(p) and p > 0.0
+                for p in (
+                    bar_open,
+                    bar_high,
+                    bar_low,
+                    close_val,
+                    cleaned_high,
+                    cleaned_low,
+                    raw_high,
+                    raw_low,
+                )
+            )
+            or not (math.isfinite(vol_val) and vol_val >= 0.0)
+            or bar_high < bar_low
+            or cleaned_high < cleaned_low
+            or raw_high < raw_low
+        ):
+            logger.warning(
+                "Ignoring malformed primary bar for %s: OHLC=(%s, %s, %s, %s), vol=%s",
+                bar.bar_type,
+                bar_open,
+                bar_high,
+                bar_low,
+                close_val,
+                vol_val,
+            )
+            return False
 
         if bar_ts > 0 and self._last_bar_ts_ns > 0 and bar_ts <= self._last_bar_ts_ns:
             if (
@@ -2321,6 +2757,33 @@ class BaseArchetypeStrategy(Strategy):
             return False
         if bar_ts > 0:
             self._last_bar_ts_ns = bar_ts
+            bar_ny_date = (
+                datetime.fromtimestamp(bar_ts / 1_000_000_000.0, tz=timezone.utc)
+                .astimezone(ZoneInfo("America/New_York"))
+                .date()
+            )
+            if self._daily_ohlc_date is None:
+                self._daily_ohlc_date = bar_ny_date
+                self._daily_cur_high = cleaned_high
+                self._daily_cur_low = cleaned_low
+                self._daily_cur_close = close_val
+            elif bar_ny_date > self._daily_ohlc_date:
+                if self._daily_cur_close > 0.0:
+                    self._completed_daily_highs.append(self._daily_cur_high)
+                    self._completed_daily_lows.append(self._daily_cur_low)
+                    self._completed_daily_closes.append(self._daily_cur_close)
+                    if len(self._completed_daily_closes) > 60:
+                        del self._completed_daily_highs[:-60]
+                        del self._completed_daily_lows[:-60]
+                        del self._completed_daily_closes[:-60]
+                self._daily_ohlc_date = bar_ny_date
+                self._daily_cur_high = cleaned_high
+                self._daily_cur_low = cleaned_low
+                self._daily_cur_close = close_val
+            elif bar_ny_date == self._daily_ohlc_date:
+                self._daily_cur_high = max(self._daily_cur_high, cleaned_high)
+                self._daily_cur_low = min(self._daily_cur_low, cleaned_low)
+                self._daily_cur_close = close_val
             if self._standalone_clock is not None:
                 try:
                     self._standalone_clock.set_time(bar_ts)
@@ -2334,6 +2797,7 @@ class BaseArchetypeStrategy(Strategy):
         self._closes.append(close_val)
         self._volumes.append(vol_val)
         self._bar_ts_ns_window.append(bar_ts)
+        self._last_tod_volume_quantile = self._update_rth_tod_volume(bar_ts, vol_val)
         max_keep = max(self._archetype_config.lookback_window * 3, 120)
         if len(self._closes) > max_keep:
             del self._highs[:-max_keep]
@@ -2678,7 +3142,7 @@ class BaseArchetypeStrategy(Strategy):
         trigger_price: Optional[Price] = None,
         client_id: Optional[Any] = None,
         params: Optional[Dict[str, Any]] = None,
-    ) -> None:
+    ) -> bool:
         cid_str = str(
             getattr(
                 order_or_client_order_id,
@@ -2698,7 +3162,7 @@ class BaseArchetypeStrategy(Strategy):
             }
         )
         if not self._is_owner_thread() or not self._is_trader_registered():
-            return
+            return False
         cid_obj = (
             order_or_client_order_id.client_order_id
             if hasattr(order_or_client_order_id, "client_order_id")
@@ -2717,6 +3181,7 @@ class BaseArchetypeStrategy(Strategy):
                 client_id=client_id,
                 params=params,
             )
+            return True
         except TypeError:
             try:
                 super().modify_order(
@@ -2725,10 +3190,13 @@ class BaseArchetypeStrategy(Strategy):
                     price=price,
                     trigger_price=trigger_price,
                 )
+                return True
             except Exception as exc:
                 logger.warning("modify_order fallback failed for %s: %s", cid_str, exc)
+                return False
         except Exception as exc:
             logger.warning("modify_order failed for %s: %s", cid_str, exc)
+            return False
 
     def _apply_atomic_protective_stop_modify(
         self,
@@ -2767,16 +3235,42 @@ class BaseArchetypeStrategy(Strategy):
         ):
             self._protective_stop_qty = float(target_qty)
             self._stop_price = rounded_stop_px
+            sym = self._symbol_from_instrument_id(target_inst)
+            self._notify_stop_leg_replaced(
+                sym,
+                "",
+                existing_cid,
+                new_covered_qty=qty_dec,
+                stop_price=rounded_stop_px,
+                status="ACTIVE",
+            )
             return existing_cid
-        self.modify_order(
+        mod_result = self.modify_order(
             existing_stop,
             quantity=qty_obj,
             trigger_price=trig_obj,
         )
+        if mod_result is False:
+            pos_qty = self._current_position_qty(target_inst)
+            if pos_qty > 0.0:
+                self._fail_closed_unprotected_position(
+                    target_inst=target_inst,
+                    cid=existing_cid or None,
+                    reason=f"ATOMIC_STOP_MODIFY_FAILED:{existing_cid}",
+                    pos_qty=Decimal(f"{pos_qty:.6f}"),
+                    reference_price=rounded_stop_px,
+                )
+            return ""
         if existing_cid:
             prev_qty = self._stop_qty_by_cid.get(existing_cid)
             if prev_qty is not None:
                 self._prior_stop_qty_by_cid[existing_cid] = prev_qty
+            prev_px = self._stop_price_by_cid.get(existing_cid)
+            if prev_px is not None and float(prev_px) > 0.0:
+                self._prior_stop_price_by_cid[existing_cid] = float(prev_px)
+            elif self._stop_price is not None and float(self._stop_price) > 0.0:
+                self._prior_stop_price_by_cid[existing_cid] = float(self._stop_price)
+            self._attempted_stop_price_by_cid[existing_cid] = rounded_stop_px
             self._stop_qty_by_cid[existing_cid] = qty_dec
             self._stop_price_by_cid[existing_cid] = rounded_stop_px
             self._stop_orders_by_cid[existing_cid] = existing_stop
@@ -2903,7 +3397,7 @@ class BaseArchetypeStrategy(Strategy):
                 trig_px = self._extract_price_float(raw_trig)
                 if trig_px > 0.0:
                     self._stop_price_by_cid[cid] = trig_px
-                    if self._stop_price <= 0.0:
+                    if self._stop_price is None or self._stop_price <= 0.0:
                         self._stop_price = trig_px
                     plan_side = getattr(self._archetype_config, "plan_side", PlanSide.LONG)
                     if self._trailing_stop_price is not None and self._trailing_stop_price > 0.0:
@@ -3060,15 +3554,29 @@ class BaseArchetypeStrategy(Strategy):
         ):
             self._protective_stop_order_id = None
             self._protective_stop_qty = 0.0
+        affected_primary = False
+        primary_inst = self._archetype_config.instrument_id
+        primary_key = str(primary_inst)
         if instrument_id is not None:
             inst_key = str(instrument_id)
             cids = self._active_protective_stops_by_inst.get(inst_key)
             if cids and cid in cids:
                 cids.remove(cid)
-            return
-        for inst_key, cids in list(self._active_protective_stops_by_inst.items()):
-            if cid in cids:
-                cids.remove(cid)
+            if inst_key == primary_key:
+                affected_primary = True
+        else:
+            for inst_key, cids in list(self._active_protective_stops_by_inst.items()):
+                if cid in cids:
+                    cids.remove(cid)
+                    if inst_key == primary_key:
+                        affected_primary = True
+        if (
+            affected_primary
+            and not self._active_protective_stops_by_inst.get(primary_key)
+            and self._open_position_signed_qty(primary_inst) == Decimal("0")
+        ):
+            self._stop_price = None
+            self._trailing_stop_price = None
 
     def _build_protective_stop_order(
         self,
@@ -3146,6 +3654,17 @@ class BaseArchetypeStrategy(Strategy):
         if stop_cid not in active_list:
             active_list.append(stop_cid)
         self._submit_order_safely(stop_order)
+        cached_stop = self._lookup_order_in_cache(stop_order) or stop_order
+        post_status = self._normalized_order_status(cached_stop)
+        active_for_inst = self._active_protective_stops_by_inst.get(inst_key, [])
+        if (
+            post_status in ("DENIED", "REJECTED", "CANCELED", "EXPIRED")
+            or stop_cid in self._denied_order_ids
+            or stop_cid in self._rejected_order_ids
+            or stop_cid not in active_for_inst
+        ):
+            self._remove_tracked_stop_cid(stop_cid, instrument_id)
+            return None
         if resolved_stop_px > 0.0:
             self._sync_plan_gate_stop_price(
                 resolved_stop_px,
@@ -3178,6 +3697,186 @@ class BaseArchetypeStrategy(Strategy):
             quantity,
             stop_loss_price=stop_loss_price,
         )
+
+    def _is_order_open_in_cache(self, cid: str, order: Any = None) -> bool:
+        cached = (
+            self._lookup_order_in_cache(order)
+            if order is not None and not isinstance(order, ClientOrderId)
+            else None
+        ) or (self._lookup_order_in_cache(cid) if cid else None)
+        if cached is None:
+            return False
+        return not bool(getattr(cached, "is_closed", True))
+
+    def _collect_still_open_stop_cids(
+        self,
+        inst_key: str,
+        old_cids_for_replace: Sequence[str],
+        old_stop_by_cid: Mapping[str, Any],
+    ) -> List[str]:
+        existing_group = self._deferred_protective_stop_groups.get(inst_key)
+        pending_group_cids = (
+            [
+                str(pcid)
+                for pcid in existing_group.get("pending_cids", set())
+                if pcid and self._is_order_open_in_cache(str(pcid))
+            ]
+            if existing_group
+            else []
+        )
+        new_open_cids = [
+            old_cid
+            for old_cid in old_cids_for_replace
+            if self._is_order_open_in_cache(old_cid, old_stop_by_cid.get(old_cid))
+        ]
+        return list(dict.fromkeys(pending_group_cids + new_open_cids))
+
+    def _register_deferred_protective_stop_group(
+        self,
+        *,
+        target_inst: InstrumentId,
+        still_open_cids: Sequence[str],
+        target_qty: Decimal,
+        target_stop_px: float,
+        planned_new_cid: str,
+        parent_entry_cid: str,
+    ) -> str:
+        inst_key = str(target_inst)
+        sym = self._symbol_from_instrument_id(target_inst)
+        anchor_cid = str(still_open_cids[-1])
+        first_cid = str(still_open_cids[0])
+        if planned_new_cid:
+            self._notify_stop_leg_replaced(
+                sym,
+                planned_new_cid,
+                f"deferred-replace-{first_cid}",
+                new_covered_qty=target_qty,
+                stop_price=float(target_stop_px),
+                status="REPLACING",
+            )
+        prior_group = self._deferred_protective_stop_groups.pop(inst_key, None)
+        if prior_group is not None:
+            for stale_cid in prior_group.get("pending_cids", set()):
+                self._deferred_protective_stop_by_cid.pop(stale_cid, None)
+        group_meta: Dict[str, Any] = {
+            "instrument_id": target_inst,
+            "target_qty": float(target_qty),
+            "target_stop_px": float(target_stop_px),
+            "pending_cids": {str(c) for c in still_open_cids if str(c)},
+            "parent_entry_cid": parent_entry_cid,
+            "anchor_cid": anchor_cid,
+        }
+        self._deferred_protective_stop_groups[inst_key] = group_meta
+        self._deferred_protective_stop_submission = (
+            float(target_qty),
+            float(target_stop_px),
+        )
+        for o_cid in group_meta["pending_cids"]:
+            self._deferred_protective_stop_by_cid[o_cid] = group_meta
+        self._stop_price = float(target_stop_px)
+        self._protective_stop_qty = float(target_qty)
+        self._active_protective_stops_by_inst[inst_key] = []
+        return anchor_cid
+
+    def _consume_deferred_protective_stop_event(
+        self,
+        *,
+        cid: str,
+        deferred_meta: Optional[Dict[str, Any]],
+        deferred_tuple: Optional[Tuple[float, float]],
+    ) -> Optional[Tuple[InstrumentId, float, float, str]]:
+        if deferred_meta is not None and isinstance(deferred_meta.get("pending_cids"), set):
+            pending_cids: set[str] = deferred_meta["pending_cids"]
+            if cid:
+                pending_cids.discard(cid)
+            if pending_cids:
+                return None
+            target_inst = deferred_meta["instrument_id"]
+            self._deferred_protective_stop_groups.pop(str(target_inst), None)
+            if not self._deferred_protective_stop_groups:
+                self._deferred_protective_stop_submission = None
+            target_qty = float(deferred_meta["target_qty"])
+            target_stop_px = float(deferred_meta["target_stop_px"])
+            sym = self._symbol_from_instrument_id(target_inst)
+            parent_entry_cid = str(
+                deferred_meta.get("parent_entry_cid") or f"cancel-replace-{sym}"
+            )
+            return target_inst, target_qty, target_stop_px, parent_entry_cid
+        self._deferred_protective_stop_submission = None
+        target_inst = (
+            deferred_meta["instrument_id"]
+            if deferred_meta is not None
+            else self._archetype_config.instrument_id
+        )
+        if deferred_tuple is not None:
+            target_qty, target_stop_px = deferred_tuple
+        elif deferred_meta is not None:
+            target_qty = float(deferred_meta["target_qty"])
+            target_stop_px = float(deferred_meta["target_stop_px"])
+        else:
+            return None
+        sym = self._symbol_from_instrument_id(target_inst)
+        return target_inst, target_qty, target_stop_px, f"cancel-replace-{sym}"
+
+    def _submit_deferred_replacement_stop(
+        self,
+        *,
+        target_inst: InstrumentId,
+        trigger_cid: str,
+        target_stop_px: float,
+        parent_entry_cid: str,
+        fail_reason_prefix: str,
+    ) -> None:
+        pos_qty = self._current_position_qty(target_inst)
+        if pos_qty <= 0.0 or target_stop_px <= 0.0:
+            return
+        eff_qty = pos_qty
+        signed_pos = self._open_position_signed_qty(target_inst)
+        entry_side = self._infer_entry_side_for_position(signed_pos)
+        sym = self._symbol_from_instrument_id(target_inst)
+        new_stop_cid: Optional[str] = None
+        try:
+            stop_qty_obj = self._format_quantity(eff_qty, target_inst)
+            replacement_stop = self._build_protective_stop_order(
+                instrument_id=target_inst,
+                entry_side=entry_side,
+                quantity=stop_qty_obj,
+                stop_loss_price=float(target_stop_px),
+                parent_entry_cid=parent_entry_cid,
+            )
+            if replacement_stop is not None:
+                new_stop_cid = self._register_and_submit_protective_stop_order(
+                    replacement_stop,
+                    target_inst,
+                    stop_qty_obj,
+                    stop_loss_price=float(target_stop_px),
+                )
+        except Exception as exc:
+            logger.error(
+                "Deferred stop replacement submission failed for %s (%s): %s",
+                target_inst,
+                trigger_cid,
+                exc,
+            )
+            new_stop_cid = None
+        if new_stop_cid:
+            self._notify_stop_leg_replaced(
+                sym,
+                trigger_cid or f"deferred-replace-{sym}",
+                new_stop_cid,
+                new_covered_qty=Decimal(f"{eff_qty:.6f}"),
+                stop_price=float(target_stop_px),
+            )
+            self._active_protective_stops_by_inst[str(target_inst)] = [new_stop_cid]
+        else:
+            self._active_protective_stops_by_inst[str(target_inst)] = []
+            self._fail_closed_unprotected_position(
+                target_inst=target_inst,
+                cid=trigger_cid or None,
+                reason=f"{fail_reason_prefix}:{trigger_cid}",
+                pos_qty=Decimal(f"{eff_qty:.6f}"),
+                reference_price=float(target_stop_px),
+            )
 
     def _sync_protective_stop_for_entry_fill(
         self,
@@ -3295,8 +3994,9 @@ class BaseArchetypeStrategy(Strategy):
                 instrument_id=inst_id,
             )
 
-        stop_qty_obj = self._format_quantity(desired_stop_qty, inst_id)
+        new_stop_cid: Optional[str] = None
         try:
+            stop_qty_obj = self._format_quantity(desired_stop_qty, inst_id)
             replacement_stop = self._build_protective_stop_order(
                 instrument_id=inst_id,
                 entry_side=spec["entry_side"],
@@ -3304,35 +4004,70 @@ class BaseArchetypeStrategy(Strategy):
                 stop_loss_price=target_stop_px,
                 parent_entry_cid=spec["parent_entry_cid"],
             )
-            planned_new_cid = (
-                str(replacement_stop.client_order_id)
-                if replacement_stop is not None
-                else ""
-            )
-            for old_stop in open_stops:
-                old_cid = str(getattr(old_stop, "client_order_id", "") or "")
-                if not old_cid or old_cid == planned_new_cid:
-                    continue
-                self._notify_stop_leg_replaced(
-                    sym,
-                    old_cid,
-                    planned_new_cid,
-                    new_covered_qty=desired_stop_qty,
-                    stop_price=target_stop_px,
-                )
-                self._remove_tracked_stop_cid(old_cid, inst_id)
-                self._cancel_single_order_safely(old_stop)
+            if replacement_stop is None:
+                new_stop_cid = None
+            else:
+                planned_new_cid = str(replacement_stop.client_order_id or "").strip()
+                old_stop_by_cid: Dict[str, Any] = {}
+                for old_stop in open_stops:
+                    old_cid = str(getattr(old_stop, "client_order_id", "") or "")
+                    if old_cid and old_cid != planned_new_cid:
+                        old_stop_by_cid[old_cid] = old_stop
+                for prev_cid in list(self._active_protective_stops_by_inst.get(inst_key, [])):
+                    if prev_cid and prev_cid != planned_new_cid and prev_cid not in old_stop_by_cid:
+                        old_stop_by_cid[prev_cid] = self._stop_orders_by_cid.get(prev_cid) or ClientOrderId(prev_cid)
+                old_cids_for_replace: List[str] = []
+                for old_cid, old_stop in old_stop_by_cid.items():
+                    old_cids_for_replace.append(old_cid)
+                    self._notify_stop_leg_replaced(
+                        sym,
+                        old_cid,
+                        planned_new_cid,
+                        new_covered_qty=desired_stop_qty,
+                        stop_price=target_stop_px,
+                        status="REPLACING",
+                    )
+                    self._remove_tracked_stop_cid(old_cid, inst_id)
+                    cached_old = (
+                        self._lookup_order_in_cache(old_stop)
+                        if not isinstance(old_stop, ClientOrderId)
+                        else None
+                    ) or self._lookup_order_in_cache(old_cid)
+                    if cached_old is None or (
+                        not bool(getattr(cached_old, "is_closed", True))
+                        and self._normalized_order_status(cached_old) != "PENDING_CANCEL"
+                    ):
+                        self._cancel_single_order_safely(old_stop)
 
-            new_stop_cid = (
-                self._register_and_submit_protective_stop_order(
+                still_open_old_cids = self._collect_still_open_stop_cids(
+                    inst_key, old_cids_for_replace, old_stop_by_cid
+                )
+                if still_open_old_cids:
+                    return self._register_deferred_protective_stop_group(
+                        target_inst=inst_id,
+                        still_open_cids=still_open_old_cids,
+                        target_qty=desired_stop_qty,
+                        target_stop_px=target_stop_px,
+                        planned_new_cid=planned_new_cid,
+                        parent_entry_cid=str(spec.get("parent_entry_cid") or f"cancel-replace-{sym}"),
+                    )
+
+                new_stop_cid = self._register_and_submit_protective_stop_order(
                     replacement_stop,
                     inst_id,
                     stop_qty_obj,
                     stop_loss_price=target_stop_px,
                 )
-                if replacement_stop is not None
-                else None
-            )
+                if new_stop_cid:
+                    ref_old_cid = old_cids_for_replace[-1] if old_cids_for_replace else new_stop_cid
+                    self._notify_stop_leg_replaced(
+                        sym,
+                        ref_old_cid,
+                        new_stop_cid,
+                        new_covered_qty=desired_stop_qty,
+                        stop_price=target_stop_px,
+                        status="ACTIVE",
+                    )
         except Exception as exc:
             logger.error(
                 "Protective stop submission failed for %s (parent=%s): %s",
@@ -3342,25 +4077,16 @@ class BaseArchetypeStrategy(Strategy):
             )
             new_stop_cid = None
 
-        if new_stop_cid is None:
-            actor = self._resolve_telemetry_actor()
-            if actor is not None and hasattr(actor, "oco_monitor") and desired_stop_qty > Decimal("0"):
-                try:
-                    actor.oco_monitor.invalidate_protective_order(
-                        symbol=sym,
-                        reason=f"PROTECTIVE_STOP_SUBMISSION_FAILED:{spec.get('parent_entry_cid')}",
-                    )
-                    actor.oco_monitor.verify_position_coverage(
-                        symbol=sym,
-                        pos_qty=desired_stop_qty,
-                        override_reason=f"PROTECTIVE_STOP_SUBMISSION_FAILED:{spec.get('parent_entry_cid')}",
-                    )
-                except Exception as oco_exc:
-                    logger.error(
-                        "Failed to trigger protective OCO verification on stop submission failure for %s: %s",
-                        sym,
-                        oco_exc,
-                    )
+        if not new_stop_cid:
+            self._active_protective_stops_by_inst[inst_key] = []
+            if desired_stop_qty > Decimal("0"):
+                self._fail_closed_unprotected_position(
+                    target_inst=inst_id,
+                    cid=None,
+                    reason=f"PROTECTIVE_STOP_SUBMISSION_FAILED:{spec.get('parent_entry_cid')}",
+                    pos_qty=desired_stop_qty,
+                    reference_price=target_stop_px,
+                )
             return None
 
         self._active_protective_stops_by_inst[inst_key] = [new_stop_cid]
@@ -3434,6 +4160,7 @@ class BaseArchetypeStrategy(Strategy):
             if pending_cids:
                 return
 
+            self._cancel_safe_exit_ttl_timer(inst_key)
             self._pending_safe_exits.pop(inst_key, None)
             current_abs_pos = abs(self._open_position_signed_qty(target_inst))
             initial_abs_pos = _to_decimal(spec.get("initial_abs_pos_qty"), "0")
@@ -3486,6 +4213,7 @@ class BaseArchetypeStrategy(Strategy):
             self._active_exit_orders_by_inst.pop(inst_key, None)
             target_inst = InstrumentId.from_str(inst_key)
             sym = self._symbol_from_instrument_id(target_inst)
+            self._notify_safe_exit_end(sym)
             signed_qty = self._open_position_signed_qty(target_inst)
             open_stops = self._get_open_protective_stop_orders(target_inst)
             if signed_qty != Decimal("0") and not open_stops:
@@ -3509,7 +4237,6 @@ class BaseArchetypeStrategy(Strategy):
                             cid,
                             exc,
                         )
-            self._notify_safe_exit_end(sym)
 
     def on_order_accepted(self, event: Any) -> None:
         cid = str(self._event_get(event, "client_order_id", "") or "")
@@ -3587,10 +4314,11 @@ class BaseArchetypeStrategy(Strategy):
                         else float(self._trailing_stop_price)
                     )
             qty_differs = pos_qty > 0.0 and abs(pos_qty - stop_qty) > 1e-6
+            tick_f = float(self._resolve_tick_size(target_inst))
             px_differs = (
                 desired_px > 0.0
                 and stop_px > 0.0
-                and abs(round(desired_px, 2) - round(stop_px, 2)) >= 0.01
+                and abs(desired_px - stop_px) >= (tick_f * 0.5)
             )
             if not qty_differs and not px_differs:
                 return
@@ -3611,6 +4339,8 @@ class BaseArchetypeStrategy(Strategy):
             return
         self._unconfirmed_stop_cids.discard(cid)
         self._prior_stop_qty_by_cid.pop(cid, None)
+        self._prior_stop_price_by_cid.pop(cid, None)
+        self._attempted_stop_price_by_cid.pop(cid, None)
         venue_id = self._event_get(event, "venue_order_id", None)
         if venue_id is not None:
             self._venue_order_id_by_cid[cid] = venue_id
@@ -3719,10 +4449,11 @@ class BaseArchetypeStrategy(Strategy):
                         else float(self._trailing_stop_price)
                     )
             qty_differs = pos_qty > 0.0 and abs(pos_qty - stop_qty) > 1e-6
+            tick_f = float(self._resolve_tick_size(target_inst))
             px_differs = (
                 desired_px > 0.0
                 and stop_px > 0.0
-                and abs(round(desired_px, 2) - round(stop_px, 2)) >= 0.01
+                and abs(desired_px - stop_px) >= (tick_f * 0.5)
             )
             if not qty_differs and not px_differs:
                 if confirmed_px > 0.0 and confirmed_qty > Decimal("0"):
@@ -3745,13 +4476,14 @@ class BaseArchetypeStrategy(Strategy):
 
         current_stop_qty = float(self._stop_qty_by_cid.get(cid, Decimal("0")))
         current_stop_px = float(self._stop_price_by_cid.get(cid, 0.0) or 0.0)
+        tick_f = float(self._resolve_tick_size(target_inst))
         if (
             target_qty > 0.0
             and target_stop_px > 0.0
             and order_obj is not None
             and (
                 abs(target_qty - current_stop_qty) > 1e-6
-                or (current_stop_px > 0.0 and abs(round(target_stop_px, 2) - round(current_stop_px, 2)) >= 0.01)
+                or (current_stop_px > 0.0 and abs(target_stop_px - current_stop_px) >= (tick_f * 0.5))
             )
         ):
             self._apply_atomic_protective_stop_modify(
@@ -3987,6 +4719,15 @@ class BaseArchetypeStrategy(Strategy):
             restored_qty = self._prior_stop_qty_by_cid.pop(cid)
             self._stop_qty_by_cid[cid] = restored_qty
             self._protective_stop_qty = float(restored_qty)
+        has_prior_stop_px = False
+        restored_stop_px = 0.0
+        attempted_stop_px = self._attempted_stop_price_by_cid.pop(cid, 0.0) if cid else 0.0
+        if cid and cid in self._prior_stop_price_by_cid:
+            restored_stop_px = float(self._prior_stop_price_by_cid.pop(cid))
+            has_prior_stop_px = restored_stop_px > 0.0
+            self._stop_price_by_cid[cid] = restored_stop_px
+            if restored_stop_px > 0.0:
+                self._stop_price = restored_stop_px
 
         safe_exit_spec = self._pending_safe_exits.get(str(target_inst))
         if safe_exit_spec is not None and cid in safe_exit_spec.get("pending_stop_cids", set()):
@@ -4008,27 +4749,34 @@ class BaseArchetypeStrategy(Strategy):
         if target_qty <= 0.0:
             return
 
-        target_stop_px = float(
+        live_stop_px = float(
             self._stop_price
             if self._stop_price is not None and self._stop_price > 0.0
             else (self._stop_price_by_cid.get(cid, 0.0) or 0.0)
         )
+        if not has_prior_stop_px and self._trailing_stop_price is not None and self._trailing_stop_price > 0.0:
+            if self._archetype_config.plan_side == PlanSide.LONG:
+                live_stop_px = max(live_stop_px, float(self._trailing_stop_price))
+            else:
+                live_stop_px = (
+                    min(live_stop_px, float(self._trailing_stop_price))
+                    if live_stop_px > 0.0
+                    else float(self._trailing_stop_price)
+                )
+        if live_stop_px <= 0.0 and self._risk_envelope is not None:
+            live_stop_px = float(self._risk_envelope.initial_stop_price)
+        if live_stop_px <= 0.0:
+            return
+
+        target_stop_px = attempted_stop_px if attempted_stop_px > 0.0 else live_stop_px
         if self._trailing_stop_price is not None and self._trailing_stop_price > 0.0:
             if self._archetype_config.plan_side == PlanSide.LONG:
                 target_stop_px = max(target_stop_px, float(self._trailing_stop_price))
             else:
-                target_stop_px = (
-                    min(target_stop_px, float(self._trailing_stop_price))
-                    if target_stop_px > 0.0
-                    else float(self._trailing_stop_price)
-                )
-        if target_stop_px <= 0.0 and self._risk_envelope is not None:
-            target_stop_px = float(self._risk_envelope.initial_stop_price)
-        if target_stop_px <= 0.0:
-            return
+                target_stop_px = min(target_stop_px, float(self._trailing_stop_price))
 
         latest_px = self._resolve_latest_market_price(target_inst)
-        fmt_target_stop_px = float(self._format_price(target_stop_px, target_inst).as_double())
+        fmt_live_stop_px = float(self._format_price(live_stop_px, target_inst).as_double())
         reason_str = str(self._event_get(event, "reason", "") or "").lower()
         signed_pos = self._open_position_signed_qty(target_inst)
         is_long_pos = (
@@ -4037,8 +4785,8 @@ class BaseArchetypeStrategy(Strategy):
             else self._archetype_config.plan_side == PlanSide.LONG
         )
         price_breached = (
-            (is_long_pos and latest_px > 0.0 and latest_px <= fmt_target_stop_px)
-            or (not is_long_pos and latest_px > 0.0 and latest_px >= fmt_target_stop_px)
+            (is_long_pos and latest_px > 0.0 and latest_px <= fmt_live_stop_px)
+            or (not is_long_pos and latest_px > 0.0 and latest_px >= fmt_live_stop_px)
             or "in the market" in reason_str
             or "stop price" in reason_str
             or "stop px" in reason_str
@@ -4065,6 +4813,7 @@ class BaseArchetypeStrategy(Strategy):
                 instrument_id=target_inst,
             )
             if not exit_cid and str(target_inst) not in self._pending_safe_exits:
+                self._notify_safe_exit_end(sym)
                 actor = self._resolve_telemetry_actor()
                 if actor is not None and hasattr(actor, "oco_monitor"):
                     try:
@@ -4103,16 +4852,80 @@ class BaseArchetypeStrategy(Strategy):
         elif cid:
             self._cancel_single_order_safely(ClientOrderId(cid))
 
-    def on_order_filled(self, event: Any) -> None:
+    def on_order_filled(self, event: Any, *, _is_partial_call: bool = False) -> None:
         cid = str(self._event_get(event, "client_order_id", "") or "")
         if not cid:
             return
-        self._filled_order_ids.add(cid)
         event_id = self._event_get(event, "event_id", None) or self._event_get(event, "id", None)
         trade_id = self._event_get(event, "trade_id", None)
-        ts_event = self._event_get(event, "ts_event", None)
-        fill_key = f"id:{event_id}" if event_id is not None else f"fill:{cid}:{trade_id}:{ts_event}"
-        self._processed_fill_keys.add(fill_key)
+        trade_id_str = (
+            str(trade_id).strip()
+            if trade_id is not None and str(trade_id).strip()
+            else ""
+        )
+        event_id_str = (
+            str(event_id).strip()
+            if event_id is not None and str(event_id).strip()
+            else ""
+        )
+        if trade_id_str:
+            fill_key: Optional[str] = f"trade:{cid}:{trade_id_str}"
+        elif event_id_str:
+            fill_key = f"id:{event_id_str}"
+        else:
+            ev_ts_ns = int(self._event_get(event, "ts_event", 0) or 0)
+            if ev_ts_ns > 0:
+                ev_qty_s = str(self._event_get(event, "last_qty", "") or "")
+                ev_px_s = str(self._event_get(event, "last_px", "") or "")
+                fill_key = f"ts:{cid}:{ev_ts_ns}:{ev_qty_s}:{ev_px_s}"
+            else:
+                fill_key = None
+        if fill_key is not None:
+            if fill_key in self._processed_fill_keys:
+                return
+            self._processed_fill_keys.add(fill_key)
+
+        leaves_obj = getattr(event, "leaves_qty", None)
+        leaves_dec = (
+            _to_decimal(
+                leaves_obj.as_decimal() if hasattr(leaves_obj, "as_decimal") else leaves_obj,
+                "0",
+            )
+            if leaves_obj is not None
+            else None
+        )
+        cached_order_for_fill = self._lookup_order_in_cache(cid)
+        is_explicit_partial = (
+            _is_partial_call
+            or bool(self._event_get(event, "is_partial", False))
+            or str(self._event_get(event, "status", "") or "").strip().upper()
+            == "PARTIALLY_FILLED"
+        )
+        if leaves_dec is not None:
+            is_fully_filled = leaves_dec <= Decimal("0")
+        elif cached_order_for_fill is not None:
+            co_qty = _to_decimal(getattr(cached_order_for_fill, "quantity", None), "0")
+            co_filled = _to_decimal(getattr(cached_order_for_fill, "filled_qty", None), "0")
+            co_leaves_raw = getattr(cached_order_for_fill, "leaves_qty", None)
+            co_leaves = (
+                _to_decimal(
+                    co_leaves_raw.as_decimal()
+                    if hasattr(co_leaves_raw, "as_decimal")
+                    else co_leaves_raw,
+                    "1",
+                )
+                if co_leaves_raw is not None
+                else max(Decimal("0"), co_qty - co_filled)
+            )
+            is_fully_filled = bool(getattr(cached_order_for_fill, "is_closed", False)) or (
+                co_qty > Decimal("0") and (co_leaves <= Decimal("0") or co_filled >= co_qty)
+            )
+        elif is_explicit_partial:
+            is_fully_filled = False
+        else:
+            is_fully_filled = True
+        if is_fully_filled:
+            self._filled_order_ids.add(cid)
 
         last_qty = self._event_get(event, "last_qty", None)
         if last_qty is None:
@@ -4176,30 +4989,54 @@ class BaseArchetypeStrategy(Strategy):
             if cid in stop_cids:
                 ev_ts = int(getattr(event, "ts_event", 0) or getattr(event, "ts_init", 0) or 0)
                 self._last_stop_exit_ts_ns = max(self._last_stop_exit_ts_ns, ev_ts, self._last_bar_ts_ns)
-                self._trailing_stop_price = None
                 stop_total = self._stop_qty_by_cid.get(cid, Decimal("0"))
-                if stop_total <= Decimal("0") or fill_qty_dec >= stop_total:
-                    self._remove_tracked_stop_cid(
-                        cid, InstrumentId.from_str(inst_key)
-                    )
+                if stop_total <= Decimal("0") and cached_order_for_fill is not None:
+                    stop_total = _to_decimal(getattr(cached_order_for_fill, "quantity", None), "0")
+                stop_is_terminal = (
+                    is_fully_filled
+                    and (leaves_dec is None or leaves_dec <= Decimal("0"))
+                    and (stop_total <= Decimal("0") or fill_qty_dec >= stop_total)
+                )
+                if stop_is_terminal:
+                    target_stop_inst = InstrumentId.from_str(inst_key)
+                    self._remove_tracked_stop_cid(cid, target_stop_inst)
+                    if abs(self._open_position_signed_qty(target_stop_inst)) <= Decimal("0"):
+                        self._trailing_stop_price = None
+                        self._stop_price = None
+                        self._peak_favorable_price = None
+                        if inst_key == str(self._archetype_config.instrument_id):
+                            self._tracked_signed_qty_by_inst.pop(inst_key, None)
+                            self._entry_filled_qty = 0.0
+                        if hasattr(self, "_anchor_target"):
+                            self._anchor_target = None
+                        if hasattr(self, "_entry_reference_price"):
+                            self._entry_reference_price = None
                 else:
-                    self._stop_qty_by_cid[cid] = max(
-                        Decimal("0"), stop_total - fill_qty_dec
+                    if leaves_dec is not None and leaves_dec > Decimal("0"):
+                        self._stop_qty_by_cid[cid] = leaves_dec
+                    elif stop_total > Decimal("0"):
+                        self._stop_qty_by_cid[cid] = max(
+                            Decimal("0"), stop_total - fill_qty_dec
+                        )
+
+        if cid and cid in self._deferred_protective_stop_by_cid:
+            def_fill_meta = self._deferred_protective_stop_by_cid.pop(cid, None)
+            consumed = self._consume_deferred_protective_stop_event(
+                cid=cid,
+                deferred_meta=def_fill_meta,
+                deferred_tuple=self._deferred_protective_stop_submission,
+            )
+            if consumed is not None:
+                t_inst, _t_qty, t_stop_px, p_entry_cid = consumed
+                if self._current_position_qty(t_inst) > 0.0 and not self._get_open_protective_stop_orders(t_inst):
+                    self._submit_deferred_replacement_stop(
+                        target_inst=t_inst,
+                        trigger_cid=cid,
+                        target_stop_px=t_stop_px,
+                        parent_entry_cid=p_entry_cid,
+                        fail_reason_prefix="DEFERRED_STOP_FILL_REPLACE_FAILED",
                     )
 
-        for inst_key, active_exit_cid in list(self._active_exit_orders_by_inst.items()):
-            if active_exit_cid == cid:
-                target_inst = InstrumentId.from_str(inst_key)
-                if self._open_position_signed_qty(target_inst) == Decimal("0"):
-                    self._active_exit_orders_by_inst.pop(inst_key, None)
-                    self._notify_safe_exit_end(
-                        self._symbol_from_instrument_id(target_inst)
-                    )
-
-        # 3. Position-driven protective stop synchronization for entry partial/full fills
-        lookup_cid = cid
-        if "-E" in cid:
-            lookup_cid = cid.rsplit("-E", 1)[0]
         leaves_obj = getattr(event, "leaves_qty", None)
         leaves_dec = (
             _to_decimal(
@@ -4209,6 +5046,100 @@ class BaseArchetypeStrategy(Strategy):
             if leaves_obj is not None
             else None
         )
+        for inst_key, active_exit_cid in list(self._active_exit_orders_by_inst.items()):
+            if active_exit_cid == cid:
+                target_inst = InstrumentId.from_str(inst_key)
+                sym = self._symbol_from_instrument_id(target_inst)
+                rem_signed = self._open_position_signed_qty(target_inst)
+                cached_exit = self._lookup_order_in_cache(cid)
+                cached_closed = bool(getattr(cached_exit, "is_closed", False)) if cached_exit is not None else False
+                cached_leaves_raw = getattr(cached_exit, "leaves_qty", None) if cached_exit is not None else None
+                if cached_leaves_raw is not None:
+                    cached_leaves = _to_decimal(
+                        cached_leaves_raw.as_decimal()
+                        if hasattr(cached_leaves_raw, "as_decimal")
+                        else cached_leaves_raw,
+                        "0",
+                    )
+                elif cached_exit is not None and getattr(cached_exit, "quantity", None) is not None:
+                    ex_qty_raw = getattr(cached_exit, "quantity", 0)
+                    ex_fill_raw = getattr(cached_exit, "filled_qty", 0)
+                    ex_qty_dec = _to_decimal(
+                        ex_qty_raw.as_decimal() if hasattr(ex_qty_raw, "as_decimal") else ex_qty_raw,
+                        "0",
+                    )
+                    ex_fill_dec = _to_decimal(
+                        ex_fill_raw.as_decimal() if hasattr(ex_fill_raw, "as_decimal") else ex_fill_raw,
+                        "0",
+                    )
+                    cached_leaves = max(Decimal("0"), ex_qty_dec - ex_fill_dec)
+                else:
+                    cached_leaves = None
+                exit_order_closed = (
+                    (leaves_dec is not None and leaves_dec <= Decimal("0"))
+                    or cached_closed
+                    or (cached_leaves is not None and cached_leaves <= Decimal("0"))
+                )
+                if rem_signed == Decimal("0"):
+                    self._active_exit_orders_by_inst.pop(inst_key, None)
+                    self._exit_retry_count_by_inst.pop(inst_key, None)
+                    self._notify_safe_exit_end(sym)
+                elif exit_order_closed:
+                    self._active_exit_orders_by_inst.pop(inst_key, None)
+                    self._notify_safe_exit_end(sym)
+                    if self._thesis_invalidated or self._exit_only_mode:
+                        retry_cnt = self._exit_retry_count_by_inst.get(inst_key, 0)
+                        if retry_cnt < 3:
+                            self._exit_retry_count_by_inst[inst_key] = retry_cnt + 1
+                            self._submit_exit(
+                                reason="RESIDUAL_POSITION_FAIL_CLOSED_EXIT",
+                                quantity=abs(rem_signed),
+                                instrument_id=target_inst,
+                            )
+                    elif self._should_submit_protective_stop():
+                        rem_abs = abs(rem_signed)
+                        active_stop_cids = list(
+                            self._active_protective_stops_by_inst.get(inst_key, [])
+                        )
+                        covered_dec = sum(
+                            (
+                                self._stop_qty_by_cid.get(sc, Decimal("0"))
+                                for sc in active_stop_cids
+                            ),
+                            Decimal("0"),
+                        )
+                        if covered_dec < rem_abs:
+                            tightest = self._current_tightest_stop_price(target_inst)
+                            stop_px = float(tightest) if tightest is not None and tightest > Decimal("0") else float(self._stop_price or 0.0)
+                            if self._trailing_stop_price is not None and float(self._trailing_stop_price) > 0.0:
+                                if rem_signed > Decimal("0"):
+                                    stop_px = max(stop_px, float(self._trailing_stop_price))
+                                elif stop_px <= 0.0:
+                                    stop_px = float(self._trailing_stop_price)
+                                else:
+                                    stop_px = min(stop_px, float(self._trailing_stop_price))
+                            if stop_px > 0.0:
+                                entry_side = self._infer_entry_side_for_position(rem_signed)
+                                stop_qty_obj = self._format_quantity(float(rem_abs), target_inst)
+                                rep_stop = self._build_protective_stop_order(
+                                    instrument_id=target_inst,
+                                    entry_side=entry_side,
+                                    quantity=stop_qty_obj,
+                                    stop_loss_price=stop_px,
+                                    parent_entry_cid=f"residual-{cid}",
+                                )
+                                if rep_stop is not None:
+                                    self._register_and_submit_protective_stop_order(
+                                        rep_stop,
+                                        target_inst,
+                                        stop_qty_obj,
+                                        stop_loss_price=stop_px,
+                                    )
+
+        # 3. Position-driven protective stop synchronization for entry partial/full fills
+        lookup_cid = cid
+        if "-E" in cid:
+            lookup_cid = cid.rsplit("-E", 1)[0]
         spec = self._pending_protective_stops.get(cid)
         if spec is None and "-E" in cid:
             spec = self._pending_protective_stops.get(lookup_cid)
@@ -4277,7 +5208,7 @@ class BaseArchetypeStrategy(Strategy):
                     self._pending_protective_stops.pop(lookup_cid, None)
 
     def on_order_partially_filled(self, event: Any) -> None:
-        self.on_order_filled(event)
+        self.on_order_filled(event, _is_partial_call=True)
 
     def _is_order_denied_or_rejected(self, cid: str) -> bool:
         if not cid:
@@ -4308,37 +5239,9 @@ class BaseArchetypeStrategy(Strategy):
                 return True
         return False
 
-    def _on_order_terminal(self, event: Any, status_str: str) -> None:
-        cid = str(self._event_get(event, "client_order_id", "") or "")
+    def _is_tracked_protective_stop(self, cid: str) -> bool:
         if not cid:
-            return
-        base_cid = cid.rsplit("-E", 1)[0] if "-E" in cid else cid
-        norm_status = str(status_str or "").strip().upper()
-        if norm_status == "DENIED":
-            self._denied_order_ids.add(cid)
-            self._denied_order_ids.add(base_cid)
-        elif norm_status == "REJECTED":
-            self._rejected_order_ids.add(cid)
-            self._rejected_order_ids.add(base_cid)
-        dedup_key = (base_cid, norm_status)
-        if dedup_key in self._processed_terminal_events:
-            return
-        self._processed_terminal_events.add(dedup_key)
-        for e_inst_key, e_spec in list(self._active_entry_orders_by_inst.items()):
-            if e_spec.get("cid") in (cid, base_cid):
-                self._active_entry_orders_by_inst.pop(e_inst_key, None)
-        self._pending_protective_stops.pop(cid, None)
-        if "-E" in cid:
-            self._pending_protective_stops.pop(base_cid, None)
-        self._remove_tracked_stop_cid(cid)
-        self._advance_pending_safe_exit_for_stop_event(cid, stop_filled=False)
-        self._handle_exit_order_failure(cid, status_str)
-
-    def on_order_denied(self, event: Any) -> None:
-        self._on_order_terminal(event, "DENIED")
-
-    def on_order_rejected(self, event: Any) -> None:
-        cid = str(self._event_get(event, "client_order_id", "") or "")
+            return False
         primary_stop_cid = (
             str(
                 getattr(
@@ -4351,30 +5254,193 @@ class BaseArchetypeStrategy(Strategy):
             if self._protective_stop_order_id is not None
             else ""
         )
-        t_meta = self._order_side_by_cid.get(cid)
-        target_inst = (
-            InstrumentId.from_str(t_meta[0])
-            if t_meta is not None
-            else self._archetype_config.instrument_id
-        )
-        is_protective_stop = (
-            (cid and cid == primary_stop_cid)
+        return (
+            cid == primary_stop_cid
             or cid in self._stop_orders_by_cid
             or any(
                 cid in cids
                 for cids in self._active_protective_stops_by_inst.values()
             )
         )
-        self._on_order_terminal(event, "REJECTED")
+
+    def _on_order_terminal(self, event: Any, status_str: str) -> None:
+        cid = str(self._event_get(event, "client_order_id", "") or "")
+        if not cid:
+            return
+        base_cid = cid.rsplit("-E", 1)[0] if "-E" in cid else cid
+        norm_status = str(status_str or "").strip().upper()
+        parent_still_open = False
+        if "-E" in cid and norm_status in ("CANCELED", "EXPIRED", "DENIED", "REJECTED"):
+            parent_order = self._lookup_order_in_cache(base_cid)
+            if parent_order is not None and not bool(
+                getattr(parent_order, "is_closed", False)
+            ):
+                p_leaves = _to_decimal(getattr(parent_order, "leaves_qty", None), "0")
+                parent_still_open = p_leaves > Decimal("0")
+            if not parent_still_open and self._is_trader_registered():
+                try:
+                    cache_obj = self.cache
+                except RuntimeError:
+                    cache_obj = None
+                if cache_obj is not None and hasattr(cache_obj, "orders_open"):
+                    try:
+                        open_orders = cache_obj.orders_open() or ()
+                    except Exception:
+                        open_orders = ()
+                    sibling_prefix = f"{base_cid}-E"
+                    for sib in open_orders:
+                        sib_cid = str(getattr(sib, "client_order_id", "") or "")
+                        if (
+                            sib_cid != cid
+                            and sib_cid.startswith(sibling_prefix)
+                            and not bool(getattr(sib, "is_closed", False))
+                            and _to_decimal(getattr(sib, "leaves_qty", None), "0") > Decimal("0")
+                        ):
+                            parent_still_open = True
+                            break
+        if norm_status == "DENIED":
+            self._denied_order_ids.add(cid)
+            if not parent_still_open:
+                self._denied_order_ids.add(base_cid)
+        elif norm_status == "REJECTED":
+            self._rejected_order_ids.add(cid)
+            if not parent_still_open:
+                self._rejected_order_ids.add(base_cid)
+        dedup_key = (cid, norm_status)
+        if dedup_key in self._processed_terminal_events:
+            return
+        self._processed_terminal_events.add(dedup_key)
+        was_protective_stop = self._is_tracked_protective_stop(cid)
+        removed_entry_inst_keys: List[str] = []
+        if not parent_still_open:
+            for e_inst_key, e_spec in list(self._active_entry_orders_by_inst.items()):
+                if e_spec.get("cid") in (cid, base_cid):
+                    self._active_entry_orders_by_inst.pop(e_inst_key, None)
+                    removed_entry_inst_keys.append(e_inst_key)
+            self._pending_protective_stops.pop(cid, None)
+            if "-E" in cid:
+                self._pending_protective_stops.pop(base_cid, None)
+        self._remove_tracked_stop_cid(cid)
+        self._advance_pending_safe_exit_for_stop_event(cid, stop_filled=False)
+        self._handle_exit_order_failure(cid, status_str)
+        if (
+            not parent_still_open
+            and not was_protective_stop
+            and norm_status in ("CANCELED", "EXPIRED", "DENIED", "REJECTED")
+            and cid not in self._active_exit_orders_by_inst.values()
+        ):
+            t_meta = self._order_side_by_cid.get(cid) or self._order_side_by_cid.get(base_cid)
+            term_inst = (
+                InstrumentId.from_str(t_meta[0])
+                if t_meta is not None
+                else (
+                    InstrumentId.from_str(removed_entry_inst_keys[0])
+                    if removed_entry_inst_keys
+                    else self._archetype_config.instrument_id
+                )
+            )
+            term_inst_key = str(term_inst)
+            if (
+                term_inst_key not in self._active_entry_orders_by_inst
+                and abs(self._open_position_signed_qty(term_inst)) <= Decimal("0")
+                and self._current_position_qty(term_inst) <= 0.0
+                and not self._pending_protective_stops
+            ):
+                self._trailing_stop_price = None
+                self._peak_favorable_price = None
+                if hasattr(self, "_anchor_target"):
+                    self._anchor_target = None
+                if hasattr(self, "_entry_reference_price"):
+                    self._entry_reference_price = None
+
+    def _fail_closed_unprotected_position(
+        self,
+        *,
+        target_inst: Optional[InstrumentId] = None,
+        cid: Optional[str] = None,
+        reason: str,
+        pos_qty: Optional[Decimal] = None,
+        reference_price: Optional[float] = None,
+    ) -> Optional[str]:
+        """Transitions an unprotected live position fail-closed: invalidates OCO coverage,
+        blocks new entries (`_exit_only_mode=True`), cancels open entries, and triggers Safe Exit."""
+        inst = target_inst or self._archetype_config.instrument_id
+        sym = self._symbol_from_instrument_id(inst)
+        eff_qty = (
+            float(pos_qty)
+            if pos_qty is not None and pos_qty > Decimal("0")
+            else max(self._current_position_qty(inst), self._entry_filled_qty)
+        )
+        if eff_qty <= 0.0:
+            return None
+        self._exit_only_mode = True
+        self._cancel_open_entry_orders_for_symbol(inst)
+        actor = self._resolve_telemetry_actor()
+        oco_mon = (
+            getattr(actor, "oco_monitor", None)
+            or getattr(actor, "_oco_monitor", None)
+            if actor is not None
+            else None
+        )
+        if oco_mon is not None:
+            try:
+                if hasattr(oco_mon, "invalidate_protective_order"):
+                    if cid:
+                        oco_mon.invalidate_protective_order(
+                            symbol=sym,
+                            broker_order_id=cid,
+                            reason=reason,
+                        )
+                    else:
+                        oco_mon.invalidate_protective_order(
+                            symbol=sym,
+                            reason=reason,
+                        )
+                if hasattr(oco_mon, "verify_position_coverage"):
+                    oco_mon.verify_position_coverage(
+                        symbol=sym,
+                        pos_qty=Decimal(f"{eff_qty:.6f}"),
+                        override_reason=reason,
+                    )
+            except Exception as oco_exc:
+                logger.error(
+                    "Failed to trigger protective OCO verification for %s (%s): %s",
+                    sym,
+                    reason,
+                    oco_exc,
+                )
+        self._notify_safe_exit_begin(sym)
+        exit_cid = self._submit_exit(
+            reason=reason,
+            reference_price=float(reference_price or 0.0),
+            instrument_id=inst,
+        )
+        if not exit_cid and str(inst) not in self._pending_safe_exits:
+            self._notify_safe_exit_end(sym)
+        return exit_cid
+
+    def _handle_protective_stop_terminal_failure(self, event: Any, status_str: str) -> None:
+        cid = str(self._event_get(event, "client_order_id", "") or "")
+        t_meta = self._order_side_by_cid.get(cid)
+        target_inst = (
+            InstrumentId.from_str(t_meta[0])
+            if t_meta is not None
+            else self._archetype_config.instrument_id
+        )
+        is_protective_stop = self._is_tracked_protective_stop(cid)
+        norm_status = str(status_str or "").strip().upper()
+        self._on_order_terminal(event, norm_status)
         if is_protective_stop:
             pos_qty = self._current_position_qty(target_inst)
             if pos_qty > 0.0 or self._entry_filled_qty > 0.0:
+                self._exit_only_mode = True
                 sym = self._symbol_from_instrument_id(target_inst)
                 reason_msg = str(self._event_get(event, "reason", "UNKNOWN") or "UNKNOWN")
                 logger.error(
-                    "Protective stop order %s rejected for %s while holding position (qty=%s, reason=%s); "
+                    "Protective stop order %s %s for %s while holding position (qty=%s, reason=%s); "
                     "canceling open entries and triggering emergency fail-closed safe exit",
                     cid,
+                    norm_status.lower(),
                     target_inst,
                     pos_qty or self._entry_filled_qty,
                     reason_msg,
@@ -4382,20 +5448,27 @@ class BaseArchetypeStrategy(Strategy):
                 self._cancel_open_entry_orders_for_symbol(target_inst)
                 self._notify_safe_exit_begin(sym)
                 exit_cid = self._submit_exit(
-                    reason="PROTECTIVE_STOP_REJECTED_FAIL_CLOSED",
+                    reason=f"PROTECTIVE_STOP_{norm_status}_FAIL_CLOSED",
                     instrument_id=target_inst,
                 )
                 if not exit_cid and str(target_inst) not in self._pending_safe_exits:
+                    self._notify_safe_exit_end(sym)
                     actor = self._resolve_telemetry_actor()
                     if actor is not None and hasattr(actor, "oco_monitor"):
                         try:
                             actor.oco_monitor.invalidate_protective_order(
                                 symbol=sym,
                                 broker_order_id=cid,
-                                reason=f"EMERGENCY_EXIT_FAILED_ON_STOP_REJECT:{cid}:{reason_msg}",
+                                reason=f"EMERGENCY_EXIT_FAILED_ON_STOP_{norm_status}:{cid}:{reason_msg}",
                             )
                         except Exception:
                             pass
+
+    def on_order_denied(self, event: Any) -> None:
+        self._handle_protective_stop_terminal_failure(event, "DENIED")
+
+    def on_order_rejected(self, event: Any) -> None:
+        self._handle_protective_stop_terminal_failure(event, "REJECTED")
 
     def on_order_canceled(self, event: Any) -> None:
         cid = str(self._event_get(event, "client_order_id", "") or "")
@@ -4425,58 +5498,54 @@ class BaseArchetypeStrategy(Strategy):
                 )
             )
         )
-        self._on_order_terminal(event, "CANCELED")
-        if is_deferred_stop_cancel:
-            self._deferred_protective_stop_submission = None
-            target_inst = (
-                deferred_meta["instrument_id"]
-                if deferred_meta is not None
+        is_pending_safe_exit_stop = bool(cid) and any(
+            cid in spec.get("pending_stop_cids", set())
+            for spec in self._pending_safe_exits.values()
+        )
+        is_replaced_stop_cancel = False
+        if cid and cid in self._replaced_protective_stop_cids:
+            self._replaced_protective_stop_cids.discard(cid)
+            t_meta = self._order_side_by_cid.get(cid)
+            cancel_inst = (
+                InstrumentId.from_str(t_meta[0])
+                if t_meta is not None
                 else self._archetype_config.instrument_id
             )
-            if deferred_tuple is not None:
-                target_qty, target_stop_px = deferred_tuple
-            else:
-                target_qty = float(deferred_meta["target_qty"])
-                target_stop_px = float(deferred_meta["target_stop_px"])
-            pos_qty = self._current_position_qty(target_inst)
-            eff_qty = pos_qty if pos_qty > 0.0 else target_qty
-            if eff_qty > 0.0 and target_stop_px > 0.0:
-                signed_pos = self._open_position_signed_qty(target_inst)
-                entry_side = (
-                    OrderSide.BUY
-                    if (
-                        signed_pos > Decimal("0")
-                        or self._archetype_config.plan_side == PlanSide.LONG
-                    )
-                    else OrderSide.SELL
+            pos_flat = (
+                abs(self._open_position_signed_qty(cancel_inst)) <= Decimal("0")
+                and self._entry_filled_qty <= 0.0
+            )
+            has_live_replacement = any(
+                str(getattr(s, "client_order_id", "") or "") != cid
+                for s in self._get_open_protective_stop_orders(cancel_inst)
+            )
+            is_replaced_stop_cancel = pos_flat or has_live_replacement
+        is_unexpected_stop_cancel = (
+            bool(cid)
+            and not is_deferred_stop_cancel
+            and not is_pending_safe_exit_stop
+            and not is_replaced_stop_cancel
+            and self._is_tracked_protective_stop(cid)
+        )
+        if is_unexpected_stop_cancel:
+            self._handle_protective_stop_terminal_failure(event, "CANCELED")
+        else:
+            self._on_order_terminal(event, "CANCELED")
+        if is_deferred_stop_cancel:
+            consumed = self._consume_deferred_protective_stop_event(
+                cid=cid,
+                deferred_meta=deferred_meta,
+                deferred_tuple=deferred_tuple,
+            )
+            if consumed is not None:
+                target_inst, _target_qty, target_stop_px, parent_entry_cid = consumed
+                self._submit_deferred_replacement_stop(
+                    target_inst=target_inst,
+                    trigger_cid=cid,
+                    target_stop_px=target_stop_px,
+                    parent_entry_cid=parent_entry_cid,
+                    fail_reason_prefix="DEFERRED_STOP_REPLACE_SUBMISSION_FAILED",
                 )
-                stop_qty_obj = self._format_quantity(eff_qty, target_inst)
-                sym = self._symbol_from_instrument_id(target_inst)
-                replacement_stop = self._build_protective_stop_order(
-                    instrument_id=target_inst,
-                    entry_side=entry_side,
-                    quantity=stop_qty_obj,
-                    stop_loss_price=float(target_stop_px),
-                    parent_entry_cid=f"cancel-replace-{sym}",
-                )
-                if replacement_stop is not None:
-                    new_stop_cid = self._register_and_submit_protective_stop_order(
-                        replacement_stop,
-                        target_inst,
-                        stop_qty_obj,
-                        stop_loss_price=float(target_stop_px),
-                    )
-                    if new_stop_cid:
-                        self._notify_stop_leg_replaced(
-                            sym,
-                            cid or f"deferred-replace-{sym}",
-                            new_stop_cid,
-                            new_covered_qty=Decimal(f"{eff_qty:.6f}"),
-                            stop_price=float(target_stop_px),
-                        )
-                        self._active_protective_stops_by_inst[str(target_inst)] = [
-                            new_stop_cid
-                        ]
 
     def on_order_cancel_rejected(self, event: Any) -> None:
         cid = str(self._event_get(event, "client_order_id", "") or "")
@@ -4543,68 +5612,121 @@ class BaseArchetypeStrategy(Strategy):
             else:
                 pending_cids.discard(cid)
                 if not pending_cids:
+                    self._cancel_safe_exit_ttl_timer(inst_key)
                     self._pending_safe_exits.pop(inst_key, None)
                     self._notify_safe_exit_end(sym)
             return
 
-        deferred_meta = self._deferred_protective_stop_by_cid.pop(cid, None)
+        deferred_meta = self._deferred_protective_stop_by_cid.pop(cid, None) if cid else None
         deferred_tuple = self._deferred_protective_stop_submission
-        if deferred_meta is not None or deferred_tuple is not None:
-            self._deferred_protective_stop_submission = None
+        if deferred_meta is not None or (
+            deferred_tuple is not None and self._is_tracked_protective_stop(cid)
+        ):
+            target_inst = (
+                deferred_meta["instrument_id"]
+                if deferred_meta is not None
+                else self._archetype_config.instrument_id
+            )
+            if deferred_tuple is not None:
+                target_qty, target_stop_px = deferred_tuple
+            else:
+                target_qty = float(deferred_meta["target_qty"])
+                target_stop_px = float(deferred_meta["target_stop_px"])
+            sym = self._symbol_from_instrument_id(target_inst)
             if is_already_gone and not is_filled:
-                target_inst = (
-                    deferred_meta["instrument_id"]
-                    if deferred_meta is not None
-                    else self._archetype_config.instrument_id
-                )
                 self._remove_tracked_stop_cid(cid, target_inst)
-                if deferred_tuple is not None:
-                    target_qty, target_stop_px = deferred_tuple
+                consumed = self._consume_deferred_protective_stop_event(
+                    cid=cid,
+                    deferred_meta=deferred_meta,
+                    deferred_tuple=deferred_tuple,
+                )
+                if consumed is not None:
+                    c_inst, _c_qty, c_stop_px, c_parent_cid = consumed
+                    self._submit_deferred_replacement_stop(
+                        target_inst=c_inst,
+                        trigger_cid=cid,
+                        target_stop_px=c_stop_px,
+                        parent_entry_cid=c_parent_cid,
+                        fail_reason_prefix="DEFERRED_STOP_CANCEL_REJECTED_REPLACE_FAILED",
+                    )
+            elif not is_filled:
+                if deferred_meta is not None and isinstance(deferred_meta.get("pending_cids"), set):
+                    deferred_meta["pending_cids"].discard(cid)
+                    if not deferred_meta["pending_cids"]:
+                        self._deferred_protective_stop_groups.pop(str(target_inst), None)
+                        if not self._deferred_protective_stop_groups:
+                            self._deferred_protective_stop_submission = None
                 else:
-                    target_qty = float(deferred_meta["target_qty"])
-                    target_stop_px = float(deferred_meta["target_stop_px"])
+                    self._deferred_protective_stop_submission = None
+                # Cancel of the live protective stop was transiently rejected: order remains alive.
+                while cid in self._canceled_order_ids_audit:
+                    self._canceled_order_ids_audit.remove(cid)
+                inst_key = str(target_inst)
+                active_list = self._active_protective_stops_by_inst.setdefault(inst_key, [])
+                if cid not in active_list:
+                    active_list.append(cid)
+                if existing_stop is not None:
+                    self._stop_orders_by_cid[cid] = existing_stop
                 pos_qty = self._current_position_qty(target_inst)
-                eff_qty = pos_qty if pos_qty > 0.0 else target_qty
-                if eff_qty > 0.0 and target_stop_px > 0.0:
-                    signed_pos = self._open_position_signed_qty(target_inst)
-                    entry_side = (
-                        OrderSide.BUY
-                        if (
-                            signed_pos > Decimal("0")
-                            or self._archetype_config.plan_side == PlanSide.LONG
-                        )
-                        else OrderSide.SELL
+                existing_qty = self._stop_qty_by_cid.get(
+                    cid,
+                    _to_decimal(getattr(existing_stop, "quantity", 0), "0")
+                    if existing_stop is not None
+                    else Decimal(f"{max(pos_qty, target_qty):.6f}"),
+                )
+                existing_px = self._stop_price_by_cid.get(cid, 0.0)
+                if existing_px <= 0.0 and existing_stop is not None:
+                    existing_px = self._extract_price_float(
+                        getattr(existing_stop, "trigger_price", None)
                     )
-                    stop_qty_obj = self._format_quantity(eff_qty, target_inst)
-                    sym = self._symbol_from_instrument_id(target_inst)
-                    replacement_stop = self._build_protective_stop_order(
-                        instrument_id=target_inst,
-                        entry_side=entry_side,
-                        quantity=stop_qty_obj,
-                        stop_loss_price=float(target_stop_px),
-                        parent_entry_cid=f"cancel-replace-{sym}",
+                if existing_px <= 0.0:
+                    existing_px = float(target_stop_px or self._stop_price or 0.0)
+                if existing_qty > Decimal("0") and existing_px > 0.0:
+                    self._notify_stop_leg_replaced(
+                        sym,
+                        cid,
+                        cid,
+                        new_covered_qty=existing_qty,
+                        stop_price=float(existing_px),
+                        status="ACTIVE",
                     )
-                    if replacement_stop is not None:
-                        new_stop_cid = self._register_and_submit_protective_stop_order(
-                            replacement_stop,
-                            target_inst,
-                            stop_qty_obj,
-                            stop_loss_price=float(target_stop_px),
+                tick_f = float(self._resolve_tick_size(target_inst))
+                needs_resync = pos_qty > 0.0 and target_stop_px > 0.0 and (
+                    abs(float(existing_qty) - pos_qty) > 1e-6
+                    or abs(float(existing_px) - float(target_stop_px)) >= (tick_f * 0.5)
+                )
+                if needs_resync:
+                    if (
+                        existing_stop is not None
+                        and not self._is_stop_order_unconfirmed_submitted(existing_stop)
+                    ):
+                        mod_cid = self._apply_atomic_protective_stop_modify(
+                            existing_stop,
+                            target_qty=float(pos_qty),
+                            target_stop_px=float(target_stop_px),
+                            instrument_id=target_inst,
                         )
-                        if new_stop_cid:
-                            self._notify_stop_leg_replaced(
-                                sym,
-                                cid,
-                                new_stop_cid,
-                                new_covered_qty=Decimal(f"{eff_qty:.6f}"),
-                                stop_price=float(target_stop_px),
+                        if not mod_cid:
+                            self._pending_protective_stop_sync = (
+                                float(pos_qty),
+                                float(target_stop_px),
                             )
-                            self._active_protective_stops_by_inst[str(target_inst)] = [
-                                new_stop_cid
-                            ]
+                    else:
+                        self._pending_protective_stop_sync = (
+                            float(pos_qty),
+                            float(target_stop_px),
+                        )
 
     def on_order_expired(self, event: Any) -> None:
-        self._on_order_terminal(event, "EXPIRED")
+        cid = str(self._event_get(event, "client_order_id", "") or "")
+        is_pending_safe_exit_stop = bool(cid) and any(
+            cid in spec.get("pending_stop_cids", set())
+            for spec in self._pending_safe_exits.values()
+        )
+        if is_pending_safe_exit_stop:
+            self._on_order_terminal(event, "EXPIRED")
+            return
+        self._handle_protective_stop_terminal_failure(event, "EXPIRED")
 
     def _sync_tracked_position_from_event(self, event: Any) -> None:
         inst_id = self._event_get(event, "instrument_id", None)
@@ -4647,8 +5769,10 @@ class BaseArchetypeStrategy(Strategy):
         inst_key = str(target_inst)
         sym = self._symbol_from_instrument_id(target_inst)
         self._tracked_signed_qty_by_inst.pop(inst_key, None)
+        self._cancel_safe_exit_ttl_timer(inst_key)
         self._pending_safe_exits.pop(inst_key, None)
         self._active_exit_orders_by_inst.pop(inst_key, None)
+        self._exit_retry_count_by_inst.pop(inst_key, None)
         self._active_entry_orders_by_inst.pop(inst_key, None)
         self._notify_safe_exit_end(sym)
         actor = self._resolve_telemetry_actor()
@@ -4663,6 +5787,15 @@ class BaseArchetypeStrategy(Strategy):
         ):
             self._exit_only_mode = True
         if inst_id is None or str(inst_id) == str(self._archetype_config.instrument_id):
+            if self._open_position_signed_qty(target_inst) == Decimal("0"):
+                self._stop_price = None
+                inst_cids = list(self._active_protective_stops_by_inst.pop(str(target_inst), ()))
+                for old_scid in inst_cids:
+                    self._stop_orders_by_cid.pop(old_scid, None)
+                    self._stop_qty_by_cid.pop(old_scid, None)
+                    self._stop_price_by_cid.pop(old_scid, None)
+                    self._unconfirmed_stop_cids.discard(old_scid)
+                    self._stop_submitted_bar_seq_by_cid.pop(old_scid, None)
             self._trailing_stop_price = None
             self._peak_favorable_price = None
             self._armed_entry_signal = None
@@ -4670,6 +5803,11 @@ class BaseArchetypeStrategy(Strategy):
             self._entry_filled_qty = 0.0
             self._pending_protective_stop_sync = None
             self._deferred_protective_stop_submission = None
+            self._deferred_protective_stop_groups.clear()
+            self._deferred_protective_stop_by_cid.clear()
+            self._prior_stop_qty_by_cid.clear()
+            self._prior_stop_price_by_cid.clear()
+            self._attempted_stop_price_by_cid.clear()
 
     def _current_tightest_stop_price(
         self, instrument_id: Optional[InstrumentId] = None
@@ -4804,6 +5942,15 @@ class BaseArchetypeStrategy(Strategy):
                     float(new_stop_price),
                 )
                 self._stop_price = float(new_stop_price)
+                if existing_cid:
+                    self._notify_stop_leg_replaced(
+                        sym,
+                        existing_cid,
+                        f"deferred-replace-{existing_cid}",
+                        new_covered_qty=Decimal(f"{pending_qty:.6f}"),
+                        stop_price=float(new_stop_price),
+                        status="REPLACING",
+                    )
                 return existing_cid
             return self._apply_atomic_protective_stop_modify(
                 existing_stop,
@@ -4812,65 +5959,176 @@ class BaseArchetypeStrategy(Strategy):
                 instrument_id=target_inst,
             )
 
-        entry_side = (
-            OrderSide.BUY
-            if (signed_pos > Decimal("0") or self._archetype_config.plan_side == PlanSide.LONG)
-            else OrderSide.SELL
-        )
-        stop_qty_obj = self._format_quantity(desired_qty, target_inst)
-        replacement_stop = self._build_protective_stop_order(
-            instrument_id=target_inst,
-            entry_side=entry_side,
-            quantity=stop_qty_obj,
-            stop_loss_price=float(new_stop_price),
-            parent_entry_cid=f"rollover-{sym}",
-        )
-        if replacement_stop is None:
+        entry_side = self._infer_entry_side_for_position(signed_pos)
+        replacement_stop = None
+        stop_qty_obj = None
+        try:
+            stop_qty_obj = self._format_quantity(desired_qty, target_inst)
+            replacement_stop = self._build_protective_stop_order(
+                instrument_id=target_inst,
+                entry_side=entry_side,
+                quantity=stop_qty_obj,
+                stop_loss_price=float(new_stop_price),
+                parent_entry_cid=f"rollover-{sym}",
+            )
+        except Exception as exc:
+            logger.error(
+                "Protective stop replacement construction failed for %s: %s",
+                target_inst,
+                exc,
+            )
+            replacement_stop = None
+        if replacement_stop is None or stop_qty_obj is None:
+            if open_stops:
+                logger.error(
+                    "Protective stop replacement build returned None for %s while %d live stop(s) remain active; preserving existing protection",
+                    target_inst,
+                    len(open_stops),
+                )
+                return None
+            self._active_protective_stops_by_inst[inst_key] = []
+            if desired_qty > Decimal("0"):
+                self._fail_closed_unprotected_position(
+                    target_inst=target_inst,
+                    cid=None,
+                    reason="PROTECTIVE_STOP_REPLACE_BUILD_FAILED",
+                    pos_qty=desired_qty,
+                    reference_price=float(new_stop_price),
+                )
             return None
 
         planned_new_cid = str(replacement_stop.client_order_id)
+        old_cids_for_replace: List[str] = []
+        old_stop_by_cid: Dict[str, Any] = {}
         for old_stop in open_stops:
             old_cid = str(getattr(old_stop, "client_order_id", "") or "")
             if not old_cid or old_cid == planned_new_cid:
                 continue
+            old_cids_for_replace.append(old_cid)
+            old_stop_by_cid[old_cid] = old_stop
             self._notify_stop_leg_replaced(
                 sym,
                 old_cid,
                 planned_new_cid,
                 new_covered_qty=desired_qty,
                 stop_price=float(new_stop_price),
+                status="REPLACING",
             )
             self._remove_tracked_stop_cid(old_cid, target_inst)
-            self._cancel_single_order_safely(old_stop)
+            cached_old = self._lookup_order_in_cache(old_stop) or self._lookup_order_in_cache(old_cid)
+            if cached_old is None or (
+                not bool(getattr(cached_old, "is_closed", True))
+                and self._normalized_order_status(cached_old) != "PENDING_CANCEL"
+            ):
+                self._cancel_single_order_safely(old_stop)
 
-        new_stop_cid = self._register_and_submit_protective_stop_order(
-            replacement_stop,
-            target_inst,
-            stop_qty_obj,
-            stop_loss_price=float(new_stop_price),
+        still_open_old_cids = self._collect_still_open_stop_cids(
+            inst_key, old_cids_for_replace, old_stop_by_cid
+        )
+        if still_open_old_cids:
+            return self._register_deferred_protective_stop_group(
+                target_inst=target_inst,
+                still_open_cids=still_open_old_cids,
+                target_qty=desired_qty,
+                target_stop_px=float(new_stop_price),
+                planned_new_cid=planned_new_cid,
+                parent_entry_cid=f"rollover-{sym}",
+            )
+
+        new_stop_cid: Optional[str] = None
+        try:
+            new_stop_cid = self._register_and_submit_protective_stop_order(
+                replacement_stop,
+                target_inst,
+                stop_qty_obj,
+                stop_loss_price=float(new_stop_price),
+            )
+        except Exception as exc:
+            logger.error(
+                "Protective stop replacement submission failed for %s: %s",
+                target_inst,
+                exc,
+            )
+            new_stop_cid = None
+
+        if not new_stop_cid:
+            self._active_protective_stops_by_inst[inst_key] = []
+            if desired_qty > Decimal("0"):
+                self._fail_closed_unprotected_position(
+                    target_inst=target_inst,
+                    cid=old_cids_for_replace[-1] if old_cids_for_replace else None,
+                    reason="PROTECTIVE_STOP_REPLACE_SUBMISSION_FAILED",
+                    pos_qty=desired_qty,
+                    reference_price=float(new_stop_price),
+                )
+            return None
+
+        ref_old_cid = old_cids_for_replace[-1] if old_cids_for_replace else new_stop_cid
+        self._notify_stop_leg_replaced(
+            sym,
+            ref_old_cid,
+            new_stop_cid,
+            new_covered_qty=desired_qty,
+            stop_price=float(new_stop_price),
+            status="ACTIVE",
         )
         self._active_protective_stops_by_inst[inst_key] = [new_stop_cid]
         return new_stop_cid
 
-    def apply_renewed_plan_item(self, new_item: PlanItemContract) -> PlanRiskEnvelope:
+    def apply_renewed_plan_item(
+        self,
+        new_item: PlanItemContract,
+        *,
+        enforce_monotonic_stop: bool = True,
+    ) -> PlanRiskEnvelope:
         """Applies a `RENEWED_ACTIVE` `PlanItemContract` in-place while enforcing monotonic
-        stop-loss tightening (`new_stop >= current_stop` for LONG, `new_stop <= current_stop` for SHORT).
+        stop-loss tightening when holding open exposure or preserving prior active stops
+        (`new_stop >= current_stop` for LONG, `new_stop <= current_stop` for SHORT),
+        and resets stale stops when flat (`enforce_monotonic_stop=False`).
         """
         cfg = self._archetype_config
         new_cfg = new_item.strategy_config
         new_env = new_item.risk_envelope
 
-        current_stop_dec = self._current_tightest_stop_price(cfg.instrument_id)
-        proposed_stop_dec = new_env.initial_stop_price
-        if current_stop_dec is not None and current_stop_dec > Decimal("0"):
-            if cfg.plan_side == PlanSide.LONG:
-                tightened_stop_dec = max(current_stop_dec, proposed_stop_dec)
-            else:
-                tightened_stop_dec = min(current_stop_dec, proposed_stop_dec)
-        else:
-            tightened_stop_dec = proposed_stop_dec
+        if str(cfg.bar_timeframe) != str(new_cfg.bar_timeframe):
+            raise ValueError(
+                f"Cannot apply renewed plan item with changed bar_timeframe "
+                f"({cfg.bar_timeframe} -> {new_cfg.bar_timeframe}); instantiate fresh strategy"
+            )
 
-        renewed_env = replace(new_env, initial_stop_price=tightened_stop_dec)
+        has_open_exposure = (
+            self._open_position_signed_qty(cfg.instrument_id) != Decimal("0")
+        ) or bool(self._get_open_protective_stop_orders(cfg.instrument_id))
+        if has_open_exposure and cfg.plan_side != new_env.side:
+            raise ValueError(
+                f"Cannot flip plan_side ({cfg.plan_side.value} -> {new_env.side.value}) "
+                f"on {cfg.instrument_id} while holding open exposure"
+            )
+        proposed_stop_dec = new_env.initial_stop_price
+        if enforce_monotonic_stop or has_open_exposure:
+            current_stop_dec = self._current_tightest_stop_price(cfg.instrument_id)
+            if current_stop_dec is not None and current_stop_dec > Decimal("0"):
+                if new_env.side == PlanSide.LONG:
+                    tightened_stop_dec = max(current_stop_dec, proposed_stop_dec)
+                else:
+                    tightened_stop_dec = min(current_stop_dec, proposed_stop_dec)
+            else:
+                tightened_stop_dec = proposed_stop_dec
+        else:
+            current_stop_dec = None
+            tightened_stop_dec = proposed_stop_dec
+            self._stop_price = None
+            self._trailing_stop_price = None
+            self._peak_favorable_price = None
+
+        renewed_tp = self._clear_crossed_take_profit(
+            new_env.side, tightened_stop_dec, new_env.take_profit_price
+        )
+        renewed_env = replace(
+            new_env,
+            initial_stop_price=tightened_stop_dec,
+            take_profit_price=renewed_tp,
+        )
 
         cfg.archetype_contract = new_cfg
         cfg.lookback_window = new_cfg.lookback_window
@@ -4880,10 +6138,17 @@ class BaseArchetypeStrategy(Strategy):
         cfg.exit_quantile_threshold = new_cfg.exit_quantile_threshold
         cfg.atr_stop_multiplier = new_cfg.atr_stop_multiplier
         cfg.trade_qty = renewed_env.target_qty
+        cfg.plan_side = renewed_env.side
         cfg._plan_risk_envelope = renewed_env
         cfg._plan_initial_stop_price = tightened_stop_dec
         cfg._plan_max_risk_budget_usd = renewed_env.max_risk_budget_usd
         cfg._plan_daily_atr_14 = new_item.daily_atr_14 or renewed_env.daily_atr_14
+        cfg._plan_item_id = str(new_item.item_id)
+        cfg._plan_id = str(new_item.plan_id)
+        if hasattr(self, "_plan_item_id"):
+            self._plan_item_id = str(new_item.item_id)
+        if hasattr(self, "_plan_id"):
+            self._plan_id = str(new_item.plan_id)
         renewed_exec_spec = new_item.execution_spec or renewed_env.execution_spec
         cfg._execution_spec = renewed_exec_spec
         cfg.exec_algorithm_id = (
@@ -4896,6 +6161,16 @@ class BaseArchetypeStrategy(Strategy):
         self._exit_only_mode = False
         self._thesis_invalidated = False
         self._pending_thesis_exit = False
+        if not has_open_exposure:
+            self._entry_filled_qty = 0.0
+            self._pending_protective_stop_sync = None
+            self._deferred_protective_stop_submission = None
+            self._deferred_protective_stop_groups.clear()
+            self._deferred_protective_stop_by_cid.clear()
+            self._prior_stop_qty_by_cid.clear()
+            self._prior_stop_price_by_cid.clear()
+            self._attempted_stop_price_by_cid.clear()
+            self._active_protective_stops_by_inst.pop(str(cfg.instrument_id), None)
 
         tightened_float = float(tightened_stop_dec)
         if self._trailing_stop_price is not None:
@@ -5032,6 +6307,29 @@ class BaseArchetypeStrategy(Strategy):
     ) -> str:
         """Creates and submits a collared `LimitOrder` entry routed via `CollaredTwap` / `PreTradeRiskGate`."""
         target_inst = instrument_id or self._archetype_config.instrument_id
+        try:
+            ref_val = float(reference_price)
+            atr_val = float(atr)
+        except (TypeError, ValueError):
+            return ""
+        if not math.isfinite(ref_val) or ref_val <= 0.0:
+            return ""
+        if not math.isfinite(atr_val) or atr_val < 0.0:
+            atr = 0.0
+        if limit_price is not None:
+            try:
+                lp_val = float(limit_price)
+                if not math.isfinite(lp_val) or lp_val <= 0.0:
+                    limit_price = None
+            except (TypeError, ValueError):
+                limit_price = None
+        if stop_loss_price is not None:
+            try:
+                sp_val = float(stop_loss_price)
+                if not math.isfinite(sp_val) or sp_val <= 0.0:
+                    stop_loss_price = None
+            except (TypeError, ValueError):
+                stop_loss_price = None
         if (
             self._in_warmup
             or self._exit_only_mode
@@ -5076,6 +6374,27 @@ class BaseArchetypeStrategy(Strategy):
             eff_daily_atr = self._resolve_daily_atr_14(reference_price)
         else:
             eff_daily_atr = 0.0
+        if (
+            stop_loss_price is None
+            and self._should_submit_protective_stop()
+            and self._risk_envelope is not None
+            and self._risk_envelope.initial_stop_price > Decimal("0")
+        ):
+            atr_mult = float(
+                _to_decimal(
+                    getattr(self._archetype_config, "atr_stop_multiplier", None),
+                    "2.0",
+                )
+            )
+            derived_stop = self._resolve_protective_stop_price(
+                reference_price=reference_price,
+                raw_stop_price=None,
+                side=order_side,
+                raw_stop_distance=(eff_daily_atr * atr_mult if eff_daily_atr > 0.0 else None),
+                instrument_id=target_inst,
+            )
+            if math.isfinite(derived_stop) and derived_stop > 0.0:
+                stop_loss_price = float(derived_stop)
         if self._risk_envelope is not None and reference_price > 0.0:
             plan_ref_dec = (
                 self._risk_envelope.target_notional_usd
@@ -5281,6 +6600,17 @@ class BaseArchetypeStrategy(Strategy):
         if active_plan_id:
             exec_params["plan_id"] = str(active_plan_id)
 
+        if self._should_submit_protective_stop() and (
+            stop_loss_price is None
+            or not math.isfinite(float(stop_loss_price))
+            or float(stop_loss_price) <= 0.0
+        ):
+            logger.error(
+                "Refusing unprotected entry order for %s: missing/non-positive protective stop_loss_price=%r",
+                target_inst,
+                stop_loss_price,
+            )
+            return ""
         eff_exec_algo_id = (
             COLLARED_TWAP_EXEC_ALGORITHM_ID
             if exec_spec.exec_algorithm == ExecAlgorithm.COLLARED_TWAP
@@ -5462,8 +6792,11 @@ class BaseArchetypeStrategy(Strategy):
                 )
         if raw_ref is None:
             return ""
-        resolved_ref = float(raw_ref)
-        if resolved_ref <= 0.0:
+        try:
+            resolved_ref = float(raw_ref)
+        except (TypeError, ValueError):
+            return ""
+        if not math.isfinite(resolved_ref) or resolved_ref <= 0.0:
             return ""
 
         if atr is not None:
@@ -5475,7 +6808,11 @@ class BaseArchetypeStrategy(Strategy):
             raw_atr = self._resolve_daily_atr_14(resolved_ref)
         else:
             raw_atr = 0.0
-        if raw_atr is None or float(raw_atr) <= 0.0:
+        try:
+            raw_atr_f = float(raw_atr) if raw_atr is not None else 0.0
+        except (TypeError, ValueError):
+            raw_atr_f = 0.0
+        if not math.isfinite(raw_atr_f) or raw_atr_f <= 0.0:
             atr_mult_cfg = float(
                 _to_decimal(
                     getattr(self._archetype_config, "atr_stop_multiplier", None), "1"
@@ -5483,7 +6820,7 @@ class BaseArchetypeStrategy(Strategy):
             )
             env_stop = (
                 float(self._stop_price)
-                if self._stop_price is not None and self._stop_price > 0.0
+                if self._stop_price is not None and math.isfinite(float(self._stop_price)) and self._stop_price > 0.0
                 else (
                     float(self._risk_envelope.initial_stop_price)
                     if self._risk_envelope is not None
@@ -5492,16 +6829,28 @@ class BaseArchetypeStrategy(Strategy):
                 )
             )
             if env_stop > 0.0 and abs(resolved_ref - env_stop) > 0.0 and atr_mult_cfg > 0.0:
-                raw_atr = abs(resolved_ref - env_stop) / atr_mult_cfg
-        if raw_atr is None or float(raw_atr) <= 0.0:
+                raw_atr_f = abs(resolved_ref - env_stop) / atr_mult_cfg
+        if not math.isfinite(raw_atr_f) or raw_atr_f <= 0.0:
             return ""
-        resolved_atr = float(raw_atr)
+        resolved_atr = raw_atr_f
 
         resolved_stop = (
             stop_loss_price
             if stop_loss_price is not None
             else kwargs.get("stop_price")
         )
+        if resolved_stop is not None:
+            try:
+                if not math.isfinite(float(resolved_stop)) or float(resolved_stop) <= 0.0:
+                    resolved_stop = None
+            except (TypeError, ValueError):
+                resolved_stop = None
+        if limit_price is not None:
+            try:
+                if not math.isfinite(float(limit_price)) or float(limit_price) <= 0.0:
+                    limit_price = None
+            except (TypeError, ValueError):
+                limit_price = None
         if resolved_stop is None:
             stop_fn = getattr(self, "_stop_loss_price_for_entry", None)
             if callable(stop_fn):
@@ -5611,7 +6960,7 @@ class BaseArchetypeStrategy(Strategy):
             instrument_id=instrument_id,
             order_side=exit_side,
             quantity=qty_obj,
-            time_in_force=TimeInForce.GTC,
+            time_in_force=TimeInForce.DAY,
             reduce_only=True,
             exec_algorithm_id=None,
             exec_algorithm_params=exec_params,
@@ -5623,7 +6972,6 @@ class BaseArchetypeStrategy(Strategy):
         self._order_side_by_cid[cid] = (inst_key, exit_side)
         self._submitted_order_ids.append(cid)
         self._submit_order_safely(order)
-        self._trailing_stop_price = None
         return cid
 
     def _submit_plan_gated_exit(
@@ -5748,6 +7096,7 @@ class BaseArchetypeStrategy(Strategy):
             "submitted_exit_cid": None,
         }
         self._pending_safe_exits[inst_key] = safe_exit_spec
+        self._schedule_safe_exit_ttl_timer(target_inst, sym)
 
         for stop_order in open_stops:
             self._cancel_single_order_safely(stop_order)

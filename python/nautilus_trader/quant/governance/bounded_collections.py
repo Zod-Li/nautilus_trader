@@ -96,6 +96,9 @@ class _BoundedFifoDict(OrderedDict):
                 self.move_to_end(oldest_key)
                 continue
             self.popitem(last=False)
+        hard_cap = max(self._max_size * 2, self._max_size + 1)
+        while len(self) >= hard_cap:
+            self.popitem(last=False)
         super().__setitem__(key, value)
 
     def setdefault(self, key: Any, default: Any = None) -> Any:

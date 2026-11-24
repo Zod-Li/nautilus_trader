@@ -23,6 +23,7 @@
 //! (`OrderStatusReport`, `FillReport`, `PositionStatusReport`).
 
 use std::{
+    collections::HashSet,
     future::Future,
     pin::Pin,
     sync::{
@@ -1105,12 +1106,18 @@ impl AlpacaExecutionClient {
             AlpacaTradeEventKind::New
             | AlpacaTradeEventKind::Calculated
             | AlpacaTradeEventKind::Stopped => {
-                if update.replaces.is_some()
-                    && tracking
+                let replace_preserves_order_state = update.replaces.is_some()
+                    && (tracking
                         .emitted_updates
                         .lock()
                         .contains_key(&update.venue_order_id)
-                {
+                        || cached_order.as_ref().is_some_and(|o| {
+                            !o.filled_qty().is_zero()
+                                || o.status() == OrderStatus::PartiallyFilled
+                                || (o.status() == OrderStatus::PendingUpdate
+                                    && o.previous_status() == Some(OrderStatus::PartiallyFilled))
+                        }));
+                if replace_preserves_order_state {
                     tracking
                         .terminal_events
                         .lock()
@@ -1491,6 +1498,28 @@ impl AlpacaExecutionClient {
         }
     }
 
+    fn resolve_tracked_client_id(
+        tracking: &SharedExecutionTracking,
+        vid: &VenueOrderId,
+        replaces: Option<&str>,
+        raw_client_order_id: &str,
+    ) -> Option<ClientOrderId> {
+        tracking
+            .client_order_id_for_venue(vid)
+            .or_else(|| {
+                replaces
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(VenueOrderId::new)
+                    .and_then(|r_vid| tracking.client_order_id_for_venue(&r_vid))
+            })
+            .or_else(|| {
+                ClientOrderId::new_checked(raw_client_order_id.trim())
+                    .ok()
+                    .map(|cid| tracking.resolve_client_order_id(cid))
+            })
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn reconcile_post_cancel_order(
         http: &Arc<AlpacaHttpClient>,
@@ -1662,8 +1691,8 @@ impl AlpacaExecutionClient {
                     let side = AlpacaOrderSide::try_from(first.order_side())?;
                     let time_in_force = AlpacaTimeInForce::try_from(first.time_in_force())?;
                     Ok(AlpacaOrderRequest {
-                        symbol: first.instrument_id().symbol.as_str().to_string(),
-                        qty: first.quantity().as_decimal(),
+                        symbol: tp_leg.instrument_id().symbol.as_str().to_string(),
+                        qty: tp_leg.quantity().as_decimal(),
                         side,
                         order_type: AlpacaOrderType::Limit,
                         time_in_force,
@@ -1672,7 +1701,7 @@ impl AlpacaExecutionClient {
                         trail_price: None,
                         trail_percent: None,
                         extended_hours: false,
-                        client_order_id: first.client_order_id().as_str().to_string(),
+                        client_order_id: tp_leg.client_order_id().as_str().to_string(),
                         order_class: Some(AlpacaOrderClass::Oco),
                         take_profit: Some(tp_spec),
                         stop_loss: Some(sl_spec),
@@ -1799,6 +1828,216 @@ impl AlpacaExecutionClient {
         .await;
     }
 
+    async fn follow_replaced_order_chain(
+        http: &Arc<AlpacaHttpClient>,
+        tracking: &SharedExecutionTracking,
+        client_order_id: Option<ClientOrderId>,
+        start_vid: VenueOrderId,
+        initial_resp: AlpacaOrderResponse,
+    ) -> (VenueOrderId, AlpacaOrderResponse, bool) {
+        const MAX_REPLACE_HOPS: usize = 8;
+        let mut cur_vid = start_vid;
+        let mut cur_resp = initial_resp;
+        let mut cur_resp_matches_vid = cur_resp.id.trim() == cur_vid.as_str();
+        let mut visited: HashSet<VenueOrderId> = HashSet::from([start_vid]);
+        for _ in 0..MAX_REPLACE_HOPS {
+            if !cur_resp.status.trim().eq_ignore_ascii_case("replaced") {
+                break;
+            }
+            let Some(next_raw) = cur_resp
+                .replaced_by
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            else {
+                break;
+            };
+            let next_vid = VenueOrderId::new(next_raw);
+            if !visited.insert(next_vid) {
+                log::warn!(
+                    "Detected cycle in Alpaca replaced_by chain starting at {start_vid}: repeated {next_vid}"
+                );
+                break;
+            }
+            tracking
+                .terminal_events
+                .lock()
+                .add((cur_vid, AlpacaTradeEventKind::Canceled));
+            if let Some(cid) = client_order_id {
+                tracking.record_venue_order_id(cid, next_vid);
+            }
+            cur_vid = next_vid;
+            match http.get_order(cur_vid.as_str()).await {
+                Ok(next_resp) => {
+                    if let Some(cid) = client_order_id
+                        && !next_resp.client_order_id.trim().is_empty()
+                        && let Ok(resp_cid) =
+                            ClientOrderId::new_checked(next_resp.client_order_id.trim())
+                    {
+                        tracking.record_client_order_id_alias(resp_cid, cid);
+                    }
+                    cur_resp = next_resp;
+                    cur_resp_matches_vid = true;
+                }
+                Err(err) => {
+                    log::warn!(
+                        "Alpaca follow_replaced_order_chain get_order({cur_vid}) failed: {err}"
+                    );
+                    cur_resp_matches_vid = false;
+                    break;
+                }
+            }
+        }
+        (cur_vid, cur_resp, cur_resp_matches_vid)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn emit_replaced_order_update(
+        emitter: &ExecutionEventEmitter,
+        tracking: &SharedExecutionTracking,
+        order: &OrderAny,
+        new_vid: VenueOrderId,
+        fetched_resp: Option<&AlpacaOrderResponse>,
+        fallback_qty: Option<Quantity>,
+        fallback_px: Option<Price>,
+        fallback_trigger: Option<Price>,
+        ts_now: UnixNanos,
+    ) {
+        let new_qty = fetched_resp
+            .and_then(|r| r.qty)
+            .and_then(|d| decimal_to_quantity(d, DEFAULT_EQUITY_SIZE_PRECISION).ok())
+            .or(fallback_qty)
+            .unwrap_or_else(|| order.quantity());
+        let new_px = fetched_resp
+            .and_then(|r| r.limit_price)
+            .and_then(|d| decimal_to_price(d, DEFAULT_EQUITY_PRICE_PRECISION).ok())
+            .or(fallback_px)
+            .or_else(|| order.price());
+        let new_trigger = fetched_resp
+            .and_then(|r| r.stop_price)
+            .and_then(|d| decimal_to_price(d, DEFAULT_EQUITY_PRICE_PRECISION).ok())
+            .or(fallback_trigger)
+            .or_else(|| order.trigger_price());
+        let _ = tracking
+            .terminal_events
+            .lock()
+            .insert((new_vid, AlpacaTradeEventKind::New));
+        if tracking.claim_order_updated(new_vid, new_qty, new_px, new_trigger) {
+            emitter.emit_order_updated(
+                order,
+                new_vid,
+                new_qty,
+                new_px,
+                new_trigger,
+                None,
+                ts_now,
+            );
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn resolve_failed_cancel_or_replaced(
+        http: &Arc<AlpacaHttpClient>,
+        emitter: &ExecutionEventEmitter,
+        tracking: &SharedExecutionTracking,
+        clock: &'static AtomicTime,
+        strategy_id: StrategyId,
+        instrument_id: InstrumentId,
+        client_order_id: ClientOrderId,
+        active_vid: VenueOrderId,
+        cached_order: Option<&OrderAny>,
+        ws_active: bool,
+    ) -> bool {
+        let Ok(resp) = http.get_order(active_vid.as_str()).await else {
+            return false;
+        };
+        let ts_done = clock.get_time_ns();
+        let (final_vid, final_resp, final_fetched) = Self::follow_replaced_order_chain(
+            http,
+            tracking,
+            Some(client_order_id),
+            active_vid,
+            resp,
+        )
+        .await;
+        if final_vid != active_vid {
+            if let Some(order) = cached_order {
+                Self::emit_replaced_order_update(
+                    emitter,
+                    tracking,
+                    order,
+                    final_vid,
+                    final_fetched.then_some(&final_resp),
+                    None,
+                    None,
+                    None,
+                    ts_done,
+                );
+            }
+            if final_fetched
+                && Self::apply_order_response_after_cancel_attempt(
+                    emitter,
+                    tracking,
+                    clock,
+                    strategy_id,
+                    instrument_id,
+                    client_order_id,
+                    final_vid,
+                    cached_order,
+                    &final_resp,
+                )
+            {
+                return true;
+            }
+            return match http.cancel_order(final_vid.as_str()).await {
+                Ok(()) => {
+                    Self::reconcile_post_cancel_order(
+                        http,
+                        emitter,
+                        tracking,
+                        clock,
+                        strategy_id,
+                        instrument_id,
+                        client_order_id,
+                        final_vid,
+                        cached_order.cloned(),
+                        ws_active,
+                    )
+                    .await;
+                    true
+                }
+                Err(_) => {
+                    if let Ok(post_resp) = http.get_order(final_vid.as_str()).await {
+                        Self::apply_order_response_after_cancel_attempt(
+                            emitter,
+                            tracking,
+                            clock,
+                            strategy_id,
+                            instrument_id,
+                            client_order_id,
+                            final_vid,
+                            cached_order,
+                            &post_resp,
+                        )
+                    } else {
+                        false
+                    }
+                }
+            };
+        }
+        Self::apply_order_response_after_cancel_attempt(
+            emitter,
+            tracking,
+            clock,
+            strategy_id,
+            instrument_id,
+            client_order_id,
+            active_vid,
+            cached_order,
+            &final_resp,
+        )
+    }
+
     async fn reconcile_tracked_orders_once(
         http: &Arc<AlpacaHttpClient>,
         emitter: &ExecutionEventEmitter,
@@ -1823,48 +2062,42 @@ impl AlpacaExecutionClient {
             };
             let ts_now = clock.get_time_ns();
             if resp.status.trim().eq_ignore_ascii_case("replaced")
-                && let Some(ref new_id) = resp.replaced_by
-                && !new_id.trim().is_empty()
+                && resp
+                    .replaced_by
+                    .as_deref()
+                    .is_some_and(|s| !s.trim().is_empty())
             {
-                tracking
-                    .terminal_events
-                    .lock()
-                    .add((vid, AlpacaTradeEventKind::Canceled));
-                let new_vid = VenueOrderId::new(new_id.trim());
-                tracking.record_venue_order_id(cid, new_vid);
-                if let Ok(new_resp) = http.get_order(new_vid.as_str()).await {
-                    let new_qty = new_resp
-                        .qty
-                        .and_then(|d| decimal_to_quantity(d, DEFAULT_EQUITY_SIZE_PRECISION).ok())
-                        .unwrap_or_else(|| order.quantity());
-                    let new_px = new_resp
-                        .limit_price
-                        .and_then(|d| decimal_to_price(d, DEFAULT_EQUITY_PRICE_PRECISION).ok())
-                        .or_else(|| order.price());
-                    let new_trigger = new_resp
-                        .stop_price
-                        .and_then(|d| decimal_to_price(d, DEFAULT_EQUITY_PRICE_PRECISION).ok())
-                        .or_else(|| order.trigger_price());
-                    if tracking.claim_order_updated(new_vid, new_qty, new_px, new_trigger) {
-                        emitter.emit_order_updated(
-                            &order,
-                            new_vid,
-                            new_qty,
-                            new_px,
-                            new_trigger,
-                            None,
-                            ts_now,
-                        );
-                    }
+                let (final_vid, final_resp, final_fetched) = Self::follow_replaced_order_chain(
+                    http,
+                    tracking,
+                    Some(cid),
+                    vid,
+                    resp,
+                )
+                .await;
+                if final_vid != vid {
+                    Self::emit_replaced_order_update(
+                        emitter,
+                        tracking,
+                        &order,
+                        final_vid,
+                        final_fetched.then_some(&final_resp),
+                        None,
+                        None,
+                        None,
+                        ts_now,
+                    );
+                }
+                if final_fetched {
                     Self::reconcile_submitted_order_response_with(
                         emitter,
                         tracking,
                         &order,
-                        &new_resp,
+                        &final_resp,
                         ts_now,
                     );
-                    continue;
                 }
+                continue;
             }
             Self::reconcile_submitted_order_response_with(emitter, tracking, &order, &resp, ts_now);
         }
@@ -1955,10 +2188,17 @@ impl AlpacaExecutionClient {
             return;
         }
 
-        if tracking
-            .terminal_events
+        if !tracking
+            .emitted_updates
             .lock()
-            .insert((venue_order_id, AlpacaTradeEventKind::New))
+            .contains_key(&venue_order_id)
+            && !matches!(status, OrderStatus::Canceled | OrderStatus::Expired)
+            && order.status() != OrderStatus::PartiallyFilled
+            && order.filled_qty().is_zero()
+            && tracking
+                .terminal_events
+                .lock()
+                .insert((venue_order_id, AlpacaTradeEventKind::New))
         {
             emitter.emit_order_accepted(order, venue_order_id, ts_accepted);
         }
@@ -2211,11 +2451,19 @@ impl ExecutionClient for AlpacaExecutionClient {
         let instrument_id = order.instrument_id();
         self.tracking.track_order(&order);
 
-        if order.is_reduce_only()
+        let is_unparented_stop = order.parent_order_id().is_none()
             && matches!(
                 order.order_type(),
+                OrderType::StopMarket
+                    | OrderType::StopLimit
+                    | OrderType::TrailingStopMarket
+                    | OrderType::TrailingStopLimit
+            );
+        if order.is_reduce_only()
+            && (matches!(
+                order.order_type(),
                 OrderType::Market | OrderType::Limit | OrderType::MarketToLimit
-            )
+            ) || is_unparented_stop)
         {
             let cache = self.core.cache();
             let open_positions = cache.positions_open(None, Some(&instrument_id), None, None, None);
@@ -2342,14 +2590,24 @@ impl ExecutionClient for AlpacaExecutionClient {
                 let ts_now = clock.get_time_ns();
                 match result {
                     Ok(resp) => {
-                        let parent_order = &orders_clone[0];
-                        let ts_accepted = resp
-                            .submitted_at
-                            .as_deref()
-                            .or(Some(resp.created_at.as_str()))
-                            .and_then(|s| parse_rfc3339_to_unix_nanos(s).ok())
-                            .unwrap_or(ts_now);
-                        let resp_legs = resp.legs.clone().unwrap_or_default();
+                        let is_oco = orders_clone.len() == 2
+                            && orders_clone[0].order_side() == orders_clone[1].order_side();
+                        let top_idx = if is_oco && orders_clone[1].order_type() == OrderType::Limit {
+                            1
+                        } else {
+                            0
+                        };
+                        let parent_order = &orders_clone[top_idx];
+                        let mut resp_legs = resp.legs.clone().unwrap_or_default();
+                        let expected_child_count = orders_clone.len().saturating_sub(1);
+                        if resp_legs.len() < expected_child_count
+                            && !resp.id.trim().is_empty()
+                            && let Ok(probed) = http.get_order(resp.id.trim()).await
+                            && let Some(legs) = probed.legs
+                            && legs.len() > resp_legs.len()
+                        {
+                            resp_legs = legs;
+                        }
                         Self::reconcile_submitted_order_response_with(
                             &emitter,
                             &tracking,
@@ -2359,7 +2617,10 @@ impl ExecutionClient for AlpacaExecutionClient {
                         );
 
                         let mut used_leg_indices = vec![false; resp_legs.len()];
-                        for (idx, child_order) in orders_clone.iter().enumerate().skip(1) {
+                        for (idx, child_order) in orders_clone.iter().enumerate() {
+                            if idx == top_idx {
+                                continue;
+                            }
                             let child_ot = child_order.order_type();
                             let matched_pos = resp_legs
                                 .iter()
@@ -2395,7 +2656,7 @@ impl ExecutionClient for AlpacaExecutionClient {
                                     }
                                 })
                                 .or_else(|| {
-                                    let fallback_idx = idx - 1;
+                                    let fallback_idx = if idx > top_idx { idx - 1 } else { idx };
                                     if fallback_idx < resp_legs.len()
                                         && !used_leg_indices[fallback_idx]
                                     {
@@ -2423,21 +2684,12 @@ impl ExecutionClient for AlpacaExecutionClient {
                                     ts_now,
                                 );
                             } else {
-                                let child_vid =
-                                    VenueOrderId::new(format!("{}-LEG-{idx}", resp.id.trim()));
-                                tracking
-                                    .record_venue_order_id(child_order.client_order_id(), child_vid);
-                                if tracking
-                                    .terminal_events
-                                    .lock()
-                                    .insert((child_vid, AlpacaTradeEventKind::New))
-                                {
-                                    emitter.emit_order_accepted(
-                                        child_order,
-                                        child_vid,
-                                        ts_accepted,
-                                    );
-                                }
+                                log::warn!(
+                                    "Alpaca submit_order_list response for parent {} missing child leg {} (client_order_id={}); leaving child order in Submitted state awaiting reconciliation",
+                                    resp.id.trim(),
+                                    idx,
+                                    child_order.client_order_id(),
+                                );
                             }
                         }
                     }
@@ -2549,31 +2801,45 @@ impl ExecutionClient for AlpacaExecutionClient {
                         {
                             tracking.record_client_order_id_alias(resp_cid, cid);
                         }
-                        let new_qty = resp
-                            .qty
-                            .and_then(|d| {
-                                decimal_to_quantity(d, DEFAULT_EQUITY_SIZE_PRECISION).ok()
-                            })
-                            .or(cmd_qty)
-                            .unwrap_or_else(|| order_clone.quantity());
-                        let new_px = resp
-                            .limit_price
-                            .and_then(|d| decimal_to_price(d, DEFAULT_EQUITY_PRICE_PRECISION).ok())
-                            .or(cmd_price)
-                            .or_else(|| order_clone.price());
-                        let new_trigger = resp
-                            .stop_price
-                            .and_then(|d| decimal_to_price(d, DEFAULT_EQUITY_PRICE_PRECISION).ok())
-                            .or(cmd_trigger_price)
-                            .or_else(|| order_clone.trigger_price());
-                        if tracking.claim_order_updated(new_vid, new_qty, new_px, new_trigger) {
-                            emitter.emit_order_updated(
-                                &order_clone,
+                        let (final_vid, final_resp, final_fetched) = if resp
+                            .status
+                            .trim()
+                            .eq_ignore_ascii_case("replaced")
+                            && resp
+                                .replaced_by
+                                .as_deref()
+                                .is_some_and(|s| !s.trim().is_empty())
+                        {
+                            Self::follow_replaced_order_chain(
+                                &http,
+                                &tracking,
+                                Some(cid),
                                 new_vid,
-                                new_qty,
-                                new_px,
-                                new_trigger,
-                                None,
+                                resp,
+                            )
+                            .await
+                        } else {
+                            (new_vid, resp, true)
+                        };
+                        Self::emit_replaced_order_update(
+                            &emitter,
+                            &tracking,
+                            &order_clone,
+                            final_vid,
+                            final_fetched.then_some(&final_resp),
+                            cmd_qty,
+                            cmd_price,
+                            cmd_trigger_price,
+                            ts_done,
+                        );
+                        if final_fetched
+                            && !final_resp.status.trim().eq_ignore_ascii_case("replaced")
+                        {
+                            Self::reconcile_submitted_order_response_with(
+                                &emitter,
+                                &tracking,
+                                &order_clone,
+                                &final_resp,
                                 ts_done,
                             );
                         }
@@ -2581,59 +2847,39 @@ impl ExecutionClient for AlpacaExecutionClient {
                     Err(e) => {
                         if let Ok(resp) = http.get_order(&vid_str).await {
                             if resp.status.trim().eq_ignore_ascii_case("replaced")
-                                && let Some(ref new_id) = resp.replaced_by
-                                && !new_id.trim().is_empty()
+                                && resp
+                                    .replaced_by
+                                    .as_deref()
+                                    .is_some_and(|s| !s.trim().is_empty())
                             {
-                                tracking
-                                    .terminal_events
-                                    .lock()
-                                    .add((active_vid, AlpacaTradeEventKind::Canceled));
-                                let new_vid = VenueOrderId::new(new_id.trim());
-                                tracking.record_venue_order_id(cid, new_vid);
-                                let new_resp_opt = http.get_order(new_vid.as_str()).await.ok();
-                                let new_qty = new_resp_opt
-                                    .as_ref()
-                                    .and_then(|r| r.qty)
-                                    .and_then(|d| {
-                                        decimal_to_quantity(d, DEFAULT_EQUITY_SIZE_PRECISION).ok()
-                                    })
-                                    .or(cmd_qty)
-                                    .unwrap_or_else(|| order_clone.quantity());
-                                let new_px = new_resp_opt
-                                    .as_ref()
-                                    .and_then(|r| r.limit_price)
-                                    .and_then(|d| {
-                                        decimal_to_price(d, DEFAULT_EQUITY_PRICE_PRECISION).ok()
-                                    })
-                                    .or(cmd_price)
-                                    .or_else(|| order_clone.price());
-                                let new_trigger = new_resp_opt
-                                    .as_ref()
-                                    .and_then(|r| r.stop_price)
-                                    .and_then(|d| {
-                                        decimal_to_price(d, DEFAULT_EQUITY_PRICE_PRECISION).ok()
-                                    })
-                                    .or(cmd_trigger_price)
-                                    .or_else(|| order_clone.trigger_price());
-                                if tracking
-                                    .claim_order_updated(new_vid, new_qty, new_px, new_trigger)
-                                {
-                                    emitter.emit_order_updated(
+                                let (final_vid, final_resp, final_fetched) =
+                                    Self::follow_replaced_order_chain(
+                                        &http,
+                                        &tracking,
+                                        Some(cid),
+                                        active_vid,
+                                        resp,
+                                    )
+                                    .await;
+                                if final_vid != active_vid {
+                                    Self::emit_replaced_order_update(
+                                        &emitter,
+                                        &tracking,
                                         &order_clone,
-                                        new_vid,
-                                        new_qty,
-                                        new_px,
-                                        new_trigger,
-                                        None,
+                                        final_vid,
+                                        final_fetched.then_some(&final_resp),
+                                        cmd_qty,
+                                        cmd_price,
+                                        cmd_trigger_price,
                                         ts_done,
                                     );
                                 }
-                                if let Some(ref new_resp) = new_resp_opt {
+                                if final_fetched {
                                     Self::reconcile_submitted_order_response_with(
                                         &emitter,
                                         &tracking,
                                         &order_clone,
-                                        new_resp,
+                                        &final_resp,
                                         ts_done,
                                     );
                                 }
@@ -2756,26 +3002,25 @@ impl ExecutionClient for AlpacaExecutionClient {
                         .await;
                     }
                     Err(AlpacaError::DeterministicReject { message, .. }) => {
-                        let mut reconciled = false;
-                        if let Ok(resp) = http.get_order(&vid_str).await {
-                            reconciled = Self::apply_order_response_after_cancel_attempt(
-                                &emitter,
-                                &tracking,
-                                clock,
-                                strategy_id,
-                                instrument_id,
-                                client_order_id,
-                                active_vid,
-                                cached_order.as_ref(),
-                                &resp,
-                            );
-                        }
+                        let reconciled = Self::resolve_failed_cancel_or_replaced(
+                            &http,
+                            &emitter,
+                            &tracking,
+                            clock,
+                            strategy_id,
+                            instrument_id,
+                            client_order_id,
+                            active_vid,
+                            cached_order.as_ref(),
+                            ws_active,
+                        )
+                        .await;
                         if !reconciled {
                             emitter.emit_order_cancel_rejected_event(
                                 strategy_id,
                                 instrument_id,
                                 client_order_id,
-                                Some(active_vid),
+                                Some(tracking.current_venue_order_id(&client_order_id).unwrap_or(active_vid)),
                                 &message,
                                 ts_done,
                             );
@@ -2787,26 +3032,25 @@ impl ExecutionClient for AlpacaExecutionClient {
                         log::error!(
                             "Alpaca cancel_order transport error for {client_order_id} (venue_order_id={active_vid}): {other_err}"
                         );
-                        let mut reconciled = false;
-                        if let Ok(resp) = http.get_order(&vid_str).await {
-                            reconciled = Self::apply_order_response_after_cancel_attempt(
-                                &emitter,
-                                &tracking,
-                                clock,
-                                strategy_id,
-                                instrument_id,
-                                client_order_id,
-                                active_vid,
-                                cached_order.as_ref(),
-                                &resp,
-                            );
-                        }
+                        let reconciled = Self::resolve_failed_cancel_or_replaced(
+                            &http,
+                            &emitter,
+                            &tracking,
+                            clock,
+                            strategy_id,
+                            instrument_id,
+                            client_order_id,
+                            active_vid,
+                            cached_order.as_ref(),
+                            ws_active,
+                        )
+                        .await;
                         if !reconciled {
                             emitter.emit_order_cancel_rejected_event(
                                 strategy_id,
                                 instrument_id,
                                 client_order_id,
-                                Some(active_vid),
+                                Some(tracking.current_venue_order_id(&client_order_id).unwrap_or(active_vid)),
                                 &format!("cancel_order transport error: {other_err}"),
                                 ts_done,
                             );
@@ -2818,12 +3062,23 @@ impl ExecutionClient for AlpacaExecutionClient {
     }
 
     fn cancel_all_orders(&self, cmd: CancelAllOrders) -> anyhow::Result<()> {
+        let mut fallback_orders = Vec::new();
         for order in self
             .core
             .cache()
             .orders(None, Some(&cmd.instrument_id), None, None, None)
         {
             self.tracking.track_order(&order);
+            if !order.is_closed()
+                && cmd.order_side.is_none_or(|filter| order.order_side() == filter)
+            {
+                fallback_orders.push((
+                    order.strategy_id(),
+                    order.client_order_id(),
+                    order.venue_order_id(),
+                    order.status(),
+                ));
+            }
         }
         let http = Arc::clone(&self.http_client);
         let emitter = self.emitter.clone();
@@ -2840,9 +3095,24 @@ impl ExecutionClient for AlpacaExecutionClient {
                     Ok(orders) => orders,
                     Err(e) => {
                         log::error!("Alpaca cancel_all_orders list_open_orders failed: {e}");
+                        let ts_done = clock.get_time_ns();
+                        let msg = format!("cancel_all_orders list_open_orders failed: {e}");
+                        for (ord_strategy_id, cid, opt_vid, _) in fallback_orders {
+                            let resolved_vid = tracking.current_venue_order_id(&cid).or(opt_vid);
+                            emitter.emit_order_cancel_rejected_event(
+                                ord_strategy_id,
+                                instrument_id,
+                                cid,
+                                resolved_vid,
+                                &msg,
+                                ts_done,
+                            );
+                        }
                         return;
                     }
                 };
+                let mut matched_fallback_cids: HashSet<ClientOrderId> = HashSet::new();
+                let mut matched_fallback_vids: HashSet<VenueOrderId> = HashSet::new();
                 for open_order in open_orders {
                     if open_order.symbol.trim() != target_symbol {
                         continue;
@@ -2855,42 +3125,360 @@ impl ExecutionClient for AlpacaExecutionClient {
                     }
                     let vid = VenueOrderId::new(open_order.id.trim());
                     let vid_str = vid.as_str().to_string();
-                    if let Ok(()) = http.cancel_order(&vid_str).await {
-                        let resolved_cid = tracking
-                            .client_order_id_for_venue(&vid)
-                            .or_else(|| {
-                                open_order
-                                    .replaces
-                                    .as_deref()
-                                    .map(str::trim)
-                                    .filter(|s| !s.is_empty())
-                                    .map(VenueOrderId::new)
-                                    .and_then(|r_vid| tracking.client_order_id_for_venue(&r_vid))
-                            })
-                            .or_else(|| {
-                                ClientOrderId::new_checked(open_order.client_order_id.trim())
-                                    .ok()
-                                    .map(|cid| tracking.resolve_client_order_id(cid))
-                            });
-                        if let Some(cid) = resolved_cid {
-                            let cached_order = tracking.cached_orders.lock().get(&cid).cloned();
-                            let eff_strategy_id = cached_order
-                                .as_ref()
-                                .map(Order::strategy_id)
-                                .unwrap_or(strategy_id);
-                            Self::reconcile_post_cancel_order(
-                                &http,
-                                &emitter,
-                                &tracking,
-                                clock,
-                                eff_strategy_id,
+                    matched_fallback_vids.insert(vid);
+                    let mut resolved_cid = Self::resolve_tracked_client_id(
+                        &tracking,
+                        &vid,
+                        open_order.replaces.as_deref(),
+                        &open_order.client_order_id,
+                    );
+                    if let Some(cid) = resolved_cid {
+                        matched_fallback_cids.insert(cid);
+                    }
+                    match http.cancel_order(&vid_str).await {
+                        Ok(()) => {
+                            let mut fetched_resp: Option<AlpacaOrderResponse> = None;
+                            if resolved_cid.is_none()
+                                && let Ok(resp) = http.get_order(&vid_str).await
+                            {
+                                resolved_cid = Self::resolve_tracked_client_id(
+                                    &tracking,
+                                    &vid,
+                                    resp.replaces.as_deref(),
+                                    &resp.client_order_id,
+                                );
+                                fetched_resp = Some(resp);
+                            }
+                            if let Some(cid) = resolved_cid {
+                                matched_fallback_cids.insert(cid);
+                                let cached_order = tracking.cached_orders.lock().get(&cid).cloned();
+                                let eff_strategy_id = cached_order
+                                    .as_ref()
+                                    .map(Order::strategy_id)
+                                    .unwrap_or(strategy_id);
+                                if let Some(resp) = fetched_resp {
+                                    if !Self::apply_order_response_after_cancel_attempt(
+                                        &emitter,
+                                        &tracking,
+                                        clock,
+                                        eff_strategy_id,
+                                        instrument_id,
+                                        cid,
+                                        vid,
+                                        cached_order.as_ref(),
+                                        &resp,
+                                    ) {
+                                        Self::reconcile_post_cancel_order(
+                                            &http,
+                                            &emitter,
+                                            &tracking,
+                                            clock,
+                                            eff_strategy_id,
+                                            instrument_id,
+                                            cid,
+                                            vid,
+                                            cached_order,
+                                            ws_active,
+                                        )
+                                        .await;
+                                    }
+                                } else {
+                                    Self::reconcile_post_cancel_order(
+                                        &http,
+                                        &emitter,
+                                        &tracking,
+                                        clock,
+                                        eff_strategy_id,
+                                        instrument_id,
+                                        cid,
+                                        vid,
+                                        cached_order,
+                                        ws_active,
+                                    )
+                                    .await;
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            let ts_done = clock.get_time_ns();
+                            log::error!(
+                                "Alpaca cancel_all_orders cancel_order({vid_str}) failed: {err}"
+                            );
+                            let mut chain_res: Option<(VenueOrderId, AlpacaOrderResponse, bool)> =
+                                None;
+                            if let Ok(resp) = http.get_order(&vid_str).await {
+                                if resolved_cid.is_none() {
+                                    resolved_cid = Self::resolve_tracked_client_id(
+                                        &tracking,
+                                        &vid,
+                                        resp.replaces.as_deref(),
+                                        &resp.client_order_id,
+                                    );
+                                }
+                                let followed = Self::follow_replaced_order_chain(
+                                    &http,
+                                    &tracking,
+                                    resolved_cid,
+                                    vid,
+                                    resp,
+                                )
+                                .await;
+                                matched_fallback_vids.insert(followed.0);
+                                chain_res = Some(followed);
+                            }
+                            if let Some(cid) = resolved_cid {
+                                matched_fallback_cids.insert(cid);
+                                let cached_order = tracking.cached_orders.lock().get(&cid).cloned();
+                                let eff_strategy_id = cached_order
+                                    .as_ref()
+                                    .map(Order::strategy_id)
+                                    .unwrap_or(strategy_id);
+                                let mut reconciled = false;
+                                let mut report_vid = vid;
+                                if let Some((final_vid, ref final_resp, final_fetched)) = chain_res {
+                                    report_vid = final_vid;
+                                    if let Some(ref ord) = cached_order
+                                        && final_vid != vid
+                                    {
+                                        Self::emit_replaced_order_update(
+                                            &emitter,
+                                            &tracking,
+                                            ord,
+                                            final_vid,
+                                            final_fetched.then_some(final_resp),
+                                            None,
+                                            None,
+                                            None,
+                                            ts_done,
+                                        );
+                                    }
+                                    if final_fetched {
+                                        reconciled = Self::apply_order_response_after_cancel_attempt(
+                                            &emitter,
+                                            &tracking,
+                                            clock,
+                                            eff_strategy_id,
+                                            instrument_id,
+                                            cid,
+                                            final_vid,
+                                            cached_order.as_ref(),
+                                            final_resp,
+                                        );
+                                    }
+                                    if !reconciled && final_vid != vid {
+                                        match http.cancel_order(final_vid.as_str()).await {
+                                            Ok(()) => {
+                                                Self::reconcile_post_cancel_order(
+                                                    &http,
+                                                    &emitter,
+                                                    &tracking,
+                                                    clock,
+                                                    eff_strategy_id,
+                                                    instrument_id,
+                                                    cid,
+                                                    final_vid,
+                                                    cached_order,
+                                                    ws_active,
+                                                )
+                                                .await;
+                                                reconciled = true;
+                                            }
+                                            Err(_) => {
+                                                if let Ok(post_resp) =
+                                                    http.get_order(final_vid.as_str()).await
+                                                {
+                                                    reconciled =
+                                                        Self::apply_order_response_after_cancel_attempt(
+                                                            &emitter,
+                                                            &tracking,
+                                                            clock,
+                                                            eff_strategy_id,
+                                                            instrument_id,
+                                                            cid,
+                                                            final_vid,
+                                                            cached_order.as_ref(),
+                                                            &post_resp,
+                                                        );
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                if !reconciled {
+                                    emitter.emit_order_cancel_rejected_event(
+                                        eff_strategy_id,
+                                        instrument_id,
+                                        cid,
+                                        Some(report_vid),
+                                        &format!("cancel_all_orders cancel_order failed: {err}"),
+                                        ts_done,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                for (ord_strategy_id, cid, opt_vid, ord_status) in fallback_orders {
+                    if matched_fallback_cids.contains(&cid)
+                        || opt_vid
+                            .as_ref()
+                            .is_some_and(|v| matched_fallback_vids.contains(v))
+                    {
+                        continue;
+                    }
+                    let resolved_vid = tracking.current_venue_order_id(&cid).or(opt_vid);
+                    if resolved_vid.is_none() && ord_status == OrderStatus::Initialized {
+                        continue;
+                    }
+                    if resolved_vid
+                        .as_ref()
+                        .is_some_and(|v| matched_fallback_vids.contains(v))
+                    {
+                        continue;
+                    }
+                    let cached_order = tracking.cached_orders.lock().get(&cid).cloned();
+                    let resp_res = if let Some(ref v) = resolved_vid {
+                        http.get_order(v.as_str()).await
+                    } else {
+                        http.get_order_by_client_order_id(cid.as_str()).await
+                    };
+                    match resp_res {
+                        Ok(resp) => {
+                            let active_vid = if !resp.id.trim().is_empty() {
+                                VenueOrderId::new(resp.id.trim())
+                            } else if let Some(v) = resolved_vid {
+                                v
+                            } else {
+                                let ts_done = clock.get_time_ns();
+                                emitter.emit_order_cancel_rejected_event(
+                                    ord_strategy_id,
+                                    instrument_id,
+                                    cid,
+                                    None,
+                                    "cancel_all_orders unmatched local order missing venue order id",
+                                    ts_done,
+                                );
+                                continue;
+                            };
+                            let (final_vid, final_resp, final_fetched) =
+                                Self::follow_replaced_order_chain(
+                                    &http,
+                                    &tracking,
+                                    Some(cid),
+                                    active_vid,
+                                    resp,
+                                )
+                                .await;
+                            if let Some(ref ord) = cached_order
+                                && final_vid != active_vid
+                            {
+                                Self::emit_replaced_order_update(
+                                    &emitter,
+                                    &tracking,
+                                    ord,
+                                    final_vid,
+                                    final_fetched.then_some(&final_resp),
+                                    None,
+                                    None,
+                                    None,
+                                    clock.get_time_ns(),
+                                );
+                            }
+                            if final_vid != active_vid
+                                && matched_fallback_vids.contains(&final_vid)
+                            {
+                                if final_fetched {
+                                    let _ = Self::apply_order_response_after_cancel_attempt(
+                                        &emitter,
+                                        &tracking,
+                                        clock,
+                                        ord_strategy_id,
+                                        instrument_id,
+                                        cid,
+                                        final_vid,
+                                        cached_order.as_ref(),
+                                        &final_resp,
+                                    );
+                                }
+                                continue;
+                            }
+                            matched_fallback_vids.insert(final_vid);
+                            let applied_terminal = final_fetched
+                                && Self::apply_order_response_after_cancel_attempt(
+                                    &emitter,
+                                    &tracking,
+                                    clock,
+                                    ord_strategy_id,
+                                    instrument_id,
+                                    cid,
+                                    final_vid,
+                                    cached_order.as_ref(),
+                                    &final_resp,
+                                );
+                            if !applied_terminal {
+                                match http.cancel_order(final_vid.as_str()).await {
+                                    Ok(()) => {
+                                        Self::reconcile_post_cancel_order(
+                                            &http,
+                                            &emitter,
+                                            &tracking,
+                                            clock,
+                                            ord_strategy_id,
+                                            instrument_id,
+                                            cid,
+                                            final_vid,
+                                            cached_order,
+                                            ws_active,
+                                        )
+                                        .await;
+                                    }
+                                    Err(err) => {
+                                        let ts_done = clock.get_time_ns();
+                                        let mut reconciled = false;
+                                        if let Ok(post_resp) =
+                                            http.get_order(final_vid.as_str()).await
+                                        {
+                                            reconciled =
+                                                Self::apply_order_response_after_cancel_attempt(
+                                                    &emitter,
+                                                    &tracking,
+                                                    clock,
+                                                    ord_strategy_id,
+                                                    instrument_id,
+                                                    cid,
+                                                    final_vid,
+                                                    cached_order.as_ref(),
+                                                    &post_resp,
+                                                );
+                                        }
+                                        if !reconciled {
+                                            emitter.emit_order_cancel_rejected_event(
+                                                ord_strategy_id,
+                                                instrument_id,
+                                                cid,
+                                                Some(final_vid),
+                                                &format!(
+                                                    "cancel_all_orders unmatched order cancel failed: {err}"
+                                                ),
+                                                ts_done,
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        Err(err) => {
+                            let ts_done = clock.get_time_ns();
+                            emitter.emit_order_cancel_rejected_event(
+                                ord_strategy_id,
                                 instrument_id,
                                 cid,
-                                vid,
-                                cached_order,
-                                ws_active,
-                            )
-                            .await;
+                                resolved_vid,
+                                &format!(
+                                    "cancel_all_orders unmatched local order reconciliation failed: {err}"
+                                ),
+                                ts_done,
+                            );
                         }
                     }
                 }
@@ -3339,10 +3927,13 @@ mod tests {
             assert_eq!((m1.as_str(), p1.as_str()), ("DELETE", "/v2/orders/VEN-PEND-FILL-1"));
             write_test_http_response(&mut s1, "204 No Content", "").await;
 
-            // 2. Immediate GET /v2/orders/VEN-PEND-FILL-1 -> status: "pending_cancel"
+            // 2. Immediate GET /v2/orders/VEN-PEND-FILL-1?nested=true -> status: "pending_cancel"
             let (mut s2, _) = listener.accept().await.unwrap();
             let (m2, p2) = read_test_http_request(&mut s2).await;
-            assert_eq!((m2.as_str(), p2.as_str()), ("GET", "/v2/orders/VEN-PEND-FILL-1"));
+            assert_eq!(
+                (m2.as_str(), p2.as_str()),
+                ("GET", "/v2/orders/VEN-PEND-FILL-1?nested=true")
+            );
             write_test_http_response(
                 &mut s2,
                 "200 OK",
@@ -3354,10 +3945,13 @@ mod tests {
             // Wait until test asserts zero premature events were emitted during pending_cancel
             let _ = allow_fill_rx.await;
 
-            // 3. Follow-up GET /v2/orders/VEN-PEND-FILL-1 -> status: "filled" (stop triggered before cancel took effect)
+            // 3. Follow-up GET /v2/orders/VEN-PEND-FILL-1?nested=true -> status: "filled" (stop triggered before cancel took effect)
             let (mut s3, _) = listener.accept().await.unwrap();
             let (m3, p3) = read_test_http_request(&mut s3).await;
-            assert_eq!((m3.as_str(), p3.as_str()), ("GET", "/v2/orders/VEN-PEND-FILL-1"));
+            assert_eq!(
+                (m3.as_str(), p3.as_str()),
+                ("GET", "/v2/orders/VEN-PEND-FILL-1?nested=true")
+            );
             write_test_http_response(
                 &mut s3,
                 "200 OK",
@@ -3457,7 +4051,10 @@ mod tests {
 
             let (mut s2, _) = listener.accept().await.unwrap();
             let (m2, p2) = read_test_http_request(&mut s2).await;
-            assert_eq!((m2.as_str(), p2.as_str()), ("GET", "/v2/orders/VEN-PEND-CANC-1"));
+            assert_eq!(
+                (m2.as_str(), p2.as_str()),
+                ("GET", "/v2/orders/VEN-PEND-CANC-1?nested=true")
+            );
             write_test_http_response(
                 &mut s2,
                 "200 OK",
@@ -3467,7 +4064,10 @@ mod tests {
 
             let (mut s3, _) = listener.accept().await.unwrap();
             let (m3, p3) = read_test_http_request(&mut s3).await;
-            assert_eq!((m3.as_str(), p3.as_str()), ("GET", "/v2/orders/VEN-PEND-CANC-1"));
+            assert_eq!(
+                (m3.as_str(), p3.as_str()),
+                ("GET", "/v2/orders/VEN-PEND-CANC-1?nested=true")
+            );
             write_test_http_response(
                 &mut s3,
                 "200 OK",
@@ -3488,7 +4088,10 @@ mod tests {
 
             let (mut s5, _) = listener.accept().await.unwrap();
             let (m5, p5) = read_test_http_request(&mut s5).await;
-            assert_eq!((m5.as_str(), p5.as_str()), ("GET", "/v2/orders/VEN-422-FILL-1"));
+            assert_eq!(
+                (m5.as_str(), p5.as_str()),
+                ("GET", "/v2/orders/VEN-422-FILL-1?nested=true")
+            );
             write_test_http_response(
                 &mut s5,
                 "200 OK",
@@ -4068,7 +4671,7 @@ mod tests {
                 let (m, p) = read_test_http_request(&mut s).await;
                 assert_eq!(m, "GET");
                 match p.as_str() {
-                    "/v2/orders/VEN-REC-FILL-1" => {
+                    "/v2/orders/VEN-REC-FILL-1?nested=true" => {
                         write_test_http_response(
                             &mut s,
                             "200 OK",
@@ -4076,7 +4679,7 @@ mod tests {
                         )
                         .await;
                     }
-                    "/v2/orders/VEN-REC-CANC-1" => {
+                    "/v2/orders/VEN-REC-CANC-1?nested=true" => {
                         write_test_http_response(
                             &mut s,
                             "200 OK",
@@ -4084,7 +4687,7 @@ mod tests {
                         )
                         .await;
                     }
-                    "/v2/orders/VEN-REC-REPL-OLD" => {
+                    "/v2/orders/VEN-REC-REPL-OLD?nested=true" => {
                         write_test_http_response(
                             &mut s,
                             "200 OK",
@@ -4092,7 +4695,7 @@ mod tests {
                         )
                         .await;
                     }
-                    "/v2/orders/VEN-REC-REPL-NEW" => {
+                    "/v2/orders/VEN-REC-REPL-NEW?nested=true" => {
                         write_test_http_response(
                             &mut s,
                             "200 OK",
@@ -4158,15 +4761,17 @@ mod tests {
         // 1. OrderFilled for CID-REC-FILL-1
         // 2. OrderCanceled for CID-REC-CANC-1
         // 3. OrderUpdated for CID-REC-REPL-1 (VEN-REC-REPL-NEW @ 125.50)
-        // 4. OrderAccepted for VEN-REC-REPL-NEW
+        // (No spurious duplicate OrderAccepted after OrderUpdated)
         let mut events = Vec::new();
-        for _ in 0..4 {
+        for _ in 0..3 {
             let ev = tokio::time::timeout(Duration::from_secs(2), rx.recv())
                 .await
                 .expect("expected reconciliation event after WS reconnect")
                 .unwrap();
             events.push(ev);
         }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(rx.try_recv().is_err());
 
         assert!(events.iter().any(|ev| matches!(
             ev,
@@ -4477,7 +5082,7 @@ mod tests {
             let (m_old, p_old) = read_test_http_request(&mut s_get_old).await;
             assert_eq!(
                 (m_old.as_str(), p_old.as_str()),
-                ("GET", "/v2/orders/VEN-MOD-ERR-OLD")
+                ("GET", "/v2/orders/VEN-MOD-ERR-OLD?nested=true")
             );
             write_test_http_response(
                 &mut s_get_old,
@@ -4486,12 +5091,12 @@ mod tests {
             )
             .await;
 
-            // Reconciliation GET /v2/orders/VEN-MOD-ERR-NEW -> status: "accepted", stop_price: "194.00"
+            // Reconciliation GET /v2/orders/VEN-MOD-ERR-NEW?nested=true -> status: "accepted", stop_price: "194.00"
             let (mut s_get_new, _) = listener.accept().await.unwrap();
             let (m_new, p_new) = read_test_http_request(&mut s_get_new).await;
             assert_eq!(
                 (m_new.as_str(), p_new.as_str()),
-                ("GET", "/v2/orders/VEN-MOD-ERR-NEW")
+                ("GET", "/v2/orders/VEN-MOD-ERR-NEW?nested=true")
             );
             write_test_http_response(
                 &mut s_get_new,
@@ -4501,7 +5106,7 @@ mod tests {
             .await;
 
             // Part B1: `cancel_order` (`DELETE /v2/orders/VEN-CANC-ERR-1`) fails on transport error
-            // (2 attempts dropped), and `GET /v2/orders/VEN-CANC-ERR-1` returns `status: "accepted"` (still open).
+            // (2 attempts dropped), and `GET /v2/orders/VEN-CANC-ERR-1?nested=true` returns `status: "accepted"` (still open).
             for _ in 0..2 {
                 let (mut s_del, _) = listener.accept().await.unwrap();
                 let (m, p) = read_test_http_request(&mut s_del).await;
@@ -4515,7 +5120,7 @@ mod tests {
             let (m_c1, p_c1) = read_test_http_request(&mut s_get_canc1).await;
             assert_eq!(
                 (m_c1.as_str(), p_c1.as_str()),
-                ("GET", "/v2/orders/VEN-CANC-ERR-1")
+                ("GET", "/v2/orders/VEN-CANC-ERR-1?nested=true")
             );
             write_test_http_response(
                 &mut s_get_canc1,
@@ -4543,7 +5148,7 @@ mod tests {
             let (m_g422, p_g422) = read_test_http_request(&mut s_get_422).await;
             assert_eq!(
                 (m_g422.as_str(), p_g422.as_str()),
-                ("GET", "/v2/orders/VEN-CANC-422-OPEN")
+                ("GET", "/v2/orders/VEN-CANC-422-OPEN?nested=true")
             );
             write_test_http_response(
                 &mut s_get_422,
@@ -4604,10 +5209,6 @@ mod tests {
             .await
             .expect("expected OrderUpdated after modify_order transport error reconciliation")
             .unwrap();
-        let mod_ev2 = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-            .await
-            .expect("expected OrderAccepted for reconciled replacement order")
-            .unwrap();
         match mod_ev1 {
             ExecutionEvent::Order(OrderEventAny::Updated(u)) => {
                 assert_eq!(u.client_order_id, ClientOrderId::from("CID-MOD-ERR-1"));
@@ -4620,9 +5221,10 @@ mod tests {
             }
             other => panic!("expected OrderUpdated, got {other:?}"),
         }
+        tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(
-            !matches!(mod_ev2, ExecutionEvent::Order(OrderEventAny::ModifyRejected(_))),
-            "Must NOT emit a false OrderModifyRejected when order was already replaced on broker"
+            rx.try_recv().is_err(),
+            "Must NOT emit OrderModifyRejected or redundant OrderAccepted when order was already replaced"
         );
         assert_eq!(
             client
@@ -4700,6 +5302,386 @@ mod tests {
             other => panic!("expected OrderCancelRejected, got {other:?}"),
         }
 
+        server.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_round2_cancel_all_orders_emits_cancel_rejected_on_list_open_orders_error() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://{addr}");
+
+        let list_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let list_calls_srv = list_calls.clone();
+        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let server = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = &mut stop_rx => break,
+                    accept_res = listener.accept() => {
+                        let Ok((mut s, _)) = accept_res else { break; };
+                        let (m, p) = read_test_http_request(&mut s).await;
+                        assert_eq!(m, "GET");
+                        assert!(p.starts_with("/v2/orders"), "unexpected path {p}");
+                        list_calls_srv.fetch_add(1, Ordering::SeqCst);
+                        write_test_http_response(
+                            &mut s,
+                            "502 Bad Gateway",
+                            r#"{"message":"upstream alpaca outage"}"#,
+                        )
+                        .await;
+                    }
+                }
+            }
+        });
+
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        let (client, mut rx) = build_test_client(&base_url, cache.clone());
+
+        let aapl_buy = OrderAny::Limit(
+            LimitOrder::new_checked(
+                TraderId::from("TRADER-001"),
+                StrategyId::from("STRAT-BUY"),
+                InstrumentId::from("AAPL.ALPACA"),
+                ClientOrderId::from("CID-CA-ERR-BUY"),
+                OrderSide::Buy,
+                Quantity::from("15"),
+                Price::from("210.00"),
+                TimeInForce::Day,
+                None,
+                false,
+                false,
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                UUID4::new(),
+                UnixNanos::from(1_700_000_000_000_000_000u64),
+            )
+            .expect("valid buy LimitOrder"),
+        );
+        let aapl_sell = build_test_stop_order("CID-CA-ERR-SELL", "AAPL", "25", "195.00");
+        let msft_buy = OrderAny::Limit(
+            LimitOrder::new_checked(
+                TraderId::from("TRADER-001"),
+                StrategyId::from("STRAT-OTHER"),
+                InstrumentId::from("MSFT.ALPACA"),
+                ClientOrderId::from("CID-CA-ERR-MSFT"),
+                OrderSide::Buy,
+                Quantity::from("10"),
+                Price::from("400.00"),
+                TimeInForce::Day,
+                None,
+                false,
+                false,
+                false,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                UUID4::new(),
+                UnixNanos::from(1_700_000_000_000_000_000u64),
+            )
+            .expect("valid msft LimitOrder"),
+        );
+        {
+            let mut c = cache.borrow_mut();
+            c.add_order(aapl_buy, None, Some(ClientId::from(ALPACA_VENUE)), false)
+                .unwrap();
+            c.add_order(aapl_sell, None, Some(ClientId::from(ALPACA_VENUE)), false)
+                .unwrap();
+            c.add_order(msft_buy, None, Some(ClientId::from(ALPACA_VENUE)), false)
+                .unwrap();
+        }
+        client.record_venue_order_id(
+            ClientOrderId::from("CID-CA-ERR-BUY"),
+            VenueOrderId::from("VEN-CA-ERR-BUY"),
+        );
+        client.record_venue_order_id(
+            ClientOrderId::from("CID-CA-ERR-SELL"),
+            VenueOrderId::from("VEN-CA-ERR-SELL"),
+        );
+        client.record_venue_order_id(
+            ClientOrderId::from("CID-CA-ERR-MSFT"),
+            VenueOrderId::from("VEN-CA-ERR-MSFT"),
+        );
+
+        // 1. CancelAllOrders filtered to AAPL Buy -> emits OrderCancelRejected ONLY for CID-CA-ERR-BUY
+        client
+            .cancel_all_orders(CancelAllOrders::new(
+                TraderId::from("TRADER-001"),
+                Some(ClientId::from(ALPACA_VENUE)),
+                StrategyId::from("STRAT-BUY"),
+                InstrumentId::from("AAPL.ALPACA"),
+                Some(OrderSide::Buy),
+                UUID4::new(),
+                UnixNanos::from(1_700_000_000_000_000_000u64),
+                None,
+                None,
+            ))
+            .unwrap();
+
+        let ev1 = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .expect("expected OrderCancelRejected for AAPL Buy")
+            .unwrap();
+        match ev1 {
+            ExecutionEvent::Order(OrderEventAny::CancelRejected(r)) => {
+                assert_eq!(r.client_order_id, ClientOrderId::from("CID-CA-ERR-BUY"));
+                assert_eq!(r.venue_order_id, Some(VenueOrderId::from("VEN-CA-ERR-BUY")));
+                assert!(
+                    r.reason
+                        .as_str()
+                        .contains("cancel_all_orders list_open_orders failed"),
+                    "unexpected reason: {}",
+                    r.reason
+                );
+            }
+            other => panic!("expected OrderCancelRejected, got {other:?}"),
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "side-filtered cancel_all_orders must not emit events for SELL or MSFT orders"
+        );
+
+        // 2. CancelAllOrders for AAPL with order_side=None -> emits OrderCancelRejected for BOTH AAPL Buy & Sell
+        client
+            .cancel_all_orders(CancelAllOrders::new(
+                TraderId::from("TRADER-001"),
+                Some(ClientId::from(ALPACA_VENUE)),
+                StrategyId::from("STRAT-BUY"),
+                InstrumentId::from("AAPL.ALPACA"),
+                None,
+                UUID4::new(),
+                UnixNanos::from(1_700_000_000_000_000_000u64),
+                None,
+                None,
+            ))
+            .unwrap();
+
+        let mut rejected_cids = Vec::new();
+        for _ in 0..2 {
+            let ev = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("expected OrderCancelRejected for unfiltered AAPL")
+                .unwrap();
+            match ev {
+                ExecutionEvent::Order(OrderEventAny::CancelRejected(r)) => {
+                    assert!(
+                        r.reason
+                            .as_str()
+                            .contains("cancel_all_orders list_open_orders failed"),
+                        "unexpected reason: {}",
+                        r.reason
+                    );
+                    rejected_cids.push(r.client_order_id.to_string());
+                }
+                other => panic!("expected OrderCancelRejected, got {other:?}"),
+            }
+        }
+        rejected_cids.sort();
+        assert_eq!(
+            rejected_cids,
+            vec!["CID-CA-ERR-BUY".to_string(), "CID-CA-ERR-SELL".to_string()]
+        );
+        assert!(list_calls.load(Ordering::SeqCst) >= 2);
+
+        let _ = stop_tx.send(());
+        server.await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_round2_cancel_all_orders_reconciles_per_order_cancel_error_via_get_order() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base_url = format!("http://{addr}");
+
+        let msft_touched = Arc::new(AtomicBool::new(false));
+        let msft_touched_srv = msft_touched.clone();
+        let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let server = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = &mut stop_rx => break,
+                    accept_res = listener.accept() => {
+                        let Ok((mut s, _)) = accept_res else { break; };
+                        let (m, p) = read_test_http_request(&mut s).await;
+                        match (m.as_str(), p.as_str()) {
+                            ("GET", path) if path.starts_with("/v2/orders?") => {
+                                write_test_http_response(
+                                    &mut s,
+                                    "200 OK",
+                                    r#"[
+                                        {"id":"VEN-CA-CANC","client_order_id":"CID-CA-CANC","created_at":"2026-03-31T15:00:00Z","symbol":"AAPL","qty":"10","filled_qty":"0","type":"stop","side":"sell","time_in_force":"gtc","stop_price":"190.00","status":"accepted"},
+                                        {"id":"VEN-CA-FILL","client_order_id":"CID-CA-FILL","created_at":"2026-03-31T15:00:01Z","symbol":"AAPL","qty":"10","filled_qty":"0","type":"stop","side":"sell","time_in_force":"gtc","stop_price":"191.00","status":"accepted"},
+                                        {"id":"VEN-CA-OPEN","client_order_id":"CID-CA-OPEN","created_at":"2026-03-31T15:00:02Z","symbol":"AAPL","qty":"10","filled_qty":"0","type":"stop","side":"sell","time_in_force":"gtc","stop_price":"192.00","status":"accepted"},
+                                        {"id":"VEN-CA-GETERR","client_order_id":"CID-CA-GETERR","created_at":"2026-03-31T15:00:03Z","symbol":"AAPL","qty":"10","filled_qty":"0","type":"stop","side":"sell","time_in_force":"gtc","stop_price":"193.00","status":"accepted"},
+                                        {"id":"VEN-CA-MSFT","client_order_id":"CID-CA-MSFT","created_at":"2026-03-31T15:00:04Z","symbol":"MSFT","qty":"5","filled_qty":"0","type":"stop","side":"sell","time_in_force":"gtc","stop_price":"410.00","status":"accepted"}
+                                    ]"#,
+                                ).await;
+                            }
+                            ("DELETE", "/v2/orders/VEN-CA-CANC")
+                            | ("DELETE", "/v2/orders/VEN-CA-FILL")
+                            | ("DELETE", "/v2/orders/VEN-CA-OPEN")
+                            | ("DELETE", "/v2/orders/VEN-CA-GETERR") => {
+                                write_test_http_response(
+                                    &mut s,
+                                    "422 Unprocessable Entity",
+                                    r#"{"code":42210000,"message":"order not cancelable"}"#,
+                                ).await;
+                            }
+                            ("GET", "/v2/orders/VEN-CA-CANC?nested=true") => {
+                                write_test_http_response(
+                                    &mut s,
+                                    "200 OK",
+                                    r#"{"id":"VEN-CA-CANC","client_order_id":"CID-CA-CANC","created_at":"2026-03-31T15:00:00Z","canceled_at":"2026-03-31T15:00:10Z","symbol":"AAPL","qty":"10","filled_qty":"0","type":"stop","side":"sell","time_in_force":"gtc","stop_price":"190.00","status":"canceled"}"#,
+                                ).await;
+                            }
+                            ("GET", "/v2/orders/VEN-CA-FILL?nested=true") => {
+                                write_test_http_response(
+                                    &mut s,
+                                    "200 OK",
+                                    r#"{"id":"VEN-CA-FILL","client_order_id":"CID-CA-FILL","created_at":"2026-03-31T15:00:01Z","filled_at":"2026-03-31T15:00:10Z","symbol":"AAPL","qty":"10","filled_qty":"10","filled_avg_price":"191.25","type":"stop","side":"sell","time_in_force":"gtc","stop_price":"191.00","status":"filled"}"#,
+                                ).await;
+                            }
+                            ("GET", "/v2/orders/VEN-CA-OPEN?nested=true") => {
+                                write_test_http_response(
+                                    &mut s,
+                                    "200 OK",
+                                    r#"{"id":"VEN-CA-OPEN","client_order_id":"CID-CA-OPEN","created_at":"2026-03-31T15:00:02Z","symbol":"AAPL","qty":"10","filled_qty":"0","type":"stop","side":"sell","time_in_force":"gtc","stop_price":"192.00","status":"accepted"}"#,
+                                ).await;
+                            }
+                            ("GET", "/v2/orders/VEN-CA-GETERR?nested=true") => {
+                                write_test_http_response(
+                                    &mut s,
+                                    "404 Not Found",
+                                    r#"{"message":"order not found"}"#,
+                                ).await;
+                            }
+                            (_, path) if path.contains("MSFT") => {
+                                msft_touched_srv.store(true, Ordering::SeqCst);
+                                write_test_http_response(&mut s, "404 Not Found", r#"{"message":"unexpected"}"#).await;
+                            }
+                            (other_m, other_p) => {
+                                panic!("unexpected HTTP call {other_m} {other_p}");
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        let cache = Rc::new(RefCell::new(Cache::default()));
+        let (client, mut rx) = build_test_client(&base_url, cache.clone());
+
+        for (cid, vid, px) in [
+            ("CID-CA-CANC", "VEN-CA-CANC", "190.00"),
+            ("CID-CA-FILL", "VEN-CA-FILL", "191.00"),
+            ("CID-CA-OPEN", "VEN-CA-OPEN", "192.00"),
+            ("CID-CA-GETERR", "VEN-CA-GETERR", "193.00"),
+        ] {
+            let ord = build_test_stop_order(cid, "AAPL", "10", px);
+            cache
+                .borrow_mut()
+                .add_order(ord, None, Some(ClientId::from(ALPACA_VENUE)), false)
+                .unwrap();
+            client.record_venue_order_id(ClientOrderId::from(cid), VenueOrderId::from(vid));
+        }
+
+        client
+            .cancel_all_orders(CancelAllOrders::new(
+                TraderId::from("TRADER-001"),
+                Some(ClientId::from(ALPACA_VENUE)),
+                StrategyId::from("STRAT-001"),
+                InstrumentId::from("AAPL.ALPACA"),
+                None,
+                UUID4::new(),
+                UnixNanos::from(1_700_000_000_000_000_000u64),
+                None,
+                None,
+            ))
+            .unwrap();
+
+        // Expect 5 events:
+        // - CID-CA-CANC -> OrderCanceled
+        // - CID-CA-FILL -> OrderFilled + OrderCancelRejected("order already filled on venue before cancel completed")
+        // - CID-CA-OPEN -> OrderCancelRejected("cancel_all_orders cancel_order failed: ...")
+        // - CID-CA-GETERR -> OrderCancelRejected("cancel_all_orders cancel_order failed: ...")
+        let mut canceled_cids = Vec::new();
+        let mut filled_cids = Vec::new();
+        let mut cancel_rejected: Vec<(String, String)> = Vec::new();
+
+        for _ in 0..5 {
+            let ev = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+                .await
+                .expect("timed out waiting for cancel_all_orders reconciliation events")
+                .unwrap();
+            match ev {
+                ExecutionEvent::Order(OrderEventAny::Canceled(c)) => {
+                    canceled_cids.push(c.client_order_id.to_string());
+                }
+                ExecutionEvent::Order(OrderEventAny::Filled(f)) => {
+                    filled_cids.push(f.client_order_id.to_string());
+                }
+                ExecutionEvent::Order(OrderEventAny::CancelRejected(r)) => {
+                    cancel_rejected.push((r.client_order_id.to_string(), r.reason.to_string()));
+                }
+                other => panic!("unexpected ExecutionEvent: {other:?}"),
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(rx.try_recv().is_err(), "unexpected extra events");
+        assert!(!msft_touched.load(Ordering::SeqCst), "MSFT order must not be touched");
+
+        assert_eq!(canceled_cids, vec!["CID-CA-CANC".to_string()]);
+        assert_eq!(filled_cids, vec!["CID-CA-FILL".to_string()]);
+
+        cancel_rejected.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(cancel_rejected.len(), 3);
+        assert_eq!(cancel_rejected[0].0, "CID-CA-FILL");
+        assert!(
+            cancel_rejected[0]
+                .1
+                .contains("order already filled on venue before cancel completed"),
+            "unexpected fill reject reason: {}",
+            cancel_rejected[0].1
+        );
+        assert_eq!(cancel_rejected[1].0, "CID-CA-GETERR");
+        assert!(
+            cancel_rejected[1]
+                .1
+                .contains("cancel_all_orders cancel_order failed"),
+            "unexpected geterr reject reason: {}",
+            cancel_rejected[1].1
+        );
+        assert_eq!(cancel_rejected[2].0, "CID-CA-OPEN");
+        assert!(
+            cancel_rejected[2]
+                .1
+                .contains("cancel_all_orders cancel_order failed"),
+            "unexpected open reject reason: {}",
+            cancel_rejected[2].1
+        );
+
+        let _ = stop_tx.send(());
         server.await.unwrap();
     }
 }

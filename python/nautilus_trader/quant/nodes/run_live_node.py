@@ -187,7 +187,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     mcp_http_server: Optional[ThreadingHTTPServer] = None
     if not args.no_mcp and not args.dry_run_build:
-        mcp_server = create_production_mcp_server(dsn=dsn)
+        mcp_server = create_production_mcp_server(dsn=dsn, environment=trading_mode)
         mcp_http_server = mcp_server.create_http_server(
             host=args.mcp_host,
             port=args.mcp_port,
@@ -212,6 +212,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         environment=env_mode,
         market=os.environ.get("TRADING_MARKET", "US_EQUITY"),
         warmup_on_build=not args.dry_run_build,
+        resolve_instruments_via_alpaca=True,
     )
     try:
         active_trading_date = trading_date

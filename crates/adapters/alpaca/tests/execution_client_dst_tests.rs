@@ -1284,7 +1284,7 @@ async fn test_modify_cancel_cancel_all_and_batch_cancel_orders_dst() {
         let (m3_get, p3_get, _) = read_http_request(&mut s3_get).await;
         assert_eq!(
             (m3_get.as_str(), p3_get.as_str()),
-            ("GET", "/v2/orders/VEN-MOD-2")
+            ("GET", "/v2/orders/VEN-MOD-2?nested=true")
         );
         write_http_response(
             &mut s3_get,
@@ -1293,12 +1293,12 @@ async fn test_modify_cancel_cancel_all_and_batch_cancel_orders_dst() {
         )
         .await;
 
-        // 4. CancelAllOrders: GET /v2/orders?status=open&limit=500 followed by DELETE /v2/orders/VEN-ALL-1 + GET /v2/orders/VEN-ALL-1
+        // 4. CancelAllOrders: GET /v2/orders?status=open&limit=500&nested=true followed by DELETE /v2/orders/VEN-ALL-1 + GET /v2/orders/VEN-ALL-1?nested=true
         let (mut s4, _) = http_listener.accept().await.unwrap();
         let (m4, p4, _) = read_http_request(&mut s4).await;
         assert_eq!(
             (m4.as_str(), p4.as_str()),
-            ("GET", "/v2/orders?status=open&limit=500")
+            ("GET", "/v2/orders?status=open&limit=500&nested=true")
         );
         write_http_response(
             &mut s4,
@@ -1319,7 +1319,7 @@ async fn test_modify_cancel_cancel_all_and_batch_cancel_orders_dst() {
         let (m5_get, p5_get, _) = read_http_request(&mut s5_get).await;
         assert_eq!(
             (m5_get.as_str(), p5_get.as_str()),
-            ("GET", "/v2/orders/VEN-ALL-1")
+            ("GET", "/v2/orders/VEN-ALL-1?nested=true")
         );
         write_http_response(
             &mut s5_get,
@@ -1336,7 +1336,10 @@ async fn test_modify_cancel_cancel_all_and_batch_cancel_orders_dst() {
 
         let (mut s6_get, _) = http_listener.accept().await.unwrap();
         let (m6_get, p6_get, _) = read_http_request(&mut s6_get).await;
-        assert_eq!((m6_get.as_str(), p6_get.as_str()), ("GET", p6.as_str()));
+        assert_eq!(
+            (m6_get.as_str(), p6_get.as_str()),
+            ("GET", format!("{p6}?nested=true").as_str())
+        );
         write_http_response(
             &mut s6_get,
             "200 OK",
@@ -1357,7 +1360,10 @@ async fn test_modify_cancel_cancel_all_and_batch_cancel_orders_dst() {
 
         let (mut s7_get, _) = http_listener.accept().await.unwrap();
         let (m7_get, p7_get, _) = read_http_request(&mut s7_get).await;
-        assert_eq!((m7_get.as_str(), p7_get.as_str()), ("GET", p7.as_str()));
+        assert_eq!(
+            (m7_get.as_str(), p7_get.as_str()),
+            ("GET", format!("{p7}?nested=true").as_str())
+        );
         write_http_response(
             &mut s7_get,
             "200 OK",
@@ -2000,7 +2006,7 @@ async fn test_submit_order_and_order_list_idempotent_recovery_and_ws_fill_dedup_
             (m2.as_str(), p2.as_str()),
             (
                 "GET",
-                "/v2/orders:by_client_order_id?client_order_id=CID-IDEMP-ACC"
+                "/v2/orders:by_client_order_id?client_order_id=CID-IDEMP-ACC&nested=true"
             )
         );
         write_http_response(
@@ -2028,7 +2034,7 @@ async fn test_submit_order_and_order_list_idempotent_recovery_and_ws_fill_dedup_
             (m4.as_str(), p4.as_str()),
             (
                 "GET",
-                "/v2/orders:by_client_order_id?client_order_id=CID-IDEMP-FILLED"
+                "/v2/orders:by_client_order_id?client_order_id=CID-IDEMP-FILLED&nested=true"
             )
         );
         write_http_response(
@@ -2056,7 +2062,7 @@ async fn test_submit_order_and_order_list_idempotent_recovery_and_ws_fill_dedup_
             (m6.as_str(), p6.as_str()),
             (
                 "GET",
-                "/v2/orders:by_client_order_id?client_order_id=CID-IDEMP-BRK-P"
+                "/v2/orders:by_client_order_id?client_order_id=CID-IDEMP-BRK-P&nested=true"
             )
         );
         write_http_response(
@@ -2138,7 +2144,7 @@ async fn test_submit_order_and_order_list_idempotent_recovery_and_ws_fill_dedup_
             (m9.as_str(), p9.as_str()),
             (
                 "GET",
-                "/v2/orders:by_client_order_id?client_order_id=CID-DUP-404"
+                "/v2/orders:by_client_order_id?client_order_id=CID-DUP-404&nested=true"
             )
         );
         write_http_response(
@@ -2878,13 +2884,13 @@ async fn test_finding14_direct_get_order_by_venue_id_and_non_blocking_spawn_dst(
         )
         .await;
 
-        // 2. Direct GET /v2/orders/VEN-F14-1 for `generate_order_status_report` (venue_order_id only)
+        // 2. Direct GET /v2/orders/VEN-F14-1?nested=true for `generate_order_status_report` (venue_order_id only)
         let (mut s2, _) = http_listener.accept().await.unwrap();
         let (m2, p2, _) = read_http_request(&mut s2).await;
         assert_eq!(
             (m2.as_str(), p2.as_str()),
-            ("GET", "/v2/orders/VEN-F14-1"),
-            "generate_order_status_report with venue_order_id must call GET /v2/orders/{{id}} directly"
+            ("GET", "/v2/orders/VEN-F14-1?nested=true"),
+            "generate_order_status_report with venue_order_id must call GET /v2/orders/{{id}}?nested=true directly"
         );
         write_http_response(
             &mut s2,
@@ -2893,12 +2899,12 @@ async fn test_finding14_direct_get_order_by_venue_id_and_non_blocking_spawn_dst(
         )
         .await;
 
-        // 3. Direct GET /v2/orders/VEN-F14-MISSING -> 404 returns Ok(None)
+        // 3. Direct GET /v2/orders/VEN-F14-MISSING?nested=true -> 404 returns Ok(None)
         let (mut s3, _) = http_listener.accept().await.unwrap();
         let (m3, p3, _) = read_http_request(&mut s3).await;
         assert_eq!(
             (m3.as_str(), p3.as_str()),
-            ("GET", "/v2/orders/VEN-F14-MISSING")
+            ("GET", "/v2/orders/VEN-F14-MISSING?nested=true")
         );
         write_http_response(
             &mut s3,
@@ -2907,13 +2913,13 @@ async fn test_finding14_direct_get_order_by_venue_id_and_non_blocking_spawn_dst(
         )
         .await;
 
-        // 4. Direct GET /v2/orders/VEN-F14-1 for `generate_fill_reports` when venue_order_id is specified
+        // 4. Direct GET /v2/orders/VEN-F14-1?nested=true for `generate_fill_reports` when venue_order_id is specified
         let (mut s4, _) = http_listener.accept().await.unwrap();
         let (m4, p4, _) = read_http_request(&mut s4).await;
         assert_eq!(
             (m4.as_str(), p4.as_str()),
-            ("GET", "/v2/orders/VEN-F14-1"),
-            "generate_fill_reports with venue_order_id must call GET /v2/orders/{{id}} directly instead of list_orders(all)"
+            ("GET", "/v2/orders/VEN-F14-1?nested=true"),
+            "generate_fill_reports with venue_order_id must call GET /v2/orders/{{id}}?nested=true directly instead of list_orders(all)"
         );
         write_http_response(
             &mut s4,
@@ -3512,8 +3518,8 @@ async fn test_ticket03_per_instrument_fifo_order_serialization_dst() {
         vec![
             "START DELETE /v2/orders/VEN-FIFO-OLD".to_string(),
             "FINISH DELETE /v2/orders/VEN-FIFO-OLD".to_string(),
-            "START GET /v2/orders/VEN-FIFO-OLD".to_string(),
-            "FINISH GET /v2/orders/VEN-FIFO-OLD".to_string(),
+            "START GET /v2/orders/VEN-FIFO-OLD?nested=true".to_string(),
+            "FINISH GET /v2/orders/VEN-FIFO-OLD?nested=true".to_string(),
             "START POST /v2/orders".to_string(),
             "FINISH POST /v2/orders".to_string(),
             "START PATCH /v2/orders/VEN-FIFO-NEW-1".to_string(),

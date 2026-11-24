@@ -10,6 +10,7 @@ coverage via `ProtectiveOcoMonitor`.
 
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from decimal import Decimal
@@ -338,6 +339,7 @@ class ProtectiveOcoMonitor:
         self,
         dsn: Optional[str] = None,
         broker: str = "alpaca",
+        market: str = "US_EQUITY",
         connect_timeout_secs: int = 3,
         on_entry_freeze_callback: Optional[Callable[[str, str], None]] = None,
         *,
@@ -350,6 +352,7 @@ class ProtectiveOcoMonitor:
             else (str(dsn) if dsn is not None else "")
         )
         self._broker = str(broker or "alpaca").strip().lower()
+        self._market = str(market or "US_EQUITY").strip().upper()
         self._connect_timeout_secs = max(1, int(connect_timeout_secs))
         self._on_entry_freeze_callback: Any = (
             self._wrap_callback(on_entry_freeze_callback)
@@ -583,12 +586,15 @@ class ProtectiveOcoMonitor:
         if not norm_sym or not self._persist_to_db or not self._dsn:
             return None
         try:
-            conn = psycopg2.connect(
-                self._dsn,
-                cursor_factory=RealDictCursor,
-                connect_timeout=self._connect_timeout_secs,
-            )
-            try:
+            timeout_secs = max(1, min(int(self._connect_timeout_secs), 2))
+            with contextlib.closing(
+                psycopg2.connect(
+                    self._dsn,
+                    cursor_factory=RealDictCursor,
+                    connect_timeout=timeout_secs,
+                    options="-c statement_timeout=1500",
+                )
+            ) as conn:
                 with conn.cursor() as cur:
                     if not self._table_exists(cur, "protective_orders"):
                         return None
@@ -633,8 +639,6 @@ class ProtectiveOcoMonitor:
                     if cov.broker_order_id:
                         self._protective_orders_by_id[cov.broker_order_id] = cov
                     return cov
-            finally:
-                conn.close()
         except Exception as exc:
             logger.error(
                 "ProtectiveOcoMonitor failed to refresh protective_orders for %s: %s",
@@ -720,11 +724,13 @@ class ProtectiveOcoMonitor:
         if existing is None:
             existing = current_sym_cov
 
-        if self.is_safe_exit_active(target_sym) and (
-            "CANCELED" in reason.upper()
-            or "REJECTED" in reason.upper()
-            or "DENIED" in reason.upper()
-            or "EXPIRED" in reason.upper()
+        reason_upper = reason.upper()
+        if (
+            self.is_safe_exit_active(target_sym)
+            and "CANCELED" in reason_upper
+            and "REJECTED" not in reason_upper
+            and "DENIED" not in reason_upper
+            and "EXPIRED" not in reason_upper
         ):
             return None
 
@@ -831,7 +837,11 @@ class ProtectiveOcoMonitor:
 
         covered_qty = (
             coverage.covered_qty
-            if (coverage is not None and coverage.status in ("ACTIVE", "REPLACING"))
+            if (
+                coverage is not None
+                and coverage.status in ("ACTIVE", "REPLACING")
+                and bool(str(coverage.broker_order_id or "").strip())
+            )
             else Decimal("0")
         )
         stop_price = coverage.stop_price if coverage is not None else Decimal("0")
@@ -840,6 +850,7 @@ class ProtectiveOcoMonitor:
         if (
             coverage is not None
             and coverage.status in ("ACTIVE", "REPLACING")
+            and bool(str(coverage.broker_order_id or "").strip())
             and covered_qty >= abs_pos_qty
             and stop_price > Decimal("0")
         ):
@@ -942,10 +953,12 @@ class ProtectiveOcoMonitor:
             JOIN trading_plans p ON p.plan_id = i.plan_id
             WHERE i.symbol = %s
               AND p.status = 'LOCKED'
+              AND UPPER(p.market) = UPPER(%s)
+              AND LOWER(i.broker) = LOWER(%s)
             ORDER BY p.trading_date DESC, p.locked_at DESC NULLS LAST
             LIMIT 1
             """,
-            (symbol,),
+            (symbol, self._market, self._broker),
         )
         row = cur.fetchone()
         return str(row["item_id"]) if row and row.get("item_id") else None
@@ -1193,6 +1206,7 @@ class PostgresTelemetryActor(DataActor):
         self._oco_monitor = oco_monitor or ProtectiveOcoMonitor(
             dsn=self._dsn if self._persist_to_db else None,
             broker=self._broker,
+            market=self._market,
             connect_timeout_secs=self._connect_timeout_secs,
             persist_to_db=self._persist_to_db,
         )
@@ -1270,11 +1284,17 @@ class PostgresTelemetryActor(DataActor):
     def trading_date(self) -> Optional[date]:
         return self._trading_date
 
+    def _clear_plan_item_cache_worker_only(self) -> None:
+        if self._persist_to_db and self._async_writer is not None:
+            self._async_writer.submit(lambda _cur: self._plan_item_cache.clear())
+        else:
+            self._plan_item_cache.clear()
+
     def set_trading_date(self, trading_date: Optional[date]) -> None:
         """Hot-reloads the active `trading_date` on `PostgresTelemetryActor` during daily rollover."""
         self._trading_date = trading_date
         self._telemetry_config.trading_date = trading_date
-        self._plan_item_cache.clear()
+        self._clear_plan_item_cache_worker_only()
         self._startup_entry_reservations.clear()
         self._scheduled_expiry_item_ids.clear()
         self._expiry_targets_by_timer.clear()
@@ -1344,6 +1364,7 @@ class PostgresTelemetryActor(DataActor):
         new_cid: Optional[str] = None,
         new_covered_qty: Any = None,
         stop_price: Any = None,
+        status: Optional[str] = None,
         *,
         symbol: Optional[str] = None,
     ) -> None:
@@ -1367,10 +1388,6 @@ class PostgresTelemetryActor(DataActor):
                     break
 
         if old_cid:
-            if len(self._replaced_stop_cids) >= 4096:
-                self._replaced_stop_cids.popitem(last=False)
-            if len(self._terminated_stop_cids) >= 4096:
-                self._terminated_stop_cids.popitem(last=False)
             self._replaced_stop_cids.add(str(old_cid))
             self._terminated_stop_cids.add(str(old_cid))
             deferred_key = f"deferred-replace-{old_cid}"
@@ -1395,11 +1412,12 @@ class PostgresTelemetryActor(DataActor):
             self._terminated_stop_cids.discard(resolved_new_cid)
             self._replaced_stop_cids.discard(resolved_new_cid)
             legs = self._active_stop_legs_by_symbol.setdefault(norm_sym, {})
-            if not resolved_new_cid.startswith("deferred-replace-"):
+            is_deferred_placeholder = resolved_new_cid.startswith("deferred-replace-")
+            if not is_deferred_placeholder:
                 for k in [k for k in legs if str(k).startswith("deferred-replace-")]:
                     legs.pop(k, None)
                     self._active_stop_price_by_leg.pop(k, None)
-            legs[resolved_new_cid] = qty_dec
+                legs[resolved_new_cid] = qty_dec
             stop_px_dec = (
                 _to_decimal(stop_price, "0")
                 if stop_price is not None
@@ -1417,16 +1435,31 @@ class PostgresTelemetryActor(DataActor):
                     )
                 )
             if stop_px_dec > Decimal("0"):
-                self._active_stop_price_by_leg[resolved_new_cid] = stop_px_dec
-                total_covered_qty = sum(legs.values(), Decimal("0"))
+                if not is_deferred_placeholder:
+                    self._active_stop_price_by_leg[resolved_new_cid] = stop_px_dec
+                real_covered_qty = sum(
+                    (
+                        q
+                        for leg_cid, q in legs.items()
+                        if not str(leg_cid).startswith("deferred-replace-")
+                    ),
+                    Decimal("0"),
+                )
+                covered_for_monitor = (
+                    real_covered_qty if real_covered_qty > Decimal("0") else qty_dec
+                )
                 target_status = (
-                    "REPLACING"
-                    if resolved_new_cid.startswith("deferred-replace-")
-                    else "ACTIVE"
+                    str(status).strip().upper()
+                    if status is not None and str(status).strip() != ""
+                    else (
+                        "REPLACING"
+                        if is_deferred_placeholder
+                        else "ACTIVE"
+                    )
                 )
                 self._oco_monitor.register_protective_order(
                     symbol=norm_sym,
-                    covered_qty=total_covered_qty,
+                    covered_qty=covered_for_monitor,
                     stop_price=stop_px_dec,
                     broker_order_id=resolved_new_cid,
                     status=target_status,
@@ -1953,22 +1986,38 @@ class PostgresTelemetryActor(DataActor):
                         self._startup_entry_reservations[cid] = (sym, ord_qty)
 
             net_new_pos = max(Decimal("0"), abs_pos_broker - abs_carry_over)
-            reconciled_reserved = (
-                max(cache_fills_today, pg_orders_filled_today, net_new_pos)
-                + open_leaves
-            )
-
             pyramid_enabled = bool(item.sizing_trace.get("pyramid_enabled", False))
-            if (
-                co_status == "RENEWED_ACTIVE"
-                and not pyramid_enabled
-                and abs_carry_over > Decimal("0")
-            ):
-                reconciled_reserved = max(
-                    reconciled_reserved, item.risk_envelope.approved_qty_cap
+            if co_status == "RENEWED_ACTIVE" and abs_carry_over > Decimal("0"):
+                actual_filled_and_leaves = (
+                    max(
+                        abs_carry_over + max(cache_fills_today, pg_orders_filled_today),
+                        abs_pos_broker,
+                    )
+                    + open_leaves
                 )
+                if not pyramid_enabled:
+                    reconciled_reserved = max(
+                        actual_filled_and_leaves,
+                        item.risk_envelope.approved_qty_cap,
+                    )
+                else:
+                    reconciled_reserved = actual_filled_and_leaves
+            else:
+                actual_filled_and_leaves = (
+                    max(cache_fills_today, pg_orders_filled_today, net_new_pos)
+                    + open_leaves
+                )
+                reconciled_reserved = actual_filled_and_leaves
 
-            reconcile_sym_fn(sym, reconciled_reserved, persist_db=self._persist_to_db)
+            if reconciled_reserved != actual_filled_and_leaves:
+                reconcile_sym_fn(
+                    sym,
+                    reconciled_reserved,
+                    persist_db=self._persist_to_db,
+                    persist_filled_qty=actual_filled_and_leaves,
+                )
+            else:
+                reconcile_sym_fn(sym, reconciled_reserved, persist_db=self._persist_to_db)
 
     def sync_plan_expiry_timers(self) -> None:
         """Schedules `valid_until` expiry alerts for active plan items via `self.clock.set_time_alert_ns`."""
@@ -2293,7 +2342,7 @@ class PostgresTelemetryActor(DataActor):
         self._active_stop_price_by_leg.clear()
         self._order_meta.clear()
         self._fills_by_cid.clear()
-        self._plan_item_cache.clear()
+        self._clear_plan_item_cache_worker_only()
         self._startup_entry_reservations.clear()
         self._safe_exit_symbols.clear()
         self._opened_position_ids.clear()
@@ -2650,20 +2699,30 @@ class PostgresTelemetryActor(DataActor):
             if remaining_covered_qty >= pos_qty:
                 return
 
-        if self.is_safe_exit_active(sym) and (
-            "CANCELED" in reason.upper()
-            or "REJECTED" in reason.upper()
-            or "DENIED" in reason.upper()
-            or "EXPIRED" in reason.upper()
+        reason_upper = reason.upper()
+        if (
+            self.is_safe_exit_active(sym)
+            and "CANCELED" in reason_upper
+            and "REJECTED" not in reason_upper
+            and "DENIED" not in reason_upper
+            and "EXPIRED" not in reason_upper
         ):
             return
 
-        if remaining_covered_qty < pos_qty and "CANCELED" in reason.upper():
+        if remaining_covered_qty < pos_qty and "CANCELED" in reason_upper:
             prev_cov = self._oco_monitor.get_coverage(sym)
             if prev_cov is not None and prev_cov.status == "REPLACING":
                 return
             if prev_cov is None or prev_cov.broker_order_id in {cid, vid, ""}:
-                db_cov = self._oco_monitor.refresh_symbol_coverage_from_db(sym)
+                try:
+                    db_cov = self._oco_monitor.refresh_symbol_coverage_from_db(sym)
+                except Exception as exc:
+                    logger.warning(
+                        "Failed refreshing DB protective_orders for %s on canceled stop leg: %s",
+                        sym,
+                        exc,
+                    )
+                    db_cov = None
                 if db_cov is not None:
                     prev_cov = db_cov
             if (
@@ -2898,6 +2957,7 @@ class PostgresTelemetryActor(DataActor):
             else qty
         )
         eff_filled_qty = max(filled_qty, _to_decimal(prev_meta.get("filled_qty"), "0"))
+        eff_leaves_qty = max(Decimal("0"), _to_decimal(eff_qty, "0") - eff_filled_qty)
         eff_limit_px = (
             prev_meta.get("limit_price")
             if is_stale_cache_snapshot and prev_meta.get("limit_price") is not None
@@ -2908,6 +2968,22 @@ class PostgresTelemetryActor(DataActor):
             if is_stale_cache_snapshot and prev_meta.get("trigger_price") is not None
             else trigger_px
         )
+        raw_order_status = (
+            order.status_string()
+            if callable(getattr(order, "status_string", None))
+            else getattr(order, "status", None)
+        )
+        order_status_str = (
+            str(raw_order_status).rsplit(".", 1)[-1].strip().upper()
+            if raw_order_status is not None and str(raw_order_status).strip()
+            else ""
+        )
+        prev_status_str = str(prev_meta.get("status") or "").strip().upper()
+        eff_status = (
+            prev_status_str
+            if is_stale_cache_snapshot and prev_status_str
+            else (order_status_str or prev_status_str or "INITIALIZED")
+        )
         meta = {
             "client_order_id": cid,
             "venue_order_id": eff_vid,
@@ -2916,8 +2992,10 @@ class PostgresTelemetryActor(DataActor):
             "symbol": symbol,
             "side": side,
             "order_type": order_type,
+            "status": eff_status,
             "quantity": eff_qty,
             "filled_qty": eff_filled_qty,
+            "leaves_qty": eff_leaves_qty,
             "limit_price": eff_limit_px,
             "trigger_price": eff_trigger_px,
             "stop_loss_price": stop_loss_px,
@@ -3041,6 +3119,9 @@ class PostgresTelemetryActor(DataActor):
                 getattr(event, "ts_init", None)
             ) or self._positive_ns(getattr(event, "ts_event", None))
 
+        qty_dec = _to_decimal(qty, "0")
+        filled_qty_dec = _to_decimal(cached_meta.get("filled_qty"), "0")
+        merged_status = str(cached_meta.get("status") or "").strip().upper() or "INITIALIZED"
         merged = {
             "client_order_id": cid,
             "venue_order_id": vid,
@@ -3049,8 +3130,10 @@ class PostgresTelemetryActor(DataActor):
             "symbol": symbol,
             "side": side,
             "order_type": order_type,
+            "status": merged_status,
             "quantity": qty,
-            "filled_qty": _to_decimal(cached_meta.get("filled_qty"), "0"),
+            "filled_qty": filled_qty_dec,
+            "leaves_qty": max(Decimal("0"), qty_dec - filled_qty_dec),
             "limit_price": limit_px,
             "trigger_price": trigger_px,
             "stop_loss_price": stop_loss_px,
@@ -3496,6 +3579,35 @@ class PostgresTelemetryActor(DataActor):
         self._resolve_order_metadata(event)
         self._flush_backend_mutations()
 
+    def _sync_protective_stop_leg_from_meta(
+        self,
+        meta: Dict[str, Any],
+        *,
+        zero_leaves_reason: str,
+    ) -> None:
+        if not _is_protective_stop_meta(meta):
+            return
+        stop_px = (
+            meta.get("trigger_price")
+            or meta.get("limit_price")
+            or meta.get("stop_loss_price")
+        )
+        leaves_qty = max(
+            Decimal("0"),
+            _to_decimal(meta.get("leaves_qty"), "0")
+            if meta.get("leaves_qty") is not None
+            else _to_decimal(meta.get("quantity"), "0")
+            - _to_decimal(meta.get("filled_qty"), "0"),
+        )
+        if (
+            leaves_qty > Decimal("0")
+            and stop_px is not None
+            and _to_decimal(stop_px, "0") > Decimal("0")
+        ):
+            self._register_active_stop_leg(meta, leaves_qty, stop_px)
+        elif leaves_qty <= Decimal("0"):
+            self._invalidate_stop_leg(meta, reason=zero_leaves_reason)
+
     def on_order_submitted(self, event: OrderSubmitted) -> None:
         meta = self._resolve_order_metadata(event)
         event_id = str(getattr(event, "event_id", "") or f"sub:{meta['client_order_id']}")
@@ -3509,13 +3621,10 @@ class PostgresTelemetryActor(DataActor):
             reason="Order submitted to execution client",
         )
         if _is_protective_stop_meta(meta):
-            stop_px = (
-                meta.get("trigger_price")
-                or meta.get("limit_price")
-                or meta.get("stop_loss_price")
+            self._sync_protective_stop_leg_from_meta(
+                meta,
+                zero_leaves_reason="ORDER_SUBMITTED_ZERO_LEAVES",
             )
-            if stop_px is not None and _to_decimal(stop_px, "0") > Decimal("0"):
-                self._register_active_stop_leg(meta, meta["quantity"], stop_px)
         else:
             self._trigger_pending_expiry_cancel_if_needed(meta)
         self._flush_backend_mutations()
@@ -3533,13 +3642,10 @@ class PostgresTelemetryActor(DataActor):
             reason="Order accepted by venue",
         )
         if _is_protective_stop_meta(meta):
-            stop_px = (
-                meta.get("trigger_price")
-                or meta.get("limit_price")
-                or meta.get("stop_loss_price")
+            self._sync_protective_stop_leg_from_meta(
+                meta,
+                zero_leaves_reason="ORDER_ACCEPTED_ZERO_LEAVES",
             )
-            if stop_px is not None and _to_decimal(stop_px, "0") > Decimal("0"):
-                self._register_active_stop_leg(meta, meta["quantity"], stop_px)
         else:
             self._trigger_pending_expiry_cancel_if_needed(meta)
         self._flush_backend_mutations()
@@ -3593,14 +3699,10 @@ class PostgresTelemetryActor(DataActor):
             event_id=event_id,
             reason="Order updated",
         )
-        if _is_protective_stop_meta(meta):
-            stop_px = (
-                meta.get("trigger_price")
-                or meta.get("limit_price")
-                or meta.get("stop_loss_price")
-            )
-            if stop_px is not None and _to_decimal(stop_px, "0") > Decimal("0"):
-                self._register_active_stop_leg(meta, meta["quantity"], stop_px)
+        self._sync_protective_stop_leg_from_meta(
+            meta,
+            zero_leaves_reason="ORDER_UPDATED_ZERO_LEAVES",
+        )
         self._flush_backend_mutations()
 
     def _handle_safe_exit_failure_if_applicable(
@@ -3777,6 +3879,7 @@ class PostgresTelemetryActor(DataActor):
         )
         if cid in self._order_meta:
             self._order_meta[cid]["filled_qty"] = cum_qty
+            self._order_meta[cid]["status"] = order_status
         if total_qty > Decimal("0") and cum_qty >= total_qty and cid:
             self._startup_entry_reservations.pop(cid, None)
 
@@ -3848,6 +3951,9 @@ class PostgresTelemetryActor(DataActor):
                     Decimal("0"), unapplied_red - last_qty
                 )
 
+        session_trading_date = self._trading_date
+        meta_snapshot = dict(meta)
+
         def _task(cur: Any) -> None:
             cur.execute(
                 """
@@ -3873,11 +3979,11 @@ class PostgresTelemetryActor(DataActor):
                     order_id,
                     cid,
                     vid,
-                    meta["strategy_id"],
+                    meta_snapshot["strategy_id"],
                     self._broker,
                     self._environment,
-                    meta["symbol"],
-                    meta["side"],
+                    meta_snapshot["symbol"],
+                    meta_snapshot["side"],
                     last_qty,
                     last_px,
                     commission,
@@ -3889,8 +3995,8 @@ class PostgresTelemetryActor(DataActor):
                             "trade_id": trade_id,
                             "client_order_id": cid,
                             "venue_order_id": vid,
-                            "symbol": meta["symbol"],
-                            "side": meta["side"],
+                            "symbol": meta_snapshot["symbol"],
+                            "side": meta_snapshot["side"],
                             "last_qty": str(last_qty),
                             "last_px": str(last_px),
                             "commission": str(commission),
@@ -3900,7 +4006,7 @@ class PostgresTelemetryActor(DataActor):
             )
             self._upsert_order_row_in_tx(
                 cur=cur,
-                meta=meta,
+                meta=meta_snapshot,
                 status=order_status,
                 filled_qty=cum_qty,
                 filled_avg_price=avg_px,
@@ -3910,12 +4016,13 @@ class PostgresTelemetryActor(DataActor):
                     "trade_id": trade_id,
                     "venue_order_id": vid,
                 },
+                session_trading_date=session_trading_date,
             )
             self._insert_plan_event_in_tx(
                 cur=cur,
-                symbol=meta["symbol"],
+                symbol=meta_snapshot["symbol"],
                 event_type="ORDER_FILLED",
-                actor=f"nautilus:telemetry:{meta['strategy_id'] or 'actor'}",
+                actor=f"nautilus:telemetry:{meta_snapshot['strategy_id'] or 'actor'}",
                 reason=f"Order fill {last_qty} @ {last_px} (cum={cum_qty})",
                 event_id=event_id,
                 payload={
@@ -3923,12 +4030,13 @@ class PostgresTelemetryActor(DataActor):
                     "trade_id": trade_id,
                     "client_order_id": cid,
                     "venue_order_id": vid,
-                    "symbol": meta["symbol"],
+                    "symbol": meta_snapshot["symbol"],
                     "last_qty": str(last_qty),
                     "last_px": str(last_px),
                     "cum_qty": str(cum_qty),
                     "status": order_status,
                 },
+                session_trading_date=session_trading_date,
             )
             self._upsert_trading_account_in_tx(cur)
 
@@ -3963,6 +4071,8 @@ class PostgresTelemetryActor(DataActor):
         plan_event_type: str,
         event_id: str,
     ) -> None:
+        session_trading_date = self._trading_date
+
         def _task(cur: Any) -> None:
             cost_basis = float(qty * avg_px_open)
             cur.execute(
@@ -4020,6 +4130,7 @@ class PostgresTelemetryActor(DataActor):
                     "avg_px_open": str(avg_px_open),
                     "realized_pnl": str(realized_pnl),
                 },
+                session_trading_date=session_trading_date,
             )
             self._upsert_trading_account_in_tx(cur)
 
@@ -4184,10 +4295,20 @@ class PostgresTelemetryActor(DataActor):
         reason: str,
         alert_spec: Optional[Dict[str, Any]] = None,
     ) -> None:
+        norm_st = str(status or "").strip().upper()
+        if isinstance(meta, dict) and norm_st:
+            meta["status"] = norm_st
+            meta_cid = str(meta.get("client_order_id") or "")
+            if meta_cid and meta_cid in self._order_meta:
+                self._order_meta[meta_cid]["status"] = norm_st
+
+        session_trading_date = self._trading_date
+        meta_snapshot = dict(meta)
+
         def _task(cur: Any) -> None:
             self._upsert_order_row_in_tx(
                 cur=cur,
-                meta=meta,
+                meta=meta_snapshot,
                 status=status,
                 filled_qty=None,
                 filled_avg_price=None,
@@ -4195,26 +4316,28 @@ class PostgresTelemetryActor(DataActor):
                     "last_event": plan_event_type,
                     "event_id": event_id,
                     "reason": reason,
-                    "venue_order_id": meta.get("venue_order_id", ""),
+                    "venue_order_id": meta_snapshot.get("venue_order_id", ""),
                 },
+                session_trading_date=session_trading_date,
             )
             self._insert_plan_event_in_tx(
                 cur=cur,
-                symbol=meta["symbol"],
+                symbol=meta_snapshot["symbol"],
                 event_type=plan_event_type,
-                actor=f"nautilus:telemetry:{meta.get('strategy_id') or 'actor'}",
+                actor=f"nautilus:telemetry:{meta_snapshot.get('strategy_id') or 'actor'}",
                 reason=reason,
                 event_id=event_id,
                 payload={
                     "event_id": event_id,
-                    "client_order_id": meta["client_order_id"],
-                    "venue_order_id": meta.get("venue_order_id", ""),
-                    "symbol": meta["symbol"],
-                    "side": meta["side"],
-                    "quantity": str(meta["quantity"]),
+                    "client_order_id": meta_snapshot["client_order_id"],
+                    "venue_order_id": meta_snapshot.get("venue_order_id", ""),
+                    "symbol": meta_snapshot["symbol"],
+                    "side": meta_snapshot["side"],
+                    "quantity": str(meta_snapshot["quantity"]),
                     "status": status,
                     "reason": reason,
                 },
+                session_trading_date=session_trading_date,
             )
             if alert_spec is not None:
                 dedup_key = alert_spec["dedup_key"]
@@ -4239,8 +4362,8 @@ class PostgresTelemetryActor(DataActor):
                             json.dumps(
                                 {
                                     "event_id": event_id,
-                                    "client_order_id": meta["client_order_id"],
-                                    "symbol": meta["symbol"],
+                                    "client_order_id": meta_snapshot["client_order_id"],
+                                    "symbol": meta_snapshot["symbol"],
                                     "status": status,
                                     "reason": reason,
                                 }
@@ -4253,6 +4376,8 @@ class PostgresTelemetryActor(DataActor):
             self._async_writer.submit(_task)
         self._processed_event_ids.add(event_id)
 
+    _UNSET_SESSION_DATE: Any = object()
+
     def _upsert_order_row_in_tx(
         self,
         cur: Any,
@@ -4261,6 +4386,7 @@ class PostgresTelemetryActor(DataActor):
         filled_qty: Optional[Decimal],
         filled_avg_price: Optional[Decimal],
         raw_response: Dict[str, Any],
+        session_trading_date: Any = _UNSET_SESSION_DATE,
     ) -> None:
         cid = str(meta.get("client_order_id") or "")
         vid = str(meta.get("venue_order_id") or "")
@@ -4277,8 +4403,13 @@ class PostgresTelemetryActor(DataActor):
         signal_ts_ns = self._positive_ns(meta.get("signal_ts_ns"))
         gate_admitted_ts_ns = self._positive_ns(meta.get("gate_admitted_ts_ns"))
         broker_ack_ts_ns = self._positive_ns(meta.get("broker_ack_ts_ns"))
-        if self._trading_date is not None and "trading_date" not in raw_response:
-            raw_response = {**raw_response, "trading_date": self._trading_date.isoformat()}
+        resolved_td = (
+            self._trading_date
+            if session_trading_date is self._UNSET_SESSION_DATE
+            else session_trading_date
+        )
+        if resolved_td is not None and "trading_date" not in raw_response:
+            raw_response = {**raw_response, "trading_date": resolved_td.isoformat()}
         cur.execute(
             """
             INSERT INTO orders (
@@ -4355,15 +4486,21 @@ class PostgresTelemetryActor(DataActor):
         reason: str,
         event_id: str,
         payload: Dict[str, Any],
+        session_trading_date: Any = _UNSET_SESSION_DATE,
     ) -> None:
         if not symbol:
             return
-        cache_key = (self._trading_date, self._market, symbol)
+        resolved_td = (
+            self._trading_date
+            if session_trading_date is self._UNSET_SESSION_DATE
+            else session_trading_date
+        )
+        cache_key = (resolved_td, self._market, symbol)
         cached_pair = self._plan_item_cache.get(cache_key)
         if cached_pair is not None:
             plan_id, item_id = cached_pair
         else:
-            if self._trading_date is not None:
+            if resolved_td is not None:
                 cur.execute(
                     """
                     SELECT p.plan_id, i.item_id
@@ -4375,7 +4512,7 @@ class PostgresTelemetryActor(DataActor):
                     ORDER BY (p.status = 'LOCKED') DESC, p.locked_at DESC NULLS LAST, p.created_at DESC
                     LIMIT 1
                     """,
-                    (symbol, self._trading_date, self._market),
+                    (symbol, resolved_td, self._market),
                 )
             else:
                 cur.execute(

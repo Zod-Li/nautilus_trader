@@ -50,8 +50,10 @@ impl RustPlanItemEnvelope {
         atr: Option<Decimal>,
     ) -> Decimal {
         let hundred = Decimal::from(100);
-        let pct_offset = reference_price * (self.limit_collar_pct / hundred);
-        let eff_atr = atr.or_else(|| self.daily_atr_14.filter(|a| *a > Decimal::ZERO));
+        let pct_offset = reference_price * (self.limit_collar_pct.max(Decimal::ZERO) / hundred);
+        let eff_atr = atr
+            .filter(|a| *a > Decimal::ZERO)
+            .or_else(|| self.daily_atr_14.filter(|a| *a > Decimal::ZERO));
         let allowed_offset = match eff_atr {
             Some(atr_val) if self.limit_collar_atr > Decimal::ZERO => {
                 let atr_offset = atr_val * self.limit_collar_atr;

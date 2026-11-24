@@ -67,6 +67,7 @@ from nautilus_trader.quant.nodes.backtest_runner import (
     _normal_ppf,
     _sort_bars_deterministic,
     compute_per_period_deflated_sharpe_ratio,
+    compute_rth_bar_close_ns,
 )
 from nautilus_trader.quant.strategies.empirical import (
     empirical_rank_quantile,
@@ -309,14 +310,15 @@ def _to_epoch_ns(raw_ts: Any, fallback_ns: int) -> int:
 
 
 def _build_monotonic_ts_ns(raw_timestamps: Sequence[Any], step_ns: int) -> List[int]:
-    """Convert a slice of timestamps into strictly increasing UTC epoch nanoseconds."""
+    """Convert raw bar-open timestamps into strictly increasing canonical NYSE RTH close nanoseconds."""
     base_ns = 1_700_000_000_000_000_000
     eff_step = max(1, int(step_ns))
     out: List[int] = []
     prev_ns = 0
     for idx, raw_ts in enumerate(raw_timestamps):
         fallback_ns = (prev_ns + eff_step) if prev_ns > 0 else (base_ns + idx * eff_step)
-        ns = _to_epoch_ns(raw_ts, fallback_ns)
+        open_ns = _to_epoch_ns(raw_ts, fallback_ns)
+        ns = compute_rth_bar_close_ns(open_ns, eff_step)
         if prev_ns > 0 and ns <= prev_ns:
             ns = prev_ns + eff_step
         out.append(ns)
@@ -1118,6 +1120,8 @@ class CausalMarketMicrostructureEstimator:
     @staticmethod
     def _ny_date_from_ns(ts_ns: int) -> date:
         if ts_ns > 100_000_000_000_000_000:
+            if ts_ns % 86_400_000_000_000 == 0:
+                return datetime.fromtimestamp(ts_ns / 1e9, tz=timezone.utc).date()
             return datetime.fromtimestamp(ts_ns / 1e9, tz=timezone.utc).astimezone(ET_TZ).date()
         return datetime(1970, 1, 1, tzinfo=timezone.utc).date()
 
@@ -1240,7 +1244,7 @@ class CausalMarketMicrostructureEstimator:
             bar_vols = [max(0.0, float(b.volume)) for b in causal_bars if float(b.volume) > 0.0]
             bars_per_day = max(
                 1.0,
-                86_400_000_000_000.0 / float(max(1, _bar_step_ns(causal_bars[0]))) / 2.5,
+                (6.5 * 3600.0 * 1e9) / float(max(1, _bar_step_ns(causal_bars[0]))),
             )
             adv_20_shares = max(1.0, float(statistics.fmean(bar_vols)) * bars_per_day) if bar_vols else 100_000.0
         else:
@@ -1446,12 +1450,21 @@ class ConditionalSwingEventExtractor:
         session_candidates: List[List[ConditionalSwingEvent]] = []
         for s_idx in range(warmup_sess, max(warmup_sess + 1, len(all_sess_starts) - eff_h)):
             tau_ns = all_sess_starts[s_idx]
+            tau_ny_date = CausalMarketMicrostructureEstimator._ny_date_from_ns(tau_ns)
             day_scored: List[Tuple[float, str, int, int]] = []
             for sym, sess_list in session_bars_by_sym.items():
-                # Find session starting at or right around tau_ns and ending eff_h sessions later
+                # Find session with exact NY session date match for tau_ns
                 sym_starts = [s[0] for s in sess_list]
-                pos = bisect.bisect_left(sym_starts, tau_ns)
-                if pos >= len(sess_list) or abs(sess_list[pos][0] - tau_ns) > 86_400_000_000_000:
+                raw_pos = bisect.bisect_left(sym_starts, tau_ns)
+                pos: Optional[int] = None
+                for cand in (raw_pos, raw_pos - 1):
+                    if 0 <= cand < len(sess_list) and (
+                        CausalMarketMicrostructureEstimator._ny_date_from_ns(sess_list[cand][0])
+                        == tau_ny_date
+                    ):
+                        pos = cand
+                        break
+                if pos is None:
                     continue
                 end_pos = min(len(sess_list) - 1, pos + eff_h - 1)
                 if end_pos < pos:
@@ -2379,13 +2392,18 @@ class OfflineRegimePanelCalibrator:
 
         try:
             for f_start, f_end in fold_ranges:
-                is_events = events[:f_start]
                 oos_events = events[f_start:f_end]
+                oos_first_start = oos_events[0].start_ns if oos_events else 0
+                is_events = (
+                    [ev for ev in events[:f_start] if ev.end_ns < oos_first_start]
+                    if oos_events
+                    else events[:f_start]
+                )
 
-                # Screen indicator parameter grid strictly on In-Sample events
+                # Screen indicator parameter grid strictly on purged In-Sample events
                 best_params = dict(grid[0])
                 if is_events and len(grid) > 1:
-                    is_sample = is_events[-min(len(is_events), 12) :]
+                    is_sample = is_events
                     best_is_score: Optional[Tuple[float, float]] = None
                     for cand_p in grid:
                         cand_dict = dict(cand_p)
@@ -2410,11 +2428,29 @@ class OfflineRegimePanelCalibrator:
                         oos_items_by_spec[s_key].append(w_item)
 
             n_oos = len(oos_events_all)
+            ny_tz = ZoneInfo("America/New_York")
+            ev_dates = [
+                datetime.fromtimestamp(ev.start_ns / 1_000_000_000.0, tz=timezone.utc)
+                .astimezone(ny_tz)
+                .date()
+                for ev in oos_events_all
+            ]
+            ordered_dates: List[date] = []
+            seen_dates: set[date] = set()
+            for d_ev in ev_dates:
+                if d_ev not in seen_dates:
+                    seen_dates.add(d_ev)
+                    ordered_dates.append(d_ev)
+            use_daily_agg = len(ordered_dates) >= 2
             h_lags = max(
                 1,
-                int(round(statistics.fmean([e.horizon_sessions for e in oos_events_all])))
-                if oos_events_all
-                else 1,
+                int(round(holding_horizon_sessions))
+                if use_daily_agg
+                else (
+                    int(round(statistics.fmean([e.horizon_sessions for e in oos_events_all])))
+                    if oos_events_all
+                    else 1
+                ),
             )
             h0_key = _spec_key(h0_spec)
             h0_rs = oos_r_by_spec[h0_key]
@@ -2431,7 +2467,18 @@ class OfflineRegimePanelCalibrator:
                 )
                 pi_rs = oos_r_by_spec[s_key]
                 pi_fills = oos_filled_by_spec[s_key]
-                deltas = [pi_rs[i] - h0_rs[i] for i in range(n_oos)]
+                deltas_raw = [pi_rs[i] - h0_rs[i] for i in range(n_oos)]
+                if use_daily_agg:
+                    delta_by_day: Dict[date, List[float]] = {}
+                    for i in range(n_oos):
+                        delta_by_day.setdefault(ev_dates[i], []).append(deltas_raw[i])
+                    deltas = [
+                        statistics.fmean(delta_by_day[d_ev])
+                        for d_ev in ordered_dates
+                        if d_ev in delta_by_day
+                    ]
+                else:
+                    deltas = deltas_raw
                 mean_delta = statistics.fmean(deltas) if deltas else 0.0
                 if s_key != h0_key:
                     t_nw = compute_newey_west_t_stat(deltas, horizon_bars=h_lags)
@@ -2441,19 +2488,45 @@ class OfflineRegimePanelCalibrator:
                 else:
                     t_nw = 0.0
                     p_val = 1.0
-                mean_r = statistics.fmean(pi_rs) if pi_rs else 0.0
-                std_r = statistics.stdev(pi_rs) if len(pi_rs) >= 2 else 0.0
+
+                filled_indices = [i for i, fl in enumerate(pi_fills) if fl]
+                filled_count = len(filled_indices)
+                active_sym_count = len({oos_events_all[i].symbol for i in filled_indices})
+                all_by_day: Dict[date, List[float]] = {}
+                for i in range(n_oos):
+                    ev_ret = float(pi_rs[i]) if pi_fills[i] else 0.0
+                    all_by_day.setdefault(ev_dates[i], []).append(ev_ret)
+                if use_daily_agg:
+                    eval_rs = [
+                        statistics.fmean(all_by_day[d_ev])
+                        for d_ev in ordered_dates
+                        if d_ev in all_by_day
+                    ]
+                    sharpe_h_lags = max(1, int(round(holding_horizon_sessions)))
+                else:
+                    eval_rs = [
+                        float(pi_rs[i]) if pi_fills[i] else 0.0
+                        for i in range(n_oos)
+                    ]
+                    sharpe_h_lags = h_lags
+
+                mean_r = statistics.fmean(eval_rs) if eval_rs else 0.0
+                std_r = statistics.stdev(eval_rs) if len(eval_rs) >= 2 else 0.0
                 sharpe_r = (
-                    (mean_r / std_r) * math.sqrt(252.0 / float(h_lags))
+                    (mean_r / std_r) * math.sqrt(252.0 / float(sharpe_h_lags))
                     if std_r > 1e-12
                     else 0.0
                 )
-                dsr_r = compute_per_period_deflated_sharpe_ratio(
-                    pi_rs,
-                    effective_trials=eff_family_trials,
+                dsr_r = (
+                    compute_per_period_deflated_sharpe_ratio(
+                        eval_rs,
+                        effective_trials=eff_family_trials,
+                    )
+                    if eval_rs
+                    else 0.0
                 )
                 missed_rate = (
-                    1.0 - (sum(1 for fl in pi_fills if fl) / float(n_oos))
+                    1.0 - (float(filled_count) / float(n_oos))
                     if n_oos > 0
                     else 1.0
                 )
@@ -2467,6 +2540,8 @@ class OfflineRegimePanelCalibrator:
                     "t_nw": t_nw,
                     "p_val": p_val,
                     "missed_rate": missed_rate,
+                    "filled_count": filled_count,
+                    "active_symbol_count": active_sym_count,
                 }
 
             by_fdr_results = (
@@ -2520,7 +2595,7 @@ class OfflineRegimePanelCalibrator:
                     st["by_q"] = 1.0
                     continue
                 if (
-                    n_oos >= self._min_pooled_sample_trades
+                    st["filled_count"] >= self._min_pooled_sample_trades
                     and st["mean_r"] > 0.0
                     and st["mean_delta_r"] > 0.0
                     and st["t_nw"] >= ONE_SIDED_ALPHA_005_CRITICAL_T
@@ -2565,7 +2640,7 @@ class OfflineRegimePanelCalibrator:
                 )
                 if (
                     h0_rep.passed
-                    and n_oos >= self._min_pooled_sample_trades
+                    and h0_st["filled_count"] >= self._min_pooled_sample_trades
                     and h0_st["mean_r"] > 0.0
                     and h0_rep_missed <= self._max_missed_fill_rate + 1e-9
                 ):
@@ -2584,10 +2659,11 @@ class OfflineRegimePanelCalibrator:
                     if rep is not None and rep.limit_collar_missed_fill_result is not None
                     else float(st["missed_rate"])
                 )
+                filled_trades = int(st["filled_count"])
                 fail_list: List[str] = []
-                if n_oos < self._min_pooled_sample_trades:
+                if filled_trades < self._min_pooled_sample_trades:
                     fail_list.append(
-                        f"Insufficient OOS events={n_oos} < {self._min_pooled_sample_trades}"
+                        f"Insufficient filled OOS trades={filled_trades} < {self._min_pooled_sample_trades}"
                     )
                 if st["mean_r"] <= 0.0:
                     fail_list.append(f"Non-positive OOS mean_r={st['mean_r']:.4f}")
@@ -2629,7 +2705,7 @@ class OfflineRegimePanelCalibrator:
                         ).quantize(Decimal("0.0001")),
                         limit_collar_atr_mult=collar_atr_val,
                         limit_collar_pct=collar_pct_val,
-                        pooled_sample_trades=int(n_oos),
+                        pooled_sample_trades=filled_trades,
                         pooled_expectancy_r=Decimal(f"{st['mean_r']:.4f}"),
                         pooled_sharpe=Decimal(f"{st['sharpe_r']:.4f}"),
                         pooled_dsr=Decimal(f"{st['dsr_r']:.6f}"),
@@ -2637,9 +2713,7 @@ class OfflineRegimePanelCalibrator:
                         stress_missed_fill_rate=Decimal(f"{eff_missed:.4f}"),
                         stress_report_json={
                             "symbol_count": len(bars_by_symbol),
-                            "active_symbol_count": sum(
-                                1 for fl in oos_filled_by_spec[s_key] if fl
-                            ),
+                            "active_symbol_count": int(st["active_symbol_count"]),
                             "bar_timeframe": bar_tf,
                             "execution_spec": es.to_dict(),
                             "h0_paired_delta_r": round(float(st["mean_delta_r"]), 6),
@@ -2666,7 +2740,7 @@ class OfflineRegimePanelCalibrator:
                         archetype_id=arch_id,
                         params={**dict(rep_params), "execution_spec": es.to_dict()},
                         passed=is_chosen,
-                        pooled_sample_trades=int(n_oos),
+                        pooled_sample_trades=filled_trades,
                         pooled_sharpe=float(st["sharpe_r"]),
                         pooled_dsr=float(st["dsr_r"]),
                         stress_missed_fill_rate=eff_missed,
@@ -2952,9 +3026,12 @@ class OfflineRegimePanelCalibrator:
                     continue
                 px_tick = float(rule_612_tick_size(Decimal(f"{c_px:.6f}")))
                 px_prec = 4 if px_tick < float(PENNY_TICK_RULE_612) else 2
-                o_px = float(opens[t_idx, j]) if np.isfinite(opens[t_idx, j]) else c_px
-                h_px = max(o_px, c_px, float(highs[t_idx, j]) if np.isfinite(highs[t_idx, j]) else c_px)
-                l_px = max(px_tick, min(o_px, c_px, float(lows[t_idx, j]) if np.isfinite(lows[t_idx, j]) else c_px))
+                o_raw = float(opens[t_idx, j])
+                o_px = o_raw if (np.isfinite(o_raw) and o_raw > 0.0) else c_px
+                h_raw = float(highs[t_idx, j])
+                h_px = max(o_px, c_px, h_raw if (np.isfinite(h_raw) and h_raw > 0.0) else c_px)
+                l_raw = float(lows[t_idx, j])
+                l_px = max(px_tick, min(o_px, c_px, l_raw if (np.isfinite(l_raw) and l_raw > 0.0) else c_px))
                 v_qty = max(1, int(round(float(volumes[t_idx, j])))) if np.isfinite(volumes[t_idx, j]) else 100
                 ts_ns = ts_ns_arr[t_idx]
                 sym_bar_list.append(
@@ -2970,7 +3047,7 @@ class OfflineRegimePanelCalibrator:
                     )
                 )
                 r_lo = float(raw_lows[t_idx, j]) if np.isfinite(raw_lows[t_idx, j]) else l_px
-                sym_raw_low_map[ts_ns] = min(l_px, max(px_tick, r_lo))
+                sym_raw_low_map[(str(bt), ts_ns)] = min(l_px, max(px_tick, r_lo))
             if sym_bar_list:
                 bars_out[norm_s] = sym_bar_list
                 raw_low_out[norm_s] = sym_raw_low_map
@@ -3020,13 +3097,16 @@ class OfflineRegimePanelCalibrator:
         bar_slice = min(t_len, len(timestamps), max(30, int(max_bars)))
         if bar_slice < 30:
             return None
-        hist_slice = min(t_len, 252 * bars_per_day)
+        prefix_end = max(30, int(round(bar_slice * 0.30)))
+        hist_end = max(prefix_end, t_len - bar_slice + prefix_end)
+        hist_slice = min(hist_end, 252 * bars_per_day)
+        hist_start = hist_end - hist_slice
 
-        raw_c_hist = closes_full[-hist_slice:]
+        raw_c_hist = closes_full[hist_start:hist_end]
         closes_hist = np.where(raw_c_hist > 0.0, raw_c_hist, np.nan)
-        raw_h_hist = np.asarray(panel_matrices.get("high", closes_full), dtype=np.float64)[-hist_slice:]
+        raw_h_hist = np.asarray(panel_matrices.get("high", closes_full), dtype=np.float64)[hist_start:hist_end]
         highs_hist = np.where(raw_h_hist > 0.0, raw_h_hist, np.nan)
-        raw_l_hist = np.asarray(panel_matrices.get("low", closes_full), dtype=np.float64)[-hist_slice:]
+        raw_l_hist = np.asarray(panel_matrices.get("low", closes_full), dtype=np.float64)[hist_start:hist_end]
         lows_hist = np.where(raw_l_hist > 0.0, raw_l_hist, np.nan)
         prev_closes_hist = np.vstack([closes_hist[:1], closes_hist[:-1]])
         tr_hist = np.maximum(
@@ -3038,14 +3118,18 @@ class OfflineRegimePanelCalibrator:
         rel_vol = atr_14_series[-1]
         finite_mask = np.isfinite(atr_14_series) & np.isfinite(rel_vol[None, :])
         valid_counts = np.sum(finite_mask, axis=0)
-        less_or_eq_counts = np.sum(
-            finite_mask & (atr_14_series <= rel_vol[None, :]),
+        less_counts = np.sum(
+            finite_mask & (atr_14_series < (rel_vol[None, :] - 1e-12)),
+            axis=0,
+        )
+        eq_counts = np.sum(
+            finite_mask & (np.abs(atr_14_series - rel_vol[None, :]) <= 1e-12),
             axis=0,
         )
         hist_vol_q = np.clip(
             np.where(
                 valid_counts > 1,
-                (less_or_eq_counts - 1.0) / np.maximum(valid_counts - 1.0, 1.0),
+                (less_counts + 0.5 * eq_counts) / np.maximum(valid_counts, 1.0),
                 LIQ_BUCKET_MEDIAN_QUANTILE,
             ),
             0.0,
@@ -3065,7 +3149,7 @@ class OfflineRegimePanelCalibrator:
         )
 
         norm_syms = [str(s).strip().upper() for s in symbols[:n_sym]]
-        valid_bar_counts = np.sum(np.isfinite(closes) & (closes > 0.0), axis=0)
+        valid_bar_counts = np.sum(np.isfinite(closes[:prefix_end]) & (closes[:prefix_end] > 0.0), axis=0)
         eligible_indices = np.array(
             [j for j, sym in enumerate(norm_syms) if sym and int(valid_bar_counts[j]) >= 30],
             dtype=np.int64,
@@ -3073,15 +3157,22 @@ class OfflineRegimePanelCalibrator:
         if eligible_indices.size == 0:
             return ({}, bar_slice, bar_spec_str, step_ns, closes, opens, highs, lows, volumes, raw_lows)
 
-        adv_win = min(bar_slice, 60 * bars_per_day)
-        spread_win = min(bar_slice, 14 * bars_per_day)
-        closes_pos = np.where(closes > 0.0, closes, np.nan)
+        closes_pre = closes[:prefix_end]
+        highs_pre = highs[:prefix_end]
+        lows_pre = lows[:prefix_end]
+        volumes_pre = volumes[:prefix_end]
+        adv_win = min(prefix_end, 60 * bars_per_day)
+        spread_win = min(prefix_end, 14 * bars_per_day)
+        closes_pos_pre = np.where(closes_pre > 0.0, closes_pre, np.nan)
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", category=RuntimeWarning)
-            median_closes = np.nanmedian(closes_pos, axis=0)
-            adv_60 = np.nanmean(closes_pos[-adv_win:] * np.maximum(volumes[-adv_win:], 0.0), axis=0)
+            median_closes = np.nanmedian(closes_pos_pre, axis=0)
+            adv_60 = np.nanmean(
+                closes_pos_pre[-adv_win:] * np.maximum(volumes_pre[-adv_win:], 0.0),
+                axis=0,
+            )
             rel_spread = np.nanmean(
-                (highs[-spread_win:] - lows[-spread_win:]) / closes_pos[-spread_win:],
+                (highs_pre[-spread_win:] - lows_pre[-spread_win:]) / closes_pos_pre[-spread_win:],
                 axis=0,
             )
             elig_adv = adv_60[eligible_indices]
@@ -3105,6 +3196,8 @@ class OfflineRegimePanelCalibrator:
             return out
 
         vol_ranks = _rank_eligible(rel_vol)
+        const_hist_vol_mask = (valid_counts > 1) & (eq_counts >= valid_counts)
+        hist_vol_q = np.where(const_hist_vol_mask, vol_ranks, hist_vol_q)
         adv_ranks = _rank_eligible(adv_60)
         spread_ranks = _rank_eligible(rel_spread)
 
@@ -3288,9 +3381,12 @@ class OfflineRegimePanelCalibrator:
                         continue
                     px_tick = float(rule_612_tick_size(Decimal(f"{c_px:.6f}")))
                     px_prec = 4 if px_tick < float(PENNY_TICK_RULE_612) else 2
-                    o_px = float(opens[t_idx, j]) if np.isfinite(opens[t_idx, j]) else c_px
-                    h_px = max(o_px, c_px, float(highs[t_idx, j]) if np.isfinite(highs[t_idx, j]) else c_px)
-                    l_px = max(px_tick, min(o_px, c_px, float(lows[t_idx, j]) if np.isfinite(lows[t_idx, j]) else c_px))
+                    o_raw = float(opens[t_idx, j])
+                    o_px = o_raw if (np.isfinite(o_raw) and o_raw > 0.0) else c_px
+                    h_raw = float(highs[t_idx, j])
+                    h_px = max(o_px, c_px, h_raw if (np.isfinite(h_raw) and h_raw > 0.0) else c_px)
+                    l_raw = float(lows[t_idx, j])
+                    l_px = max(px_tick, min(o_px, c_px, l_raw if (np.isfinite(l_raw) and l_raw > 0.0) else c_px))
                     v_qty = max(1, int(round(float(volumes[t_idx, j])))) if np.isfinite(volumes[t_idx, j]) else 100
                     ts_ns = ts_ns_arr[t_idx]
                     sym_bar_list.append(
@@ -3306,7 +3402,7 @@ class OfflineRegimePanelCalibrator:
                         )
                     )
                     r_lo = float(raw_lows[t_idx, j]) if np.isfinite(raw_lows[t_idx, j]) else l_px
-                    sym_raw_low_map[ts_ns] = min(l_px, max(px_tick, r_lo))
+                    sym_raw_low_map[(str(bt), ts_ns)] = min(l_px, max(px_tick, r_lo))
                 if len(sym_bar_list) >= 30:
                     cell_map[sym] = sym_bar_list
                     raw_low_by_sym[sym] = sym_raw_low_map
@@ -3315,7 +3411,7 @@ class OfflineRegimePanelCalibrator:
         selected_syms_list = sorted(selected_syms_set)
         bars_1m_by_sym: Optional[Dict[str, List[Bar]]] = None
         if panel_matrices_1m is not None and timestamps_1m is not None and selected_syms_list:
-            b1m, _ = self._build_symbol_bars_from_matrices(
+            b1m, raw_low_1m = self._build_symbol_bars_from_matrices(
                 panel_matrices=panel_matrices_1m,
                 symbols=symbols_1m or symbols,
                 timestamps=timestamps_1m,
@@ -3324,6 +3420,9 @@ class OfflineRegimePanelCalibrator:
             )
             if b1m:
                 bars_1m_by_sym = b1m
+            if raw_low_1m:
+                for sym_1m, r1m_map in raw_low_1m.items():
+                    raw_low_by_sym.setdefault(sym_1m, {}).update(r1m_map)
 
         bars_1d_by_sym: Optional[Dict[str, List[Bar]]] = None
         if panel_matrices_1d is not None and timestamps_1d is not None and selected_syms_list:

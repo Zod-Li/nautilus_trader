@@ -136,39 +136,21 @@ impl CalendarSessionStatus {
         ts_ns >= open_ns && ts_ns < close_ns
     }
 
-    /// Returns `true` when `bar_open_ns` has reached or passed `rth_close_ns()`
-    /// (or precedes `rth_open_ns()` on a different UTC day) and the cached session
-    /// status must be refreshed for `bar_open_ns`.
+    /// Returns `true` when `bar_open_ns` has crossed into a new `America/New_York` trading day
+    /// or has reached/passed `rth_close_ns()` without a post-close calendar status cached yet.
     #[must_use]
     pub fn should_refresh_for_bar_open(&self, bar_open_ns: UnixNanos) -> bool {
-        let bar_open_sec = (bar_open_ns.as_u64() / 1_000_000_000) as i64;
+        let bar_ny_date = jiff::Timestamp::from_nanosecond(i128::from(bar_open_ns.as_u64()))
+            .ok()
+            .and_then(|ts| ts.in_tz("America/New_York").ok())
+            .map(|ny| ny.date().to_string());
+        if bar_ny_date.as_deref() != Some(self.trading_date.trim()) {
+            return true;
+        }
         if let Some(close_ns) = self.rth_close_ns()
             && bar_open_ns >= close_ns
         {
-            if self.queried_at_utc >= self.rth_close_utc
-                && bar_open_sec.div_euclid(86_400) == self.queried_at_utc.div_euclid(86_400)
-            {
-                return false;
-            }
-            return true;
-        }
-        if let Some(open_ns) = self.rth_open_ns()
-            && bar_open_ns < open_ns
-        {
-            let ref_sec = if self.rth_open_utc > 0 {
-                self.rth_open_utc
-            } else {
-                self.queried_at_utc
-            };
-            if bar_open_sec.div_euclid(86_400) != ref_sec.div_euclid(86_400) {
-                return true;
-            }
-        }
-        if !self.is_trading_day
-            && self.queried_at_utc > 0
-            && bar_open_sec.div_euclid(86_400) != self.queried_at_utc.div_euclid(86_400)
-        {
-            return true;
+            return self.queried_at_utc < self.rth_close_utc;
         }
         false
     }

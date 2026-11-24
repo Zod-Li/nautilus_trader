@@ -320,7 +320,7 @@ fn open_position_in_cache(
 }
 
 #[test]
-fn test_absent_cache_order_skips_reservation_without_panic() {
+fn test_absent_cache_order_hydrates_submit_and_denies_absent_modify() {
     let inst = make_equity("AAPL");
     let mut cache = Cache::default();
     cache.add_instrument(inst.clone()).unwrap();
@@ -334,7 +334,7 @@ fn test_absent_cache_order_skips_reservation_without_panic() {
         false,
     );
 
-    // Order NOT added to Cache.
+    // Un-cached SubmitOrder must NOT bypass the gate: it hydrates from order_init and reserves.
     let absent_order = make_limit_order(
         inst.id(),
         "O-ABSENT-1",
@@ -344,11 +344,11 @@ fn test_absent_cache_order_skips_reservation_without_panic() {
         false,
     );
     let res = gate.check_command(&submit_cmd(&absent_order), &cache, UnixNanos::from(TS_NOW));
-    assert!(res.is_ok(), "absent cache order should not panic or reserve: {res:?}");
-    assert_eq!(gate.reserved_qty("AAPL"), dec!(0));
-    assert!(!gate.has_admitted_reservation("O-ABSENT-1"));
+    assert!(res.is_ok(), "hydrated absent SubmitOrder failed unexpectedly: {res:?}");
+    assert_eq!(gate.reserved_qty("AAPL"), dec!(25));
+    assert!(gate.has_admitted_reservation("O-ABSENT-1"));
 
-    // ModifyOrder for absent cache order also must not panic or reserve.
+    // ModifyOrder for absent cache order must fail closed without panicking.
     let absent_mod = ModifyOrder::new(
         TraderId::from("TRADER-001"),
         Some(ClientId::from("ALPACA")),
@@ -369,8 +369,9 @@ fn test_absent_cache_order_skips_reservation_without_panic() {
         &cache,
         UnixNanos::from(TS_NOW),
     );
-    assert!(mod_res.is_ok());
-    assert_eq!(gate.reserved_qty("AAPL"), dec!(0));
+    assert!(mod_res.is_err());
+    assert!(mod_res.unwrap_err().contains("ORDER_NOT_IN_CACHE"));
+    assert_eq!(gate.reserved_qty("AAPL"), dec!(25));
 }
 
 #[test]
@@ -387,6 +388,14 @@ fn test_exit_bypass_reduce_only_admitted_under_freeze_unavailable_and_expired() 
         "100",
         "150.00",
         "P-EXIT-AAPL",
+    );
+    open_position_in_cache(
+        &mut cache,
+        &inst_msft,
+        OrderSide::Buy,
+        "20",
+        "300.00",
+        "P-EXIT-MSFT",
     );
 
     let exit_aapl = make_market_order(

@@ -131,7 +131,17 @@ pub fn parse_instrument_id(symbol: &str, venue_str: &str) -> AlpacaResult<Instru
 /// Returns [`AlpacaError::Parse`] if the resulting identifier is empty or contains non-ASCII characters.
 pub fn parse_alpaca_trade_id(prefix: &str, raw_id: &str) -> AlpacaResult<TradeId> {
     let trimmed = raw_id.trim();
+    if trimmed.is_empty() || !trimmed.is_ascii() {
+        return Err(AlpacaError::Parse(format!(
+            "invalid Alpaca trade id '{raw_id}': must be non-empty ASCII"
+        )));
+    }
     let candidate = format!("{prefix}{trimmed}");
+    if !candidate.is_ascii() {
+        return Err(AlpacaError::Parse(format!(
+            "invalid TradeId '{candidate}': must be ASCII"
+        )));
+    }
     let bounded = if candidate.len() <= 36 {
         candidate
     } else {
@@ -164,6 +174,11 @@ pub fn derive_deterministic_fill_trade_id(
     is_delta: bool,
 ) -> AlpacaResult<TradeId> {
     let trimmed = order_id.trim();
+    if trimmed.is_empty() || !trimmed.is_ascii() {
+        return Err(AlpacaError::Parse(format!(
+            "invalid Alpaca order id '{order_id}': must be non-empty ASCII"
+        )));
+    }
     if !is_delta {
         return parse_alpaca_trade_id("FILL-", trimmed);
     }
@@ -569,7 +584,8 @@ pub fn parse_equity_instrument_with_ref_price(
         (prec, inc_px)
     } else {
         match asset.price_increment {
-            Some(inc) if inc > Decimal::ZERO => {
+            Some(raw_inc) if raw_inc > Decimal::ZERO => {
+                let inc = raw_inc.normalize();
                 let prec = u8::try_from(inc.scale())
                     .unwrap_or(DEFAULT_EQUITY_PRICE_PRECISION)
                     .clamp(1, 9);

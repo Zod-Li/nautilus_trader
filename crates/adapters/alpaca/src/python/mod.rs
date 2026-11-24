@@ -220,6 +220,9 @@ impl AlpacaExecutionClientFactory {
 fn alpaca_err_to_py(err: AlpacaError) -> PyErr {
     match err {
         AlpacaError::InvalidConfig(_) | AlpacaError::Parse(_) => to_pyvalue_err(err),
+        AlpacaError::DeterministicReject { status, .. } if matches!(status, 400 | 404 | 422) => {
+            to_pyvalue_err(err)
+        }
         _ => to_pyruntime_err(err),
     }
 }

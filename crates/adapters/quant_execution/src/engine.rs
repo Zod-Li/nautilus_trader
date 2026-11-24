@@ -333,6 +333,8 @@ impl RustPlanGateEngine {
 
         let mut guard = self.state.write();
         let mut batch_added_qty_by_symbol: AHashMap<String, Decimal> = AHashMap::new();
+        let mut batch_seen_entry_cids: ahash::AHashSet<&str> =
+            ahash::AHashSet::with_capacity(requests.len());
         let mut validated = Vec::with_capacity(requests.len());
 
         // Phase 1: Pure read-only validation across all legs.
@@ -345,6 +347,27 @@ impl RustPlanGateEngine {
                     plan_id: item_opt.map(|i| i.plan_id.clone()),
                 });
                 continue;
+            }
+
+            if !request.client_order_id.is_empty()
+                && !batch_seen_entry_cids.insert(request.client_order_id.as_str())
+            {
+                let item_opt = guard.items_by_symbol.get(&request.symbol);
+                let item_id_opt = item_opt.map(|i| i.item_id.clone());
+                let plan_id_opt = item_opt.map(|i| i.plan_id.clone());
+                let reason = format!(
+                    "DUPLICATE_CLIENT_ORDER_ID: duplicate entry client_order_id '{}' in batch",
+                    request.client_order_id
+                );
+                Self::enqueue_denied_mutation(
+                    &mut guard,
+                    request,
+                    &reason,
+                    "WARN",
+                    item_id_opt.as_deref(),
+                    plan_id_opt.as_deref(),
+                );
+                return Err(reason);
             }
 
             let extra_qty = batch_added_qty_by_symbol
@@ -409,8 +432,65 @@ impl RustPlanGateEngine {
         Ok(decisions)
     }
 
+    fn validate_entry_stop_loss_price(
+        side: &str,
+        stop_px: Decimal,
+        entry_ref_price: Decimal,
+        implied_plan_ref_price: Decimal,
+        initial_stop_price: Decimal,
+    ) -> Result<(), String> {
+        if stop_px <= Decimal::ZERO {
+            return Err(format!(
+                "INVALID_STOP_LOSS_PRICE: stop_loss_price ({stop_px}) must be > 0"
+            ));
+        }
+        if side.eq_ignore_ascii_case("LONG") {
+            if stop_px >= entry_ref_price {
+                return Err(format!(
+                    "INVALID_STOP_LOSS_PRICE: LONG stop_loss_price ({stop_px}) must be < entry_ref_price ({entry_ref_price})"
+                ));
+            }
+            let effective_stop_floor = if implied_plan_ref_price > initial_stop_price
+                && entry_ref_price > Decimal::ZERO
+                && entry_ref_price <= initial_stop_price
+            {
+                let max_plan_stop_dist = implied_plan_ref_price - initial_stop_price;
+                (entry_ref_price - max_plan_stop_dist).max(Decimal::new(1, 2))
+            } else {
+                initial_stop_price
+            };
+            if initial_stop_price > Decimal::ZERO && stop_px < effective_stop_floor {
+                return Err(format!(
+                    "STOP_LOSS_FLOOR_VIOLATION (STOP_LOSS_BELOW_PLAN_FLOOR): LONG stop_loss_price ({stop_px}) < initial_stop_price ({effective_stop_floor})"
+                ));
+            }
+        } else {
+            if stop_px <= entry_ref_price {
+                return Err(format!(
+                    "INVALID_STOP_LOSS_PRICE: SHORT stop_loss_price ({stop_px}) must be > entry_ref_price ({entry_ref_price})"
+                ));
+            }
+            let effective_stop_ceiling = if implied_plan_ref_price > Decimal::ZERO
+                && implied_plan_ref_price < initial_stop_price
+                && entry_ref_price >= initial_stop_price
+            {
+                let max_plan_stop_dist = initial_stop_price - implied_plan_ref_price;
+                entry_ref_price + max_plan_stop_dist
+            } else {
+                initial_stop_price
+            };
+            if initial_stop_price > Decimal::ZERO && stop_px > effective_stop_ceiling {
+                return Err(format!(
+                    "STOP_LOSS_FLOOR_VIOLATION (STOP_LOSS_ABOVE_PLAN_CEILING): SHORT stop_loss_price ({stop_px}) > initial_stop_price ({effective_stop_ceiling})"
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Validates an entry order modification (`!is_reduce_only`), denying any upward quantity
-    /// modification (`ENTRY_UPWARD_MODIFY_PROHIBITED`) and any limit price violating the collar.
+    /// modification (`ENTRY_UPWARD_MODIFY_PROHIBITED`), freeze/outage/expiration states, and
+    /// any limit/trigger/stop-loss/budget violation.
     ///
     /// # Errors
     ///
@@ -422,6 +502,9 @@ impl RustPlanGateEngine {
         new_qty: Option<Decimal>,
         current_qty: Decimal,
         new_limit_price: Option<Decimal>,
+        current_limit_price: Option<Decimal>,
+        new_trigger_price: Option<Decimal>,
+        stop_loss_price: Option<Decimal>,
         reference_price: Option<Decimal>,
         atr: Option<Decimal>,
         evaluation_ts_ns: i64,
@@ -437,10 +520,6 @@ impl RustPlanGateEngine {
                 ));
             }
         }
-
-        let Some(limit_px) = new_limit_price else {
-            return Ok(());
-        };
 
         let guard = self.state.read();
         if guard.backend_unavailable {
@@ -470,11 +549,31 @@ impl RustPlanGateEngine {
                 plan_item.item_id, plan_item.status
             ));
         }
-        if evaluation_ts_ns > plan_item.valid_until_ns {
+        if plan_item.valid_until_ns <= 0
+            || evaluation_ts_ns <= 0
+            || evaluation_ts_ns > plan_item.valid_until_ns
+        {
             return Err(format!(
-                "PLAN_ITEM_EXPIRED: evaluation_ts ({evaluation_ts_iso}) > valid_until ({})",
-                plan_item.valid_until_iso
+                "PLAN_ITEM_EXPIRED: invalid or expired evaluation_ts ({evaluation_ts_iso}, ns={evaluation_ts_ns}) / valid_until ({}, ns={})",
+                plan_item.valid_until_iso, plan_item.valid_until_ns
             ));
+        }
+
+        if let Some(trig_px) = new_trigger_price
+            && trig_px <= Decimal::ZERO
+        {
+            return Err(format!(
+                "INVALID_TRIGGER_PRICE: trigger_price ({trig_px}) must be > 0"
+            ));
+        }
+
+        let effective_limit_px = new_limit_price.or(current_limit_price);
+        if new_limit_price.is_none()
+            && new_trigger_price.is_none()
+            && stop_loss_price.is_none()
+            && new_qty.is_none()
+        {
+            return Ok(());
         }
 
         let implied_plan_ref_price = if plan_item.target_qty > Decimal::ZERO {
@@ -490,15 +589,85 @@ impl RustPlanGateEngine {
         }
 
         let worst_limit_px = plan_item.compute_worst_limit_price(ref_price, atr);
-        if plan_item.side.eq_ignore_ascii_case("LONG") && limit_px > worst_limit_px {
-            return Err(format!(
-                "COLLAR_LIMIT_VIOLATION: BUY limit_price ({limit_px}) exceeds worst_limit_price ({worst_limit_px}) from reference_price ({ref_price})"
-            ));
+        if let Some(limit_px) = new_limit_price {
+            if limit_px <= Decimal::ZERO {
+                return Err(format!(
+                    "INVALID_LIMIT_PRICE: limit_price ({limit_px}) must be > 0"
+                ));
+            }
+            if plan_item.side.eq_ignore_ascii_case("LONG") && limit_px > worst_limit_px {
+                return Err(format!(
+                    "COLLAR_LIMIT_VIOLATION: BUY limit_price ({limit_px}) exceeds worst_limit_price ({worst_limit_px}) from reference_price ({ref_price})"
+                ));
+            }
+            if plan_item.side.eq_ignore_ascii_case("SHORT") && limit_px < worst_limit_px {
+                return Err(format!(
+                    "COLLAR_LIMIT_VIOLATION: SELL limit_price ({limit_px}) below worst_limit_price ({worst_limit_px}) from reference_price ({ref_price})"
+                ));
+            }
         }
-        if plan_item.side.eq_ignore_ascii_case("SHORT") && limit_px < worst_limit_px {
-            return Err(format!(
-                "COLLAR_LIMIT_VIOLATION: SELL limit_price ({limit_px}) below worst_limit_price ({worst_limit_px}) from reference_price ({ref_price})"
-            ));
+        if let Some(trig_px) = new_trigger_price {
+            if plan_item.side.eq_ignore_ascii_case("LONG") && trig_px > worst_limit_px {
+                return Err(format!(
+                    "COLLAR_LIMIT_VIOLATION: BUY trigger_price ({trig_px}) exceeds worst_limit_price ({worst_limit_px}) from reference_price ({ref_price})"
+                ));
+            }
+            if plan_item.side.eq_ignore_ascii_case("SHORT") && trig_px < worst_limit_px {
+                return Err(format!(
+                    "COLLAR_LIMIT_VIOLATION: SELL trigger_price ({trig_px}) below worst_limit_price ({worst_limit_px}) from reference_price ({ref_price})"
+                ));
+            }
+        }
+
+        let entry_ref_price = effective_limit_px
+            .filter(|px| *px > Decimal::ZERO)
+            .unwrap_or(ref_price);
+        if let Some(stop_px) = stop_loss_price {
+            Self::validate_entry_stop_loss_price(
+                &plan_item.side,
+                stop_px,
+                entry_ref_price,
+                implied_plan_ref_price,
+                plan_item.initial_stop_price,
+            )?;
+        }
+
+        let eff_stop_px = stop_loss_price.or_else(|| {
+            if plan_item.initial_stop_price > Decimal::ZERO {
+                Some(plan_item.initial_stop_price)
+            } else {
+                None
+            }
+        });
+        let budget_check_px_opt = effective_limit_px
+            .filter(|px| *px > Decimal::ZERO)
+            .or_else(|| (ref_price > Decimal::ZERO).then_some(ref_price));
+        if let (Some(stop_px), Some(check_px)) = (eff_stop_px, budget_check_px_opt)
+            && plan_item.max_risk_budget_usd > Decimal::ZERO
+        {
+            let eff_order_qty = new_qty.unwrap_or(current_qty);
+            let sym_reserved = guard
+                .reserved_qty_by_symbol
+                .get(symbol)
+                .copied()
+                .unwrap_or(Decimal::ZERO);
+            let qty_reduction = (current_qty - eff_order_qty).max(Decimal::ZERO);
+            let projected_qty = sym_reserved.saturating_sub(qty_reduction).max(eff_order_qty);
+            let collar_allowance = (worst_limit_px - ref_price).abs() + Decimal::new(1, 2);
+            let budget_ref_price = if implied_plan_ref_price > Decimal::ZERO
+                && (implied_plan_ref_price - check_px).abs() <= collar_allowance
+            {
+                implied_plan_ref_price
+            } else {
+                check_px
+            };
+            let trade_risk_usd = (budget_ref_price - stop_px).abs() * projected_qty;
+            if trade_risk_usd > plan_item.max_risk_budget_usd {
+                return Err(format!(
+                    "RISK_BUDGET_EXCEEDED: single-trade risk (|{budget_ref_price} - {stop_px}| * {projected_qty} = {trade_risk_usd}) exceeds max_risk_budget_usd ({})",
+                    plan_item.max_risk_budget_usd
+                ));
+            }
         }
 
         Ok(())
@@ -548,10 +717,16 @@ impl RustPlanGateEngine {
             return Err((reason, "WARN", item_id_opt, plan_id_opt));
         }
 
-        if request.evaluation_ts_ns > plan_item.valid_until_ns {
+        if plan_item.valid_until_ns <= 0
+            || request.evaluation_ts_ns <= 0
+            || request.evaluation_ts_ns > plan_item.valid_until_ns
+        {
             let reason = format!(
-                "PLAN_ITEM_EXPIRED: evaluation_ts ({}) > valid_until ({})",
-                request.evaluation_ts_iso, plan_item.valid_until_iso
+                "PLAN_ITEM_EXPIRED: invalid or expired evaluation_ts ({}, ns={}) / valid_until ({}, ns={})",
+                request.evaluation_ts_iso,
+                request.evaluation_ts_ns,
+                plan_item.valid_until_iso,
+                plan_item.valid_until_ns
             );
             return Err((reason, "WARN", item_id_opt, plan_id_opt));
         }
@@ -581,6 +756,18 @@ impl RustPlanGateEngine {
             let reason = format!(
                 "INVALID_QUANTITY: order quantity must be > 0, got {}",
                 request.quantity
+            );
+            return Err((reason, "WARN", item_id_opt, plan_id_opt));
+        }
+
+        if !request.client_order_id.is_empty()
+            && guard
+                .admitted_entry_reservations
+                .contains_key(&request.client_order_id)
+        {
+            let reason = format!(
+                "DUPLICATE_CLIENT_ORDER_ID: entry reservation already exists for '{}'",
+                request.client_order_id
             );
             return Err((reason, "WARN", item_id_opt, plan_id_opt));
         }
@@ -621,6 +808,12 @@ impl RustPlanGateEngine {
         let worst_limit_px = plan_item.compute_worst_limit_price(ref_price, request.atr);
 
         let derived_limit_price = if let Some(limit_px) = request.limit_price {
+            if limit_px <= Decimal::ZERO {
+                let reason = format!(
+                    "INVALID_LIMIT_PRICE: limit_price ({limit_px}) must be > 0"
+                );
+                return Err((reason, "WARN", item_id_opt, plan_id_opt));
+            }
             if plan_item.side.eq_ignore_ascii_case("LONG") && limit_px > worst_limit_px {
                 let reason = format!(
                     "COLLAR_LIMIT_VIOLATION: BUY limit_price ({limit_px}) exceeds worst_limit_price ({worst_limit_px}) from reference_price ({ref_price})"
@@ -636,11 +829,12 @@ impl RustPlanGateEngine {
             None
         } else if request.collar_market_order {
             Some(worst_limit_px.to_string())
-        } else if request.order_type.to_ascii_uppercase().contains("MARKET") {
-            let reason = "UNCOLLARED_MARKET_ENTRY_DENIED: uncollared MARKET entry orders are prohibited; enable collar_market_orders or submit a collared LIMIT order".to_string();
-            return Err((reason, "WARN", item_id_opt, plan_id_opt));
         } else {
-            None
+            let reason = format!(
+                "UNCOLLARED_MARKET_ENTRY_DENIED: uncollared {} entry orders are prohibited; supply an explicit collared limit price or enable collar_market_orders",
+                request.order_type
+            );
+            return Err((reason, "WARN", item_id_opt, plan_id_opt));
         };
 
         let entry_ref_price = if ref_price > Decimal::ZERO {
@@ -653,61 +847,14 @@ impl RustPlanGateEngine {
         };
 
         if let Some(stop_px) = request.stop_loss_price {
-            if stop_px <= Decimal::ZERO {
-                let reason = format!(
-                    "INVALID_STOP_LOSS_PRICE: stop_loss_price ({stop_px}) must be > 0"
-                );
-                return Err((reason, "WARN", item_id_opt, plan_id_opt));
-            }
-            if plan_item.side.eq_ignore_ascii_case("LONG") {
-                if stop_px >= entry_ref_price {
-                    let reason = format!(
-                        "INVALID_STOP_LOSS_PRICE: LONG stop_loss_price ({stop_px}) must be < entry_ref_price ({entry_ref_price})"
-                    );
-                    return Err((reason, "WARN", item_id_opt, plan_id_opt));
-                }
-                let effective_stop_floor = if implied_plan_ref_price > plan_item.initial_stop_price
-                    && entry_ref_price > Decimal::ZERO
-                    && entry_ref_price <= plan_item.initial_stop_price
-                {
-                    let max_plan_stop_dist = implied_plan_ref_price - plan_item.initial_stop_price;
-                    (entry_ref_price - max_plan_stop_dist).max(Decimal::new(1, 2))
-                } else {
-                    plan_item.initial_stop_price
-                };
-                if plan_item.initial_stop_price > Decimal::ZERO
-                    && stop_px < effective_stop_floor
-                {
-                    let reason = format!(
-                        "STOP_LOSS_FLOOR_VIOLATION (STOP_LOSS_BELOW_PLAN_FLOOR): LONG stop_loss_price ({stop_px}) < initial_stop_price ({effective_stop_floor})"
-                    );
-                    return Err((reason, "WARN", item_id_opt, plan_id_opt));
-                }
-            } else {
-                if stop_px <= entry_ref_price {
-                    let reason = format!(
-                        "INVALID_STOP_LOSS_PRICE: SHORT stop_loss_price ({stop_px}) must be > entry_ref_price ({entry_ref_price})"
-                    );
-                    return Err((reason, "WARN", item_id_opt, plan_id_opt));
-                }
-                let effective_stop_ceiling = if implied_plan_ref_price > Decimal::ZERO
-                    && implied_plan_ref_price < plan_item.initial_stop_price
-                    && entry_ref_price >= plan_item.initial_stop_price
-                {
-                    let max_plan_stop_dist = plan_item.initial_stop_price - implied_plan_ref_price;
-                    entry_ref_price + max_plan_stop_dist
-                } else {
-                    plan_item.initial_stop_price
-                };
-                if plan_item.initial_stop_price > Decimal::ZERO
-                    && stop_px > effective_stop_ceiling
-                {
-                    let reason = format!(
-                        "STOP_LOSS_FLOOR_VIOLATION (STOP_LOSS_ABOVE_PLAN_CEILING): SHORT stop_loss_price ({stop_px}) > initial_stop_price ({effective_stop_ceiling})"
-                    );
-                    return Err((reason, "WARN", item_id_opt, plan_id_opt));
-                }
-            }
+            Self::validate_entry_stop_loss_price(
+                &plan_item.side,
+                stop_px,
+                entry_ref_price,
+                implied_plan_ref_price,
+                plan_item.initial_stop_price,
+            )
+            .map_err(|reason| (reason, "WARN", item_id_opt.clone(), plan_id_opt.clone()))?;
         }
 
         let effective_stop_px = request.stop_loss_price.or_else(|| {
@@ -1135,7 +1282,9 @@ mod tests {
         assert!(d1.allowed);
         assert_eq!(engine.reserved_qty("NVDA"), dec!(60));
 
-        let d2 = engine.evaluate_and_reserve(&sample_request(dec!(50)));
+        let mut req2 = sample_request(dec!(50));
+        req2.client_order_id = "O-2".to_string();
+        let d2 = engine.evaluate_and_reserve(&req2);
         assert!(!d2.allowed);
         assert!(d2.reason.unwrap().contains("QTY_CAP_EXCEEDED"));
         assert_eq!(engine.reserved_qty("NVDA"), dec!(60));
@@ -1143,7 +1292,9 @@ mod tests {
         let released = engine.release_reservation("NVDA", dec!(20));
         assert_eq!(released, dec!(40));
 
-        let d3 = engine.evaluate_and_reserve(&sample_request(dec!(50)));
+        let mut req3 = sample_request(dec!(50));
+        req3.client_order_id = "O-3".to_string();
+        let d3 = engine.evaluate_and_reserve(&req3);
         assert!(d3.allowed);
         assert_eq!(engine.reserved_qty("NVDA"), dec!(90));
         assert_eq!(engine.drain_pending_mutations(10).len(), 4);
@@ -1182,6 +1333,7 @@ mod tests {
 
         // 2. Entry at 80.00 with stop_loss_price = 74.50 (< 75.00 effective_stop_floor) must be denied
         let mut req_below_bad = sample_request(dec!(20));
+        req_below_bad.client_order_id = "O-2".to_string();
         req_below_bad.reference_price = Some(dec!(80.00));
         req_below_bad.limit_price = Some(dec!(80.20));
         req_below_bad.stop_loss_price = Some(dec!(74.50));
@@ -1194,6 +1346,7 @@ mod tests {
         // 3. Entry >= implied_plan_ref_price (100.20 >= 100.00):
         // effective_stop_floor remains strictly plan_item.initial_stop_price (95.00)
         let mut req_above_bad = sample_request(dec!(20));
+        req_above_bad.client_order_id = "O-3".to_string();
         req_above_bad.reference_price = Some(dec!(100.20));
         req_above_bad.limit_price = Some(dec!(100.40));
         req_above_bad.stop_loss_price = Some(dec!(94.80));
@@ -1229,6 +1382,7 @@ mod tests {
 
         // 2. Entry at 120.00 with stop_loss_price = 125.50 (> 125.00 effective_stop_ceiling) must be denied
         let mut req_above_bad = sample_request(dec!(20));
+        req_above_bad.client_order_id = "O-2".to_string();
         req_above_bad.order_side = "SELL".to_string();
         req_above_bad.reference_price = Some(dec!(120.00));
         req_above_bad.limit_price = Some(dec!(119.80));
@@ -1242,6 +1396,7 @@ mod tests {
         // 3. Entry <= implied_plan_ref_price (99.80 <= 100.00):
         // effective_stop_ceiling remains strictly plan_item.initial_stop_price (105.00)
         let mut req_below_bad = sample_request(dec!(20));
+        req_below_bad.client_order_id = "O-3".to_string();
         req_below_bad.order_side = "SELL".to_string();
         req_below_bad.reference_price = Some(dec!(99.80));
         req_below_bad.limit_price = Some(dec!(99.60));
@@ -1314,7 +1469,9 @@ mod tests {
         }
 
         // Subsequent full-cap 100 share entry is admitted cleanly
-        let d2 = engine.evaluate_and_reserve(&sample_request(dec!(100)));
+        let mut req2 = sample_request(dec!(100));
+        req2.client_order_id = "O-2".to_string();
+        let d2 = engine.evaluate_and_reserve(&req2);
         assert!(d2.allowed);
         assert_eq!(engine.reserved_qty("NVDA"), dec!(100));
     }

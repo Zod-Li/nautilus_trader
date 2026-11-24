@@ -509,7 +509,7 @@ async fn test_http_client_endpoints_and_auth_headers_on_wire() {
         let (mut socket, _) = listener.accept().await.unwrap();
         let req5 = read_http_request(&mut socket).await;
         assert!(req5.starts_with(
-            "GET /v2/orders:by_client_order_id?client_order_id=CID-BRACKET-2 HTTP/1.1"
+            "GET /v2/orders:by_client_order_id?client_order_id=CID-BRACKET-2&nested=true HTTP/1.1"
         ));
         write_http_response(
             &mut socket,
@@ -810,7 +810,7 @@ async fn test_http_submit_order_idempotent_recovery_via_get_order_by_client_id()
         let (mut s2, _) = listener.accept().await.unwrap();
         let req2 = read_http_request(&mut s2).await;
         assert!(req2.starts_with(
-            "GET /v2/orders:by_client_order_id?client_order_id=CID-IDEMP-500 HTTP/1.1"
+            "GET /v2/orders:by_client_order_id?client_order_id=CID-IDEMP-500&nested=true HTTP/1.1"
         ));
         probe_srv.fetch_add(1, Ordering::SeqCst);
         write_http_response(
@@ -836,7 +836,7 @@ async fn test_http_submit_order_idempotent_recovery_via_get_order_by_client_id()
         let (mut s4, _) = listener.accept().await.unwrap();
         let req4 = read_http_request(&mut s4).await;
         assert!(req4.starts_with(
-            "GET /v2/orders:by_client_order_id?client_order_id=CID-IDEMP-422 HTTP/1.1"
+            "GET /v2/orders:by_client_order_id?client_order_id=CID-IDEMP-422&nested=true HTTP/1.1"
         ));
         probe_srv.fetch_add(1, Ordering::SeqCst);
         write_http_response(
@@ -921,7 +921,7 @@ async fn test_http_list_orders_paginated_and_list_open_orders_cursor_pagination(
         let (mut s1, _) = listener.accept().await.unwrap();
         let req1 = read_http_request(&mut s1).await;
         assert!(
-            req1.starts_with("GET /v2/orders?status=all&limit=3 HTTP/1.1"),
+            req1.starts_with("GET /v2/orders?status=all&limit=3&nested=true HTTP/1.1"),
             "unexpected page 1 request: {req1}"
         );
         write_http_response(
@@ -975,7 +975,7 @@ async fn test_http_list_orders_paginated_and_list_open_orders_cursor_pagination(
         let (mut s4, _) = listener.accept().await.unwrap();
         let req4 = read_http_request(&mut s4).await;
         assert!(
-            req4.starts_with("GET /v2/orders?status=open&limit=500 HTTP/1.1"),
+            req4.starts_with("GET /v2/orders?status=open&limit=500&nested=true HTTP/1.1"),
             "unexpected initial list_open_orders request: {req4}"
         );
         let mut first_500 = Vec::with_capacity(500);

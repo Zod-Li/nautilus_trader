@@ -6,7 +6,7 @@ from dataclasses import replace
 from datetime import date
 from decimal import Decimal
 import json
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 from uuid import UUID, uuid4
 
 import psycopg2
@@ -378,6 +378,50 @@ class PlanContractRepository:
         finally:
             conn.close()
 
+    def load_locked_plan_metadata(
+        self,
+        trading_date: date | str,
+        market: str = "US_EQUITY",
+    ) -> Optional[Tuple[str, Optional[str]]]:
+        """Return `(plan_id, locked_at_str)` for the active `LOCKED` plan on `(trading_date, market)`."""
+        td = (
+            date.fromisoformat(str(trading_date)[:10])
+            if isinstance(trading_date, str)
+            else trading_date
+        )
+        mkt = str(market or "US_EQUITY").strip()
+        conn = psycopg2.connect(self._dsn, cursor_factory=RealDictCursor)
+        try:
+            with conn.cursor() as cur:
+                if not self._table_exists(cur, "trading_plans"):
+                    return None
+                cur.execute(
+                    """
+                    SELECT plan_id, locked_at
+                    FROM trading_plans
+                    WHERE trading_date = %s::date
+                      AND (market = %s OR (%s IN ('US', 'US_EQUITY') AND market IN ('US', 'US_EQUITY')))
+                      AND status = 'LOCKED'
+                    ORDER BY locked_at DESC NULLS LAST, created_at DESC NULLS LAST
+                    LIMIT 1
+                    """,
+                    (td, mkt, mkt),
+                )
+                row = cur.fetchone()
+                if not row:
+                    return None
+                if isinstance(row, Mapping):
+                    pid = row.get("plan_id")
+                    locked_at = row.get("locked_at")
+                else:
+                    pid = row[0]
+                    locked_at = row[1] if len(row) > 1 else None
+                if pid is None:
+                    return None
+                return (str(pid), str(locked_at) if locked_at is not None else None)
+        finally:
+            conn.close()
+
     def load_latest_plan_lock_event_payload(
         self,
         trading_date: date | str,
@@ -482,6 +526,8 @@ class PlanContractRepository:
         trading_date: date | str,
         market: str = "US_EQUITY",
         excluded_symbols: Optional[Iterable[str]] = None,
+        broker: Optional[str] = None,
+        environment: Optional[str] = None,
     ) -> List[PlanItemContract]:
         """Hydrate exit-only `PlanItemContract` instances for open overnight positions in `trading_positions`
         whose symbols are not already present in today's locked `trading_plan_items`.
@@ -503,13 +549,22 @@ class PlanContractRepository:
             with conn.cursor() as cur:
                 if not self._table_exists(cur, "trading_positions"):
                     return []
+                pos_filters = ["ABS(qty) > 1e-9"]
+                pos_params: List[Any] = []
+                if broker is not None and str(broker).strip():
+                    pos_filters.append("LOWER(broker) = LOWER(%s)")
+                    pos_params.append(str(broker).strip())
+                if environment is not None and str(environment).strip():
+                    pos_filters.append("UPPER(environment) = UPPER(%s)")
+                    pos_params.append(str(environment).strip())
                 cur.execute(
-                    """
+                    f"""
                     SELECT *
                     FROM trading_positions
-                    WHERE ABS(qty) > 1e-9
+                    WHERE {' AND '.join(pos_filters)}
                     ORDER BY symbol ASC
-                    """
+                    """,
+                    tuple(pos_params),
                 )
                 pos_rows = cur.fetchall() or []
                 open_positions = [
@@ -647,9 +702,20 @@ class PlanContractRepository:
                 carry_over_contracts: List[PlanItemContract] = []
                 for pos_row in open_positions:
                     sym = str(pos_row["symbol"]).strip().upper()
-                    pos_qty = _to_decimal(pos_row["qty"], "qty")
-                    abs_qty = abs(pos_qty)
-                    pos_side = PlanSide.LONG if pos_qty > Decimal("0") else PlanSide.SHORT
+                    raw_pos_qty = _to_decimal(pos_row["qty"], "qty")
+                    abs_qty = abs(raw_pos_qty)
+                    raw_pos_side = str(pos_row.get("side") or "").strip().lower()
+                    if raw_pos_side in ("short", "sell"):
+                        pos_side = PlanSide.SHORT
+                        pos_qty = -abs_qty
+                    elif raw_pos_side in ("long", "buy"):
+                        pos_side = PlanSide.LONG
+                        pos_qty = abs_qty
+                    else:
+                        pos_side = (
+                            PlanSide.LONG if raw_pos_qty > Decimal("0") else PlanSide.SHORT
+                        )
+                        pos_qty = raw_pos_qty
 
                     sym_dec = decisions_by_symbol.get(sym, "")
                     if sym in vetoed_symbols or sym_dec in (
@@ -674,7 +740,7 @@ class PlanContractRepository:
                             JOIN trading_plans p ON p.plan_id = i.plan_id
                             WHERE p.trading_date < %s::date
                               AND (p.market = %s OR (%s IN ('US', 'US_EQUITY') AND p.market IN ('US', 'US_EQUITY')))
-                              AND p.status = 'LOCKED'
+                              AND p.status IN ('LOCKED', 'CLOSED')
                               AND i.symbol = %s
                             ORDER BY p.trading_date DESC, i.updated_at DESC NULLS LAST
                             LIMIT 1
@@ -697,17 +763,32 @@ class PlanContractRepository:
 
                     prot_row = None
                     if has_protective_orders_table:
-                        cur.execute(
-                            """
-                            SELECT stop_price, status
-                            FROM protective_orders
-                            WHERE symbol = %s
-                              AND status IN ('ACTIVE', 'WORKING', 'PENDING_NEW', 'REPLACING')
-                            ORDER BY updated_at DESC NULLS LAST
-                            LIMIT 1
-                            """,
-                            (sym,),
-                        )
+                        prot_broker = str(broker or pos_row.get("broker") or "").strip()
+                        if prot_broker:
+                            cur.execute(
+                                """
+                                SELECT stop_price, status
+                                FROM protective_orders
+                                WHERE symbol = %s
+                                  AND LOWER(broker) = LOWER(%s)
+                                  AND status IN ('ACTIVE', 'WORKING', 'PENDING_NEW', 'REPLACING')
+                                ORDER BY updated_at DESC NULLS LAST
+                                LIMIT 1
+                                """,
+                                (sym, prot_broker),
+                            )
+                        else:
+                            cur.execute(
+                                """
+                                SELECT stop_price, status
+                                FROM protective_orders
+                                WHERE symbol = %s
+                                  AND status IN ('ACTIVE', 'WORKING', 'PENDING_NEW', 'REPLACING')
+                                ORDER BY updated_at DESC NULLS LAST
+                                LIMIT 1
+                                """,
+                                (sym,),
+                            )
                         prot_row = cur.fetchone()
 
                     stop_candidates: List[Decimal] = []
@@ -723,6 +804,9 @@ class PlanContractRepository:
                                 stop_candidates.append(dec_s)
 
                     row_dict = dict(hist_row)
+                    hist_plan_id_str = str(row_dict.get("plan_id") or "")
+                    if today_plan_id is not None:
+                        row_dict["plan_id"] = today_plan_id
                     row_side = PlanSide(str(row_dict.get("side") or pos_side.value).lower())
                     if stop_candidates:
                         row_dict["current_stop_price"] = (
@@ -743,7 +827,8 @@ class PlanContractRepository:
                     trace_dict = dict(raw_trace) if isinstance(raw_trace, Mapping) else {}
                     trace_dict["carry_over_status"] = carry_over_status
                     trace_dict["carry_over_position_qty"] = str(pos_qty)
-                    trace_dict["carry_over_from_plan_id"] = str(row_dict.get("plan_id") or "")
+                    trace_dict["carry_over_position_side"] = pos_side.value
+                    trace_dict["carry_over_from_plan_id"] = hist_plan_id_str
                     trace_dict["max_new_orders"] = 0
                     row_dict["sizing_trace"] = trace_dict
                     contract = PlanItemContract.from_db_row(row_dict)
@@ -862,7 +947,9 @@ class PlanContractRepository:
 
         current_contract = PlanItemContract.from_db_row(row)
         cur_status = str(current_contract.status or "").strip().upper()
-        if cur_status in ("EXPIRED", "CANCELLED", "CLOSED"):
+        if cur_status in ("EXPIRED", "CANCELLED", "CLOSED") or (
+            cur_status == "FILLED" and norm_status == "EXPIRED"
+        ):
             return current_contract
         if cur_status == norm_status:
             return current_contract

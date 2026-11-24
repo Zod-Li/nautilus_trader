@@ -39,7 +39,9 @@ class MeanReversionStrategy(BaseArchetypeStrategy):
     2. Residual deviation `res = close - vwap_anchor`.
     3. Non-parametric Robust MAD Z-score `mad_z = rolling_mad_zscore(residuals[-lookback_window:], res)`
        and empirical rank quantile `q_mad = empirical_rank_quantile(mad_z_history[-lookback_window:], mad_z)`.
-    4. Initial stop and `1m` Chandelier ratchet anchored strictly to `daily_atr_14`.
+    4. Initial stop and `1m` Chandelier ratchet anchored strictly to `daily_atr_14`
+       (per Spec 0007 M3, 15m oscillator target exits are abolished; `exit_quantile_threshold`
+       is retained only as a shared `ArchetypeStrategyConfig` field).
     """
 
     def __init__(self, config: MeanReversionConfig) -> None:
@@ -56,6 +58,7 @@ class MeanReversionStrategy(BaseArchetypeStrategy):
         super().reset_rolling_windows()
         self._residuals.clear()
         self._mad_zscores.clear()
+        self._anchor_target = None
 
     def _compute_rolling_vwap_anchor(self, window: int) -> float:
         typical_prices = [
@@ -78,7 +81,8 @@ class MeanReversionStrategy(BaseArchetypeStrategy):
         self._residuals.append(residual)
 
         res_window = self._residuals[-min(len(self._residuals), cfg.lookback_window) :]
-        mad_z = rolling_mad_zscore(res_window, residual)
+        causal_res_window = res_window[:-1] if len(res_window) >= 2 else res_window
+        mad_z = rolling_mad_zscore(causal_res_window, residual)
         self._mad_zscores.append(mad_z)
 
         max_keep = max(cfg.lookback_window * 3, 120)
@@ -89,8 +93,10 @@ class MeanReversionStrategy(BaseArchetypeStrategy):
         if self._in_warmup:
             return
 
-        bar_ts = int(getattr(bar, "ts_event", 0) or getattr(bar, "ts_init", 0) or 0)
-        tod_vol_q = self._update_rth_tod_volume(bar_ts, self._volumes[-1])
+        tod_vol_q = self._last_tod_volume_quantile
+        z_window = self._mad_zscores[-min(len(self._mad_zscores), cfg.lookback_window) :]
+        causal_z_window = z_window[:-1] if len(z_window) >= 2 else z_window
+        z_quantile = empirical_rank_quantile(causal_z_window, mad_z)
 
         if self._open_position_signed_qty() != Decimal("0"):
             return
@@ -105,9 +111,6 @@ class MeanReversionStrategy(BaseArchetypeStrategy):
             or self._has_inflight_or_open_entry_order()
         ):
             return
-
-        z_window = self._mad_zscores[-min(len(self._mad_zscores), cfg.lookback_window) :]
-        z_quantile = empirical_rank_quantile(z_window, mad_z)
 
         entry_q = quantile_to_float(cfg.entry_quantile_threshold)
         atr_mult = quantile_to_float(cfg.atr_stop_multiplier)

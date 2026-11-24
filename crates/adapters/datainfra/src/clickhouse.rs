@@ -312,26 +312,35 @@ pub trait ClickHouseArrowTransport: Send + Sync + std::fmt::Debug {
     ///
     /// Returns [`DataInfraError`] if validation, HTTP transport, Arrow decoding, or bar sanity fails.
     async fn fetch_bars(&self, req: &BarsQueryRequest) -> DataInfraResult<Vec<Bar>> {
-        let batches = self.fetch_bars_batches(req).await?;
+        let mut eff_req = req.clone();
+        if let (Some(limit), Some(_)) = (req.limit_per_symbol, req.end_ts_ns) {
+            eff_req.limit_per_symbol = Some(limit.saturating_add(2));
+        }
+        let batches = self.fetch_bars_batches(&eff_req).await?;
         let mut bars = decode_bars_batches(&batches, &req.decode_options())?;
         if let Some(end_ns) = req.end_ts_ns {
             let end_u64 = end_ns.as_u64();
-            let allow_exact_open_point = req.start_ts_ns == Some(end_ns)
-                || (bars.len() == 1
-                    && bars[0]
-                        .ts_event
-                        .as_u64()
-                        .saturating_sub(crate::mapping::timeframe_step_ns(&bars[0].bar_type))
-                        == end_u64);
-            bars.retain(|b| {
-                let close_ns = b.ts_event.as_u64();
-                let open_ns =
-                    close_ns.saturating_sub(crate::mapping::timeframe_step_ns(&b.bar_type));
-                close_ns <= end_u64 || (allow_exact_open_point && open_ns == end_u64)
-            });
+            bars.retain(|b| b.ts_event.as_u64() <= end_u64);
         }
-        if req.limit_per_symbol.is_some() {
-            bars.sort_by_key(|b| b.ts_init);
+        if let Some(limit) = req.limit_per_symbol {
+            let lim_usize = limit as usize;
+            bars.sort_by_key(|b| (b.ts_init, b.ts_event));
+            if req.end_ts_ns.is_some() {
+                let mut counts_by_inst: std::collections::HashMap<_, usize> =
+                    std::collections::HashMap::new();
+                let mut keep_rev = Vec::with_capacity(bars.len());
+                for bar in bars.into_iter().rev() {
+                    let count = counts_by_inst
+                        .entry(bar.bar_type.instrument_id())
+                        .or_insert(0);
+                    if *count < lim_usize {
+                        *count += 1;
+                        keep_rev.push(bar);
+                    }
+                }
+                keep_rev.reverse();
+                bars = keep_rev;
+            }
         }
         Ok(bars)
     }

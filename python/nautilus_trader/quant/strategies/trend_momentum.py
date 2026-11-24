@@ -90,8 +90,7 @@ class TrendMomentumStrategy(BaseArchetypeStrategy):
         if self._in_warmup:
             return
 
-        bar_ts = int(getattr(bar, "ts_event", 0) or getattr(bar, "ts_init", 0) or 0)
-        tod_vol_q = self._update_rth_tod_volume(bar_ts, self._volumes[-1])
+        tod_vol_q = self._last_tod_volume_quantile
 
         history_len = min(len(self._momentum_scores), cfg.lookback_window)
         if history_len < cfg.slow_window:
@@ -110,8 +109,10 @@ class TrendMomentumStrategy(BaseArchetypeStrategy):
 
         mom_window = self._momentum_scores[-history_len:]
         slope_window = self._slope_diffs[-history_len:]
-        mom_quantile = empirical_rank_quantile(mom_window, mom_score)
-        slope_quantile = empirical_rank_quantile(slope_window, slope_diff)
+        causal_mom_window = mom_window[:-1] if len(mom_window) >= 2 else mom_window
+        causal_slope_window = slope_window[:-1] if len(slope_window) >= 2 else slope_window
+        mom_quantile = empirical_rank_quantile(causal_mom_window, mom_score)
+        slope_quantile = empirical_rank_quantile(causal_slope_window, slope_diff)
 
         entry_q = quantile_to_float(cfg.entry_quantile_threshold)
         exit_q = quantile_to_float(cfg.exit_quantile_threshold)
@@ -121,7 +122,13 @@ class TrendMomentumStrategy(BaseArchetypeStrategy):
         low_px = self._lows[-1]
 
         if cfg.plan_side == PlanSide.LONG:
-            if mom_quantile >= entry_q and slope_quantile >= exit_q and slope_diff > 0.0:
+            if (
+                mom_quantile >= entry_q
+                and slope_quantile >= exit_q
+                and slope_diff > 0.0
+                and fast_slope >= 0.0
+                and mom_score > 0.0
+            ):
                 stop_px = self._resolve_entry_stop_price(
                     close_px, close_px - (atr_mult * daily_atr)
                 )
@@ -143,7 +150,13 @@ class TrendMomentumStrategy(BaseArchetypeStrategy):
         elif cfg.plan_side == PlanSide.SHORT:
             short_mom_q = 1.0 - mom_quantile
             short_slope_q = 1.0 - slope_quantile
-            if short_mom_q >= entry_q and short_slope_q >= exit_q and slope_diff < 0.0:
+            if (
+                short_mom_q >= entry_q
+                and short_slope_q >= exit_q
+                and slope_diff < 0.0
+                and fast_slope <= 0.0
+                and mom_score < 0.0
+            ):
                 stop_px = self._resolve_entry_stop_price(
                     close_px, close_px + (atr_mult * daily_atr)
                 )

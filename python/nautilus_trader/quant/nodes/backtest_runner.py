@@ -15,15 +15,22 @@ Implements SPEC-0007 isomorphic backtest verification:
 
 from __future__ import annotations
 
+import json
+import logging
 import math
 import os
 import statistics
+from urllib.error import URLError
+from urllib.parse import quote
+from urllib.request import urlopen
 import uuid
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
-from urllib.parse import quote
+from zoneinfo import ZoneInfo
+
+logger = logging.getLogger(__name__)
 
 from evolution_engine.config_center.envelope import load_envelope
 from evolution_engine.config_center.schema import SystemConfig
@@ -35,6 +42,7 @@ from nautilus_trader.quant.contracts.models import (
     PlanSide,
     rule_612_tick_size,
 )
+from nautilus_trader.quant.strategies.base import format_datainfra_bar_type
 from nautilus_trader.quant.strategies.empirical import rolling_atr
 from nautilus_trader.quant.execution_algorithms.collared_twap import (
     COLLARED_TWAP_EXEC_ALGORITHM_ID,
@@ -295,6 +303,64 @@ def _create_default_equity(
     )
 
 
+_NY_TZ = ZoneInfo("America/New_York")
+_TIMEFRAME_STEP_NS: Dict[str, int] = {
+    "1m": 60_000_000_000,
+    "5m": 300_000_000_000,
+    "15m": 900_000_000_000,
+    "1h": 3_600_000_000_000,
+    "4h": 14_400_000_000_000,
+    "1d": 86_400_000_000_000,
+    "1w": 7 * 86_400_000_000_000,
+}
+
+
+def is_nyse_early_close_date(trading_date: date) -> bool:
+    """Returns `True` for scheduled NYSE 13:00 ET half-day closes (Black Friday, Jul 3, Dec 24)."""
+    is_weekday = trading_date.weekday() < 5
+    is_black_friday = (
+        trading_date.month == 11
+        and trading_date.weekday() == 4
+        and 23 <= trading_date.day <= 29
+    )
+    is_july_3 = trading_date.month == 7 and trading_date.day == 3 and is_weekday
+    is_dec_24 = trading_date.month == 12 and trading_date.day == 24 and is_weekday
+    return is_black_friday or is_july_3 or is_dec_24
+
+
+def compute_rth_bar_close_ns(raw_open_ns: int, step_ns: int) -> int:
+    """Converts bar open timestamp to canonical NYSE RTH bar-close `ts_init` nanoseconds."""
+    eff_step = max(1, int(step_ns))
+    if eff_step >= 86_400_000_000_000:
+        if raw_open_ns % 86_400_000_000_000 == 0:
+            ny_d = datetime.fromtimestamp(raw_open_ns / 1e9, tz=timezone.utc).date()
+        else:
+            ny_d = datetime.fromtimestamp(raw_open_ns / 1e9, tz=timezone.utc).astimezone(_NY_TZ).date()
+        close_hour = 13 if is_nyse_early_close_date(ny_d) else 16
+        close_dt = datetime(ny_d.year, ny_d.month, ny_d.day, close_hour, 0, tzinfo=_NY_TZ)
+        return int(close_dt.astimezone(timezone.utc).timestamp() * 1_000_000_000)
+
+    ny_dt = datetime.fromtimestamp(raw_open_ns / 1e9, tz=timezone.utc).astimezone(_NY_TZ)
+    ny_d = ny_dt.date()
+    close_hour = 13 if is_nyse_early_close_date(ny_d) else 16
+    rth_open_ns = int(
+        datetime(ny_d.year, ny_d.month, ny_d.day, 9, 30, tzinfo=_NY_TZ)
+        .astimezone(timezone.utc)
+        .timestamp()
+        * 1_000_000_000
+    )
+    rth_close_ns = int(
+        datetime(ny_d.year, ny_d.month, ny_d.day, close_hour, 0, tzinfo=_NY_TZ)
+        .astimezone(timezone.utc)
+        .timestamp()
+        * 1_000_000_000
+    )
+    natural_close = raw_open_ns + eff_step
+    if rth_open_ns <= raw_open_ns < rth_close_ns:
+        return min(natural_close, rth_close_ns)
+    return natural_close
+
+
 def _clone_bar_with_prices(
     bar: Bar,
     *,
@@ -328,54 +394,66 @@ def _extract_dual_track_extremes(
     bars: Sequence[Bar],
     *,
     raw_bars: Optional[Sequence[Bar]] = None,
-    raw_low_by_ts_ns: Optional[Mapping[int, float]] = None,
-    raw_high_by_ts_ns: Optional[Mapping[int, float]] = None,
-) -> Tuple[Dict[int, Tuple[float, float]], Dict[int, Tuple[float, float]], bool]:
-    """Extracts `(cleaned_by_ts_ns, raw_by_ts_ns, has_divergence)` before bar cloning."""
-    cleaned_by_ts_ns: Dict[int, Tuple[float, float]] = {}
-    raw_by_ts_ns: Dict[int, Tuple[float, float]] = {}
-    raw_bar_map: Dict[int, Tuple[float, float]] = {}
+    raw_low_by_ts_ns: Optional[Mapping[Any, float]] = None,
+    raw_high_by_ts_ns: Optional[Mapping[Any, float]] = None,
+) -> Tuple[Dict[Any, Tuple[float, float]], Dict[Any, Tuple[float, float]], bool]:
+    """Extracts `(cleaned_by_key, raw_by_key, has_divergence)` keyed by `(str(bar_type), ts_ns)`."""
+    cleaned_by_key: Dict[Any, Tuple[float, float]] = {}
+    raw_by_key: Dict[Any, Tuple[float, float]] = {}
+    raw_bar_by_key: Dict[Tuple[str, int], Tuple[float, float]] = {}
+    raw_bar_by_ts: Dict[int, Tuple[float, float]] = {}
     if raw_bars:
         for rb in raw_bars:
-            rb_ts = max(
-                int(getattr(rb, "ts_init", 0) or 0),
-                int(getattr(rb, "ts_event", 0) or 0),
-            )
-            raw_bar_map[rb_ts] = (float(rb.high), float(rb.low))
+            rb_ts_ev = int(getattr(rb, "ts_event", 0) or 0)
+            rb_ts = rb_ts_ev if rb_ts_ev > 0 else int(getattr(rb, "ts_init", 0) or 0)
+            rb_pair = (float(rb.high), float(rb.low))
+            raw_bar_by_key[(str(rb.bar_type), rb_ts)] = rb_pair
+            raw_bar_by_ts[rb_ts] = rb_pair
+
+    def _lookup_extreme(mapping: Optional[Mapping[Any, float]], key: Tuple[str, int], ts_ns: int) -> Optional[float]:
+        if not mapping:
+            return None
+        if key in mapping:
+            return float(mapping[key])
+        if ts_ns in mapping:
+            return float(mapping[ts_ns])
+        return None
 
     has_divergence = False
     for b in bars:
-        b_ts = max(
-            int(getattr(b, "ts_init", 0) or 0),
-            int(getattr(b, "ts_event", 0) or 0),
-        )
+        b_ts_ev = int(getattr(b, "ts_event", 0) or 0)
+        b_ts = b_ts_ev if b_ts_ev > 0 else int(getattr(b, "ts_init", 0) or 0)
+        b_key = (str(b.bar_type), b_ts)
         attr_ch = getattr(b, "cleaned_high", None)
         attr_cl = getattr(b, "cleaned_low", None)
         c_high = float(attr_ch) if attr_ch is not None else float(b.high)
         c_low = float(attr_cl) if attr_cl is not None else float(b.low)
-        cleaned_by_ts_ns[b_ts] = (c_high, c_low)
 
         r_high = c_high
         r_low = c_low
-        if b_ts in raw_bar_map:
-            r_high = max(r_high, raw_bar_map[b_ts][0])
-            r_low = min(r_low, raw_bar_map[b_ts][1])
+        rb_pair = raw_bar_by_key.get(b_key) or raw_bar_by_ts.get(b_ts)
+        if rb_pair is not None:
+            r_high = max(r_high, rb_pair[0])
+            r_low = min(r_low, rb_pair[1])
         attr_rh = getattr(b, "raw_high", None)
         attr_rl = getattr(b, "raw_low", None)
         if attr_rh is not None:
             r_high = max(r_high, float(attr_rh))
         if attr_rl is not None:
             r_low = min(r_low, float(attr_rl))
-        if raw_high_by_ts_ns and b_ts in raw_high_by_ts_ns:
-            r_high = max(r_high, float(raw_high_by_ts_ns[b_ts]))
-        if raw_low_by_ts_ns and b_ts in raw_low_by_ts_ns:
-            r_low = min(r_low, float(raw_low_by_ts_ns[b_ts]))
+        extra_rh = _lookup_extreme(raw_high_by_ts_ns, b_key, b_ts)
+        extra_rl = _lookup_extreme(raw_low_by_ts_ns, b_key, b_ts)
+        if extra_rh is not None:
+            r_high = max(r_high, extra_rh)
+        if extra_rl is not None:
+            r_low = min(r_low, extra_rl)
 
-        raw_by_ts_ns[b_ts] = (r_high, r_low)
         if abs(r_high - c_high) > 1e-9 or abs(r_low - c_low) > 1e-9:
             has_divergence = True
+            cleaned_by_key[b_key] = (c_high, c_low)
+            raw_by_key[b_key] = (r_high, r_low)
 
-    return cleaned_by_ts_ns, raw_by_ts_ns, has_divergence
+    return cleaned_by_key, raw_by_key, has_divergence
 
 
 def _normalize_bars_for_parity(bars: Sequence[Bar]) -> List[Bar]:
@@ -402,6 +480,18 @@ def _normalize_bars_for_parity(bars: Sequence[Bar]) -> List[Bar]:
     return _sort_bars_deterministic(normalized)
 
 
+def _ny_date_from_ts_ns(ts_ns: int) -> date:
+    if ts_ns > 100_000_000_000_000_000:
+        if ts_ns % 86_400_000_000_000 == 0:
+            return datetime.fromtimestamp(ts_ns / 1e9, tz=timezone.utc).date()
+        return (
+            datetime.fromtimestamp(ts_ns / 1e9, tz=timezone.utc)
+            .astimezone(ZoneInfo("America/New_York"))
+            .date()
+        )
+    return datetime(1970, 1, 1, tzinfo=timezone.utc).date()
+
+
 def _resolve_trading_date_from_bars(
     bars: Sequence[Bar],
     fallback: Optional[date] = None,
@@ -414,8 +504,8 @@ def _resolve_trading_date_from_bars(
             for b in bars
         )
         if max_bar_ts_ns > 100_000_000_000_000_000:
-            return datetime.fromtimestamp(max_bar_ts_ns / 1e9, tz=timezone.utc).date()
-    return datetime.now(tz=timezone.utc).date()
+            return _ny_date_from_ts_ns(max_bar_ts_ns)
+    return datetime.now(tz=ZoneInfo("America/New_York")).date()
 
 
 def _build_parity_plan_items(
@@ -587,6 +677,7 @@ class IsomorphicBacktestRunner:
         self._explicit_impact_y: Optional[float] = (
             float(impact_coefficient_y) if impact_coefficient_y is not None else None
         )
+        self._market_impact_spec_explicit: bool = market_impact_spec is not None
         self._market_impact_spec = market_impact_spec or MarketImpactSpec(
             half_spread_bps=float(eff_half_bps if eff_half_bps is not None else 0.0),
             impact_coefficient_y=float(
@@ -604,6 +695,72 @@ class IsomorphicBacktestRunner:
         self._last_orders: List[Any] = []
         self._last_period_returns: List[float] = []
         self._last_trade_cycles: List[Dict[str, Any]] = []
+        self._loaded_raw_high_by_key: Dict[Tuple[str, int], float] = {}
+        self._loaded_raw_low_by_key: Dict[Tuple[str, int], float] = {}
+
+    def _load_clickhouse_raw_extremes(
+        self,
+        *,
+        symbol: str,
+        venue: str,
+        timeframes: Sequence[str],
+        start_ts_ns: Optional[int],
+        end_ts_ns: Optional[int],
+    ) -> Tuple[Dict[Tuple[str, int], float], Dict[Tuple[str, int], float]]:
+        raw_hi: Dict[Tuple[str, int], float] = {}
+        raw_lo: Dict[Tuple[str, int], float] = {}
+        ch_url = str(getattr(self._datainfra_config, "clickhouse_url", "") or "").strip()
+        if not ch_url.startswith(("http://", "https://")) or not timeframes:
+            return raw_hi, raw_lo
+        sym_clean = str(symbol).strip().upper().replace("'", "")
+        tf_list = ",".join(f"'{str(t).strip().lower()}'" for t in timeframes if str(t).strip())
+        if not sym_clean or not tf_list:
+            return raw_hi, raw_lo
+        clauses = [
+            f"symbol = '{sym_clean}'",
+            f"timeframe IN ({tf_list})",
+            "market_session = 'REG'",
+        ]
+        if start_ts_ns is not None and int(start_ts_ns) > 0:
+            clauses.append(
+                f"bar_start_time >= fromUnixTimestamp64Nano(toInt64({int(start_ts_ns)}))"
+            )
+        if end_ts_ns is not None and int(end_ts_ns) > 0:
+            clauses.append(
+                f"bar_start_time <= fromUnixTimestamp64Nano(toInt64({int(end_ts_ns)}))"
+            )
+        sql = (
+            "SELECT timeframe, toUnixTimestamp64Nano(toDateTime64(bar_start_time, 9, 'UTC')) AS ts_ns, "
+            "toFloat64(adj_unclipped_high) AS raw_h, toFloat64(adj_unclipped_low) AS raw_l "
+            f"FROM v_quant_bars WHERE {' AND '.join(clauses)} FORMAT JSONEachRow"
+        )
+        base_sep = "&" if "?" in ch_url else "?"
+        url = f"{ch_url.rstrip('/')}{base_sep}query={quote(sql)}"
+        try:
+            with urlopen(url, timeout=2.0) as resp:
+                for raw_line in resp.read().decode("utf-8", errors="ignore").splitlines():
+                    line = raw_line.strip()
+                    if not line:
+                        continue
+                    row = json.loads(line)
+                    tf_val = str(row.get("timeframe") or "").strip().lower()
+                    step_ns = _TIMEFRAME_STEP_NS.get(tf_val)
+                    if step_ns is None:
+                        continue
+                    open_ns = int(row.get("ts_ns") or 0)
+                    if open_ns <= 0:
+                        continue
+                    close_ns = compute_rth_bar_close_ns(open_ns, step_ns)
+                    bt_key = str(format_datainfra_bar_type(f"{sym_clean}.{venue}", tf_val))
+                    rh_val = float(row.get("raw_h") or 0.0)
+                    rl_val = float(row.get("raw_l") or 0.0)
+                    if math.isfinite(rh_val) and rh_val > 0.0:
+                        raw_hi[(bt_key, close_ns)] = rh_val
+                    if math.isfinite(rl_val) and rl_val > 0.0:
+                        raw_lo[(bt_key, close_ns)] = rl_val
+        except (URLError, OSError, ValueError, TypeError):
+            return {}, {}
+        return raw_hi, raw_lo
 
     def load_historical_data(
         self,
@@ -622,6 +779,8 @@ class IsomorphicBacktestRunner:
         try:
             symbols = [plan_item.symbol]
             venue = plan_item.venue or self._venue_name
+            self._loaded_raw_high_by_key.clear()
+            self._loaded_raw_low_by_key.clear()
             equities = [
                 catalog.register_equity(sym, venue=venue, lot_size=1)
                 for sym in symbols
@@ -653,6 +812,16 @@ class IsomorphicBacktestRunner:
                     if _bar_step_ns(b) == 60_000_000_000:
                         dedup_bars[(str(b.bar_type), int(b.ts_init))] = b
             bars = _sort_bars_deterministic(list(dedup_bars.values()))
+            queried_tfs = [tf_norm] if tf_norm == "1m" else [tf_norm, "1m"]
+            hi_map, lo_map = self._load_clickhouse_raw_extremes(
+                symbol=plan_item.symbol,
+                venue=venue,
+                timeframes=queried_tfs,
+                start_ts_ns=start_ns,
+                end_ts_ns=end_ns,
+            )
+            self._loaded_raw_high_by_key.update(hi_map)
+            self._loaded_raw_low_by_key.update(lo_map)
             quotes = (
                 catalog.query_quotes(
                     symbols,
@@ -719,10 +888,14 @@ class IsomorphicBacktestRunner:
             quote_list = list(loaded_quotes if quotes is None else quotes)
             status_list = list(loaded_statuses if statuses is None else statuses)
             equity_list = list(loaded_equities if equities is None else equities)
+            eff_raw_high = {**self._loaded_raw_high_by_key, **(dict(raw_high_by_ts_ns) if raw_high_by_ts_ns else {})}
+            eff_raw_low = {**self._loaded_raw_low_by_key, **(dict(raw_low_by_ts_ns) if raw_low_by_ts_ns else {})}
         else:
             bar_list = list(bars)
             quote_list = list(quotes or [])
             status_list = list(statuses or [])
+            eff_raw_high = raw_high_by_ts_ns
+            eff_raw_low = raw_low_by_ts_ns
             if equities is not None:
                 equity_list = list(equities)
             else:
@@ -743,15 +916,16 @@ class IsomorphicBacktestRunner:
         cleaned_by_ts_ns, raw_by_ts_ns, has_raw_divergence = _extract_dual_track_extremes(
             bar_list,
             raw_bars=raw_bars,
-            raw_low_by_ts_ns=raw_low_by_ts_ns,
-            raw_high_by_ts_ns=raw_high_by_ts_ns,
+            raw_low_by_ts_ns=eff_raw_low,
+            raw_high_by_ts_ns=eff_raw_high,
         )
         bar_list = _normalize_bars_for_parity(bar_list)
         if has_raw_divergence:
             engine_bar_list: List[Bar] = []
             for b in bar_list:
                 b_ts = int(b.ts_init)
-                r_pair = raw_by_ts_ns.get(b_ts)
+                b_key = (str(b.bar_type), b_ts)
+                r_pair = raw_by_ts_ns.get(b_key) or raw_by_ts_ns.get(b_ts)
                 if r_pair is not None:
                     engine_bar_list.append(
                         _clone_bar_with_prices(
@@ -795,9 +969,7 @@ class IsomorphicBacktestRunner:
         submit_limit = max(30, len(items_to_lock) * max_slices * max_positions * 2)
         modify_limit = max(submit_limit, len(items_to_lock) * max_slices * max_positions * 4)
         risk_engine_cfg = RiskEngineConfig(
-            max_notional_per_order={
-                str(eq.id): f"{order_notional_cap:.2f}" for eq in equity_list
-            },
+            max_notional_per_order=None,
             max_order_submit_rate=f"{submit_limit}/00:01:00",
             max_order_modify_rate=f"{modify_limit}/00:01:00",
         )
@@ -1114,7 +1286,12 @@ class IsomorphicBacktestRunner:
                 positions.append(pos)
 
         total_orders = len(orders)
-        filled_orders = sum(1 for o in orders if o.status == OrderStatus.FILLED)
+        filled_orders = sum(
+            1
+            for o in orders
+            if o.status == OrderStatus.FILLED
+            or _parse_money_float(getattr(o, "filled_qty", 0)) > 0.0
+        )
         denied_orders = sum(
             1
             for o in orders
@@ -1139,9 +1316,12 @@ class IsomorphicBacktestRunner:
                 getattr(ord_obj, "ts_last", 0) or getattr(ord_obj, "ts_init", 0)
             ),
         ):
-            if o.status == OrderStatus.FILLED:
-                qty_f = _parse_money_float(
-                    getattr(o, "filled_qty", None) or getattr(o, "quantity", 0)
+            raw_fqty = _parse_money_float(getattr(o, "filled_qty", 0))
+            if o.status == OrderStatus.FILLED or raw_fqty > 0.0:
+                qty_f = (
+                    raw_fqty
+                    if raw_fqty > 0.0
+                    else _parse_money_float(getattr(o, "quantity", 0))
                 )
                 px_f = _parse_money_float(
                     getattr(o, "avg_px", None) or getattr(o, "price", 0)
@@ -1176,17 +1356,31 @@ class IsomorphicBacktestRunner:
         }
         net_pnl = 0.0
         trade_cycles: List[Dict[str, Any]] = []
+        pos_notionals: List[float] = []
         for pos in positions:
             realized = _parse_money_float(getattr(pos, "realized_pnl", 0.0))
             inst_key = str(getattr(pos, "instrument_id", primary_inst))
             last_px = last_close_by_inst.get(inst_key, 0.0)
             unrealized = 0.0
             if getattr(pos, "is_open", False) and last_px > 0.0:
+                inst_obj = engine.cache.instrument(getattr(pos, "instrument_id", primary_inst))
+                inst_prec = getattr(inst_obj, "price_precision", None) if inst_obj is not None else None
+                if inst_prec is not None:
+                    px_prec = int(inst_prec)
+                else:
+                    tick_dec = rule_612_tick_size(Decimal(str(last_px)))
+                    px_prec = 4 if tick_dec < Decimal("0.01") else 2
                 try:
                     unrealized = _parse_money_float(
-                        pos.unrealized_pnl(Price.from_str(f"{last_px:.2f}"))
+                        pos.unrealized_pnl(Price.from_str(f"{last_px:.{px_prec}f}"))
                     )
-                except Exception:
+                except (AttributeError, TypeError, ValueError) as pnl_exc:
+                    logger.warning(
+                        "Failed computing unrealized PnL for %s at last_px=%.4f: %s",
+                        inst_key,
+                        last_px,
+                        pnl_exc,
+                    )
                     unrealized = 0.0
             pos_comms = sum(
                 _parse_money_float(c)
@@ -1205,6 +1399,12 @@ class IsomorphicBacktestRunner:
                 order_init_ts_by_id.get(opening_ord_id, 0),
             )
             entry_px = _parse_money_float(getattr(pos, "avg_px_open", 0.0))
+            pos_qty_abs = abs(
+                _parse_money_float(
+                    getattr(pos, "peak_qty", None) or getattr(pos, "quantity", 0.0)
+                )
+            )
+            pos_notionals.append(max(0.0, pos_qty_abs * entry_px))
             trade_cycles.append(
                 {
                     "instrument_id": inst_key,
@@ -1249,9 +1449,7 @@ class IsomorphicBacktestRunner:
         elif primary_bars:
             vols_by_day: Dict[date, float] = {}
             for pb in primary_bars:
-                pb_dt = datetime.fromtimestamp(
-                    int(pb.ts_init) / 1_000_000_000.0, tz=timezone.utc
-                ).date()
+                pb_dt = _ny_date_from_ts_ns(int(pb.ts_init))
                 vols_by_day[pb_dt] = vols_by_day.get(pb_dt, 0.0) + float(pb.volume)
             day_vols = [v for v in vols_by_day.values() if v > 0.0]
             adv_20_shares = (
@@ -1275,19 +1473,56 @@ class IsomorphicBacktestRunner:
                 eff_half_bps = statistics.median(quote_spreads_bps)
         if eff_half_bps is None and sizing_trace.get("half_spread_bps") is not None:
             eff_half_bps = max(0.0, float(sizing_trace["half_spread_bps"]))
+        eff_impact_y = self._explicit_impact_y
+        if eff_impact_y is None and sizing_trace.get("impact_coefficient_y") is not None:
+            eff_impact_y = max(0.0, float(sizing_trace["impact_coefficient_y"]))
+
+        causal_impact_spec: Optional[Dict[str, float]] = None
+        if (
+            not self._market_impact_spec_explicit
+            and (eff_half_bps is None or eff_impact_y is None)
+            and len(primary_bars) >= 3
+        ):
+            from nautilus_trader.quant.nodes.regime_calibrator import (
+                CausalMarketMicrostructureEstimator,
+            )
+
+            lookback_n = min(
+                len(primary_bars),
+                max(3, int(plan_item.strategy_config.lookback_window)),
+            )
+            causal_impact_spec = (
+                CausalMarketMicrostructureEstimator.estimate_market_impact(
+                    primary_bars[:lookback_n],
+                    ref_px=ref_px if ref_px > 0.0 else 100.0,
+                    daily_atr_14=plan_item.risk_envelope.daily_atr_14,
+                )
+            )
+
         if eff_half_bps is None:
-            if ref_px > 0.0:
+            if self._market_impact_spec_explicit:
+                eff_half_bps = max(0.0, float(self._market_impact_spec.half_spread_bps))
+            elif causal_impact_spec is not None:
+                eff_half_bps = max(
+                    0.0, float(causal_impact_spec.get("half_spread_bps", 0.0))
+                )
+            elif ref_px > 0.0:
                 eff_half_bps = (
                     float(rule_612_tick_size(Decimal(str(ref_px)))) / (2.0 * ref_px)
                 ) * 10_000.0
             else:
                 eff_half_bps = 0.0
 
-        eff_impact_y = self._explicit_impact_y
-        if eff_impact_y is None and sizing_trace.get("impact_coefficient_y") is not None:
-            eff_impact_y = max(0.0, float(sizing_trace["impact_coefficient_y"]))
         if eff_impact_y is None:
-            eff_impact_y = float(self._market_impact_spec.impact_coefficient_y)
+            if (
+                not self._market_impact_spec_explicit
+                and causal_impact_spec is not None
+            ):
+                eff_impact_y = max(
+                    0.0, float(causal_impact_spec.get("impact_coefficient_y", 0.0))
+                )
+            else:
+                eff_impact_y = float(self._market_impact_spec.impact_coefficient_y)
 
         impact_spec = MarketImpactSpec(
             half_spread_bps=max(0.0, float(eff_half_bps)),
@@ -1313,6 +1548,18 @@ class IsomorphicBacktestRunner:
         )
         if deducted_slippage_cost > 0.0:
             net_pnl -= deducted_slippage_cost
+            if trade_pnls:
+                total_pos_notional = sum(pos_notionals)
+                for idx in range(len(trade_pnls)):
+                    share = (
+                        pos_notionals[idx] / total_pos_notional
+                        if total_pos_notional > 0.0
+                        else (1.0 / float(len(trade_pnls)))
+                    )
+                    alloc_slip = deducted_slippage_cost * share
+                    trade_pnls[idx] -= alloc_slip
+                    if idx < len(self._last_trade_cycles):
+                        self._last_trade_cycles[idx]["net_pnl_usd"] = trade_pnls[idx]
 
         gross_pnl = net_pnl + total_commissions + deducted_slippage_cost
         end_cap = start_cap + net_pnl
@@ -1434,12 +1681,15 @@ class IsomorphicBacktestRunner:
         total_notional = 0.0
         raw_fills: List[Tuple[int, str, float, float, float]] = []
         for o in orders:
-            if o.status != OrderStatus.FILLED:
+            raw_fqty = _parse_money_float(getattr(o, "filled_qty", 0))
+            if o.status != OrderStatus.FILLED and raw_fqty <= 0.0:
                 continue
             ts = int(getattr(o, "ts_last", 0) or getattr(o, "ts_init", 0))
             inst_key = str(getattr(o, "instrument_id", ""))
-            qty = _parse_money_float(
-                getattr(o, "filled_qty", None) or getattr(o, "quantity", 0)
+            qty = (
+                raw_fqty
+                if raw_fqty > 0.0
+                else _parse_money_float(getattr(o, "quantity", 0))
             )
             px = _parse_money_float(
                 getattr(o, "avg_px", None) or getattr(o, "price", 0)
@@ -1682,20 +1932,11 @@ class StressFalsifier:
             effective_trials=effective_trials,
         )
         max_budget = float(plan_item.risk_envelope.max_risk_budget_usd)
-        if baseline.net_pnl_usd > 0.0:
-            friction_passed = (
-                friction_metrics.filled_orders > 0 and friction_metrics.net_pnl_usd > 0.0
-            )
-        else:
-            incremental_friction_loss = max(
-                0.0, float(baseline.net_pnl_usd) - float(friction_metrics.net_pnl_usd)
-            )
-            friction_passed = (
-                friction_metrics.filled_orders > 0
-                and friction_metrics.net_pnl_usd >= -max_budget
-                and abs(min(0.0, friction_metrics.max_single_trade_loss_usd)) <= max_budget
-                and incremental_friction_loss <= 0.50 * max_budget
-            )
+        friction_passed = (
+            baseline.net_pnl_usd > 0.0
+            and friction_metrics.filled_orders > 0
+            and friction_metrics.net_pnl_usd > 0.0
+        )
         friction_reason = (
             f"2x friction net_pnl_usd={friction_metrics.net_pnl_usd:.2f} within risk envelope (max_budget={max_budget:.2f})"
             if friction_passed
@@ -1994,48 +2235,47 @@ class StressFalsifier:
                 missed_winners += 1
 
         # Also inspect any unfilled entry limit orders in BacktestEngine that would have profited
-        if total_winners == 0:
-            seen_unfilled_spawns: set[str] = set()
-            for ord_obj in orders:
-                ord_cid = str(getattr(ord_obj, "client_order_id", "") or "")
-                if ord_cid in filled_cids:
-                    continue
-                if ord_obj.status in (
-                    OrderStatus.FILLED,
-                    OrderStatus.DENIED,
-                    OrderStatus.REJECTED,
-                ):
-                    continue
-                if bool(getattr(ord_obj, "is_reduce_only", False)):
-                    continue
-                spawn_key = str(getattr(ord_obj, "exec_spawn_id", "") or ord_cid)
-                if spawn_key and (
-                    spawn_key in filled_spawn_ids or spawn_key in seen_unfilled_spawns
-                ):
-                    continue
-                if spawn_key:
-                    seen_unfilled_spawns.add(spawn_key)
+        seen_unfilled_spawns: set[str] = set()
+        for ord_obj in orders:
+            ord_cid = str(getattr(ord_obj, "client_order_id", "") or "")
+            if ord_cid in filled_cids:
+                continue
+            if ord_obj.status in (
+                OrderStatus.FILLED,
+                OrderStatus.DENIED,
+                OrderStatus.REJECTED,
+            ):
+                continue
+            if bool(getattr(ord_obj, "is_reduce_only", False)):
+                continue
+            spawn_key = str(getattr(ord_obj, "exec_spawn_id", "") or ord_cid)
+            if spawn_key and (
+                spawn_key in filled_spawn_ids or spawn_key in seen_unfilled_spawns
+            ):
+                continue
+            if spawn_key:
+                seen_unfilled_spawns.add(spawn_key)
 
-                ord_ts = int(getattr(ord_obj, "ts_init", 0) or 0)
-                ord_idx = 0
-                for idx, b in enumerate(primary_bars):
-                    if int(b.ts_init) <= ord_ts:
-                        ord_idx = idx
-                    else:
-                        break
-                horizon_idx = min(len(primary_bars) - 1, ord_idx + fast_win)
-                exact_ord_bar = inst_bar_by_ts.get(ord_ts)
-                entry_ref_px = (
-                    float(exact_ord_bar.close) if exact_ord_bar is not None else closes[ord_idx]
-                )
-                fwd_move = (
-                    closes[horizon_idx] - entry_ref_px
-                    if side == PlanSide.LONG
-                    else entry_ref_px - closes[horizon_idx]
-                )
-                if fwd_move > 0.0:
-                    total_winners += 1
-                    missed_winners += 1
+            ord_ts = int(getattr(ord_obj, "ts_init", 0) or 0)
+            ord_idx = 0
+            for idx, b in enumerate(primary_bars):
+                if int(b.ts_init) <= ord_ts:
+                    ord_idx = idx
+                else:
+                    break
+            horizon_idx = min(len(primary_bars) - 1, ord_idx + fast_win)
+            exact_ord_bar = inst_bar_by_ts.get(ord_ts)
+            entry_ref_px = (
+                float(exact_ord_bar.close) if exact_ord_bar is not None else closes[ord_idx]
+            )
+            fwd_move = (
+                closes[horizon_idx] - entry_ref_px
+                if side == PlanSide.LONG
+                else entry_ref_px - closes[horizon_idx]
+            )
+            if fwd_move > 0.0:
+                total_winners += 1
+                missed_winners += 1
 
         missed_fill_rate = (
             float(missed_winners) / float(total_winners)
@@ -2229,6 +2469,24 @@ class StressFalsifier:
                     for sym_k in bars_map:
                         normalized_windows.append((sym_k, s_ns, e_ns))
 
+        window_horizons: List[float] = []
+        for w_sym, s_ns, e_ns in normalized_windows:
+            sess_dates = {
+                _ny_date_from_ts_ns(int(b.ts_init))
+                for b in bars_map.get(w_sym, ())
+                if s_ns <= int(b.ts_init) <= e_ns
+            }
+            if sess_dates:
+                window_horizons.append(float(len(sess_dates)))
+            else:
+                window_horizons.append(
+                    max(1.0, ((e_ns - s_ns) / 86_400_000_000_000.0) + 1.0)
+                )
+        empirical_mean_horizon_sessions = max(
+            1.0,
+            statistics.fmean(window_horizons) if window_horizons else 1.0,
+        )
+
         start_cap = float(self._runner._starting_capital_usd)
         eff_trials = max(
             1,
@@ -2267,7 +2525,7 @@ class StressFalsifier:
             if len(rets) >= 2:
                 m_r = statistics.fmean(rets)
                 s_r = statistics.stdev(rets)
-                ann = math.sqrt(252.0 / max(1.0, 5.0))
+                ann = math.sqrt(252.0 / max(1.0, empirical_mean_horizon_sessions))
                 sh = (m_r / s_r) * ann if s_r > 1e-12 else 0.0
             else:
                 sh = 0.0
@@ -2803,20 +3061,11 @@ class StressFalsifier:
 
             eff_total_budget = max(1.0, total_budget)
             eff_single_budget = max(1.0, max_single_budget)
-            if baseline_agg.net_pnl_usd > 0.0:
-                friction_passed = (
-                    fric_filled_events > 0 and fric_agg.net_pnl_usd > 0.0
-                )
-            else:
-                inc_fric_loss = max(
-                    0.0, float(baseline_agg.net_pnl_usd) - float(fric_agg.net_pnl_usd)
-                )
-                friction_passed = (
-                    fric_filled_events > 0
-                    and fric_agg.net_pnl_usd >= -eff_total_budget
-                    and abs(min(0.0, fric_agg.max_single_trade_loss_usd)) <= eff_single_budget
-                    and inc_fric_loss <= 0.50 * eff_total_budget
-                )
+            friction_passed = (
+                baseline_agg.net_pnl_usd > 0.0
+                and fric_filled_events > 0
+                and fric_agg.net_pnl_usd > 0.0
+            )
             double_friction_result = StressExperimentResult(
                 experiment_name="double_friction_stress",
                 passed=friction_passed,
@@ -2997,6 +3246,17 @@ class StressFalsifier:
         shocked_high = shocked_close
 
         shocked_primary = list(primary_bars)
+        shock_bar_ts = int(ref_bar.ts_init)
+        shock_start_ns = (
+            int(primary_bars[shock_idx - 1].ts_init)
+            if shock_idx > 0
+            else (shock_bar_ts - 1)
+        )
+        shock_end_ns = (
+            int(primary_bars[shock_idx + 1].ts_init)
+            if shock_idx + 1 < len(primary_bars)
+            else shock_bar_ts
+        )
         shocked_primary[shock_idx] = _clone_bar_with_prices(
             ref_bar,
             open_px=shocked_close,
@@ -3014,7 +3274,38 @@ class StressFalsifier:
                 close_px=float(nxt.close),
             )
 
-        return _sort_bars_deterministic(shocked_primary + other_bars)
+        min_1m_shock_ts = (
+            max(shock_start_ns, int(baseline_first_entry[0]))
+            if baseline_first_entry is not None
+            else shock_start_ns
+        )
+        shocked_other: List[Bar] = []
+        for ob in other_bars:
+            ob_ts = int(ob.ts_init)
+            if min_1m_shock_ts < ob_ts <= shock_bar_ts:
+                shocked_other.append(
+                    _clone_bar_with_prices(
+                        ob,
+                        open_px=shocked_close,
+                        high_px=shocked_high,
+                        low_px=shocked_low,
+                        close_px=shocked_close,
+                    )
+                )
+            elif shock_bar_ts < ob_ts <= shock_end_ns and shock_idx + 1 < len(shocked_primary):
+                shocked_other.append(
+                    _clone_bar_with_prices(
+                        ob,
+                        open_px=float(ob.open),
+                        high_px=max(float(ob.high), shocked_close),
+                        low_px=min(float(ob.low), shocked_close),
+                        close_px=float(ob.close),
+                    )
+                )
+            else:
+                shocked_other.append(ob)
+
+        return _sort_bars_deterministic(shocked_primary + shocked_other)
 
 
 StressFalsificationSuite = StressFalsifier
