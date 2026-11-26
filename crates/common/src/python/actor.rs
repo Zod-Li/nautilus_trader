@@ -2955,6 +2955,78 @@ impl PyDataActor {
         let messages = get_python_message_bus(slf.as_any())?;
         messages.unsubscribe_topic(topic, handler)
     }
+
+    #[pyo3(name = "subscribe_order_events")]
+    #[pyo3(signature = (topic, handler, priority=0))]
+    fn py_subscribe_order_events(
+        slf: &Bound<'_, Self>,
+        topic: &str,
+        #[gen_stub(override_type(type_repr = "collections.abc.Callable[[object], None]", imports = ("collections.abc",)))]
+        handler: Py<PyAny>,
+        priority: u32,
+    ) -> PyResult<()> {
+        let messages = get_python_message_bus(slf.as_any())?;
+        messages.subscribe_order_events(slf.py(), topic, handler, priority)
+    }
+
+    #[pyo3(name = "unsubscribe_order_events", signature = (topic, handler))]
+    fn py_unsubscribe_order_events(
+        slf: &Bound<'_, Self>,
+        topic: &str,
+        #[gen_stub(override_type(type_repr = "collections.abc.Callable[[object], None]", imports = ("collections.abc",)))]
+        handler: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let messages = get_python_message_bus(slf.as_any())?;
+        messages.unsubscribe_order_events(topic, handler)
+    }
+
+    #[pyo3(name = "subscribe_position_events")]
+    #[pyo3(signature = (topic, handler, priority=0))]
+    fn py_subscribe_position_events(
+        slf: &Bound<'_, Self>,
+        topic: &str,
+        #[gen_stub(override_type(type_repr = "collections.abc.Callable[[object], None]", imports = ("collections.abc",)))]
+        handler: Py<PyAny>,
+        priority: u32,
+    ) -> PyResult<()> {
+        let messages = get_python_message_bus(slf.as_any())?;
+        messages.subscribe_position_events(slf.py(), topic, handler, priority)
+    }
+
+    #[pyo3(name = "unsubscribe_position_events", signature = (topic, handler))]
+    fn py_unsubscribe_position_events(
+        slf: &Bound<'_, Self>,
+        topic: &str,
+        #[gen_stub(override_type(type_repr = "collections.abc.Callable[[object], None]", imports = ("collections.abc",)))]
+        handler: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let messages = get_python_message_bus(slf.as_any())?;
+        messages.unsubscribe_position_events(topic, handler)
+    }
+
+    #[pyo3(name = "subscribe_account_state")]
+    #[pyo3(signature = (topic, handler, priority=0))]
+    fn py_subscribe_account_state(
+        slf: &Bound<'_, Self>,
+        topic: &str,
+        #[gen_stub(override_type(type_repr = "collections.abc.Callable[[object], None]", imports = ("collections.abc",)))]
+        handler: Py<PyAny>,
+        priority: u32,
+    ) -> PyResult<()> {
+        let messages = get_python_message_bus(slf.as_any())?;
+        messages.subscribe_account_state(slf.py(), topic, handler, priority)
+    }
+
+    #[pyo3(name = "unsubscribe_account_state", signature = (topic, handler))]
+    fn py_unsubscribe_account_state(
+        slf: &Bound<'_, Self>,
+        topic: &str,
+        #[gen_stub(override_type(type_repr = "collections.abc.Callable[[object], None]", imports = ("collections.abc",)))]
+        handler: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let messages = get_python_message_bus(slf.as_any())?;
+        messages.unsubscribe_account_state(topic, handler)
+    }
 }
 
 #[cfg(feature = "defi")]

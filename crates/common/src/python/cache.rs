@@ -182,6 +182,33 @@ impl PyCache {
             .map_err(to_pyvalue_err)
     }
 
+    /// Adds the `currency` to the cache.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if persisting the currency to the backing database fails.
+    #[pyo3(name = "add_currency")]
+    fn py_add_currency(&mut self, currency: Currency) -> PyResult<()> {
+        self.0
+            .borrow_mut()
+            .add_currency(currency)
+            .map_err(to_pyvalue_err)
+    }
+
+    /// Adds the `instrument` to the cache.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if persisting the instrument to the backing database fails.
+    #[pyo3(name = "add_instrument")]
+    fn py_add_instrument(&mut self, py: Python<'_>, instrument: Py<PyAny>) -> PyResult<()> {
+        let instrument_any = pyobject_to_instrument_any(py, instrument)?;
+        self.0
+            .borrow_mut()
+            .add_instrument(instrument_any)
+            .map_err(to_pyvalue_err)
+    }
+
     #[pyo3(name = "quote", signature = (instrument_id, index=0))]
     fn py_quote(&self, instrument_id: InstrumentId, index: usize) -> Option<QuoteTick> {
         self.0

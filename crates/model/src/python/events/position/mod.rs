@@ -13,8 +13,26 @@
 //  limitations under the License.
 // -------------------------------------------------------------------------------------------------
 
+use pyo3::{IntoPyObjectExt, Py, PyAny, PyResult, Python};
+
+use crate::events::PositionEvent;
+
 pub mod adjusted;
 pub mod changed;
 pub mod closed;
 pub mod opened;
 pub mod snapshot;
+
+/// Converts a [`PositionEvent`] into a Python object.
+///
+/// # Errors
+///
+/// Returns an error if conversion to a Python object fails.
+pub fn position_event_to_pyobject(py: Python, position_event: PositionEvent) -> PyResult<Py<PyAny>> {
+    match position_event {
+        PositionEvent::PositionOpened(event) => event.into_py_any(py),
+        PositionEvent::PositionChanged(event) => event.into_py_any(py),
+        PositionEvent::PositionClosed(event) => event.into_py_any(py),
+        PositionEvent::PositionAdjusted(event) => event.into_py_any(py),
+    }
+}

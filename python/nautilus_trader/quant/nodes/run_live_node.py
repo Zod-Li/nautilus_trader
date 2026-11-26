@@ -212,6 +212,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         environment=env_mode,
         market=os.environ.get("TRADING_MARKET", "US_EQUITY"),
         warmup_on_build=not args.dry_run_build,
+        sip_feeder_url=os.environ.get("SIP_FEEDER_URL", ""),
+        require_sip_feeder_configured=trading_mode in ("LIVE", "PAPER"),
         resolve_instruments_via_alpaca=True,
     )
     try:

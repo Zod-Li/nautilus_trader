@@ -645,6 +645,21 @@ fn test_decode_sip_raw_quotes_arrow_stream_and_reject_crossed_quotes() {
         &[100.0],
         &[100.0],
     );
+
+    // Sub-dollar quote (< $1.00) decodes with 4dp per SEC Reg NMS Rule 612
+    let sub_dollar_batch = build_quotes_record_batch(
+        &["SUBD"],
+        &[1_700_000_004_000_000_000_i64],
+        &[0.4512],
+        &[0.4518],
+        &[500.0],
+        &[600.0],
+    );
+    let sub_dollar_ipc = encode_batches_to_arrow_ipc_stream(std::slice::from_ref(&sub_dollar_batch));
+    let sub_quotes = decode_quotes_arrow_stream(&sub_dollar_ipc, &opts).expect("sub-dollar quotes must decode");
+    assert_eq!(sub_quotes.len(), 1);
+    assert_eq!(sub_quotes[0].bid_price, Price::new(0.4512, 4));
+    assert_eq!(sub_quotes[0].ask_price, Price::new(0.4518, 4));
     let crossed_ipc = encode_batches_to_arrow_ipc_stream(&[crossed_batch]);
     let err = decode_quotes_arrow_stream(&crossed_ipc, &opts)
         .expect_err("crossed quote must be rejected");

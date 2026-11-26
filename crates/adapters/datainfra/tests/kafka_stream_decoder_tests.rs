@@ -93,6 +93,7 @@ fn test_decode_canonical_bar_quote_and_status_wire_frames() {
 
     // 1. Valid 1m SIP bar frame on md.sip.bars.1m
     let bar_json = br#"{
+        "schema_version": 1,
         "symbol": "AAPL",
         "timeframe": "1m",
         "bar_ts": 1711980000,
@@ -114,7 +115,7 @@ fn test_decode_canonical_bar_quote_and_status_wire_frames() {
     }"#;
 
     let bar_wire_legacy: CanonicalBarWire =
-        serde_json::from_slice(bar_json).expect("legacy CanonicalBarWire JSON should deserialize");
+        serde_json::from_slice(bar_json).expect("CanonicalBarWire v1 JSON should deserialize");
     assert_eq!(bar_wire_legacy.market, "US");
     assert_eq!(bar_wire_legacy.origin, "REALTIME");
 
@@ -138,6 +139,7 @@ fn test_decode_canonical_bar_quote_and_status_wire_frames() {
 
     // 1b. Explicit `market` and `origin` fields on initial Bar and UpdatedBar
     let explicit_bar_v1_json = br#"{
+        "schema_version": 1,
         "market": "US",
         "symbol": "TSLA",
         "timeframe": "1m",
@@ -177,6 +179,7 @@ fn test_decode_canonical_bar_quote_and_status_wire_frames() {
     }
 
     let explicit_bar_v2_json = br#"{
+        "schema_version": 1,
         "market": "US",
         "symbol": "TSLA",
         "timeframe": "1m",
@@ -224,6 +227,7 @@ fn test_decode_canonical_bar_quote_and_status_wire_frames() {
 
     // 2. Valid L1 SIP quote frame on md.sip.quotes
     let quote_json = br#"{
+        "schema_version": 1,
         "symbol": "MSFT",
         "quote_ts_ms": 1711980005250,
         "ingest_ts_ms": 1711980005255,
@@ -240,6 +244,7 @@ fn test_decode_canonical_bar_quote_and_status_wire_frames() {
         serde_json::from_slice(quote_json).expect("CanonicalQuoteWire should deserialize");
     assert_eq!(quote_wire.market, "US");
     let explicit_quote_wire = CanonicalQuoteWire {
+        schema_version: 1,
         market: "US".to_string(),
         symbol: "MSFT".to_string(),
         quote_ts_ms: 1_711_980_005_250,
@@ -280,6 +285,7 @@ fn test_decode_canonical_bar_quote_and_status_wire_frames() {
 
     // 3. Valid SIP trading status frames on md.sip.statuses (LULD_PAUSE & SHORT_SALE_RESTRICTED)
     let pause_json = br#"{
+        "schema_version": 1,
         "symbol": "NVDA",
         "status_ts_ms": 1711980010000,
         "ingest_ts_ms": 1711980010005,
@@ -318,6 +324,7 @@ fn test_decode_canonical_bar_quote_and_status_wire_frames() {
     }
 
     let ssr_wire = CanonicalTradingStatusWire {
+        schema_version: 1,
         market: "US".to_string(),
         symbol: "AMD".to_string(),
         status_ts_ms: 1_711_980_020_000,
@@ -343,6 +350,7 @@ fn test_quality_guards_filter_synthetic_and_suspect_spike_and_reject_corrupted_f
 
     // 1. Synthetic +3s zero-volume placeholder bar -> FilteredSynthetic (must NOT record version)
     let synthetic_bar = CanonicalBarWire {
+        schema_version: 1,
         market: "US".to_string(),
         symbol: "aapl".to_string(),
         timeframe: "1m".to_string(),
@@ -448,6 +456,7 @@ fn test_quality_guards_filter_synthetic_and_suspect_spike_and_reject_corrupted_f
 
     // 5. Crossed quote (bid_price > ask_price) fails closed with ProvenanceViolation
     let crossed_quote_json = br#"{
+        "schema_version": 1,
         "symbol": "AAPL",
         "quote_ts_ms": 1711980125000,
         "ingest_ts_ms": 1711980125005,
@@ -481,6 +490,7 @@ fn test_same_window_version_deduplication_and_upgrade_tracking() {
     let bar_ts = 1_711_980_900_i64;
 
     let v1_wire = CanonicalBarWire {
+        schema_version: 1,
         market: "US".to_string(),
         symbol: "AAPL".to_string(),
         timeframe: "15m".to_string(),
@@ -634,6 +644,7 @@ fn test_kafka_stream_session_coordinator_isolates_lifecycle_and_fails_closed_whe
     );
 
     let sample_quote = br#"{
+        "schema_version": 1,
         "symbol": "AAPL",
         "quote_ts_ms": 1711980005000,
         "ingest_ts_ms": 1711980005002,
@@ -724,6 +735,7 @@ fn test_kafka_broker_envelope_and_canonical_wire_frame_serialization() {
     );
 
     let bar_wire = CanonicalBarWire {
+        schema_version: 1,
         market: "US".to_string(),
         symbol: "AAPL".to_string(),
         timeframe: "1m".to_string(),
@@ -881,7 +893,7 @@ async fn test_tcp_kafka_payload_source_ephemeral_broker_streaming_failover_and_c
             vec![Record {
                 key: Some(b"AAPL".to_vec()),
                 value: Some(
-                    br#"{"topic":"md.sip.bars.1m","payload":{"symbol":"AAPL","timeframe":"1m","bar_ts":1777896600,"open":185.0,"high":186.0,"low":184.5,"close":185.5,"volume":42000.0,"version":1,"is_synthetic":false,"is_suspect_spike":false}}"#
+                    br#"{"topic":"md.sip.bars.1m","payload":{"schema_version":1,"symbol":"AAPL","timeframe":"1m","bar_ts":1777896600,"open":185.0,"high":186.0,"low":184.5,"close":185.5,"volume":42000.0,"version":1,"is_synthetic":false,"is_suspect_spike":false}}"#
                         .to_vec(),
                 ),
                 headers: std::collections::BTreeMap::new(),
@@ -1034,7 +1046,7 @@ async fn test_kafka_partition_polling_priority_batch_cap_and_poison_pill_offset_
     let mut quote_records = Vec::with_capacity(80);
     for idx in 0..80_u64 {
         let q_json = format!(
-            r#"{{"symbol":"AAPL","quote_ts_ms":{},"bid_price":185.0,"bid_size":100.0,"ask_price":185.1,"ask_size":100.0}}"#,
+            r#"{{"schema_version":1,"symbol":"AAPL","quote_ts_ms":{},"bid_price":185.0,"bid_size":100.0,"ask_price":185.1,"ask_size":100.0}}"#,
             1_777_896_600_000_u64 + idx
         );
         quote_records.push(Record {
@@ -1054,7 +1066,7 @@ async fn test_kafka_partition_polling_priority_batch_cap_and_poison_pill_offset_
             vec![Record {
                 key: Some(b"AAPL".to_vec()),
                 value: Some(
-                    br#"{"symbol":"AAPL","timeframe":"1m","bar_ts":1777896600,"open":185.0,"high":186.0,"low":184.5,"close":185.5,"volume":42000.0,"version":1,"is_synthetic":false,"is_suspect_spike":false}"#
+                    br#"{"schema_version":1,"symbol":"AAPL","timeframe":"1m","bar_ts":1777896600,"open":185.0,"high":186.0,"low":184.5,"close":185.5,"volume":42000.0,"version":1,"is_synthetic":false,"is_suspect_spike":false}"#
                         .to_vec(),
                 ),
                 headers: std::collections::BTreeMap::new(),
@@ -1070,7 +1082,7 @@ async fn test_kafka_partition_polling_priority_batch_cap_and_poison_pill_offset_
             vec![Record {
                 key: Some(b"AAPL".to_vec()),
                 value: Some(
-                    br#"{"symbol":"AAPL","status_ts_ms":1777896600000,"state":"HALTED","reason":"LULD_PAUSE"}"#
+                    br#"{"schema_version":1,"symbol":"AAPL","status_ts_ms":1777896600000,"state":"HALTED","reason":"LULD_PAUSE"}"#
                         .to_vec(),
                 ),
                 headers: std::collections::BTreeMap::new(),
@@ -1118,7 +1130,7 @@ async fn test_kafka_partition_polling_priority_batch_cap_and_poison_pill_offset_
             vec![Record {
                 key: Some(b"AAPL".to_vec()),
                 value: Some(
-                    br#"{"symbol":"AAPL","status_ts_ms":1777896660000,"state":"TRADING"}"#
+                    br#"{"schema_version":1,"symbol":"AAPL","status_ts_ms":1777896660000,"state":"TRADING"}"#
                         .to_vec(),
                 ),
                 headers: std::collections::BTreeMap::new(),
@@ -1165,7 +1177,7 @@ async fn test_kafka_partition_polling_priority_batch_cap_and_poison_pill_offset_
                 Record {
                     key: Some(b"AAPL".to_vec()),
                     value: Some(
-                        br#"{"symbol":"AAPL","timeframe":"1m","bar_ts":1777896660,"open":185.5,"high":186.5,"low":185.0,"close":186.0,"volume":31000.0,"version":1,"is_synthetic":false,"is_suspect_spike":false}"#
+                        br#"{"schema_version":1,"symbol":"AAPL","timeframe":"1m","bar_ts":1777896660,"open":185.5,"high":186.5,"low":185.0,"close":186.0,"volume":31000.0,"version":1,"is_synthetic":false,"is_suspect_spike":false}"#
                             .to_vec(),
                     ),
                     headers: std::collections::BTreeMap::new(),

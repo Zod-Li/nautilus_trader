@@ -315,7 +315,34 @@ pub fn rth_day_bounds_ns(bar_open_ns: u64) -> Option<(u64, u64)> {
 /// clamping RTH `1h`/`4h`/`1d` buckets to the NYSE RTH session close (`16:00 ET` or `13:00 ET` on half-days).
 #[must_use]
 pub fn compute_rth_bar_close_ns(bar_type: &BarType, bar_open_ns: u64) -> u64 {
+    compute_rth_bar_close_ns_with_bounds(bar_type, bar_open_ns, None)
+}
+
+/// Computes the canonical bar-close timestamp (`ts_event`) using authoritative `:8012 calendar-service`
+/// `(rth_open_ns, rth_close_ns)` bounds when supplied (`Some(...)`), falling back to `rth_day_bounds_ns`
+/// only when `session_bounds` is `None` (historical multi-year ClickHouse batch decoding).
+#[must_use]
+pub fn compute_rth_bar_close_ns_with_bounds(
+    bar_type: &BarType,
+    bar_open_ns: u64,
+    session_bounds: Option<(u64, u64)>,
+) -> u64 {
     let step_ns = timeframe_step_ns(bar_type);
+    if let Some((rth_open_ns, rth_close_ns)) = session_bounds
+        && rth_close_ns > rth_open_ns
+    {
+        if step_ns == 86_400_000_000_000 {
+            return rth_close_ns;
+        }
+        let natural_close_ns = bar_open_ns.saturating_add(step_ns);
+        if (3_600_000_000_000..=86_400_000_000_000).contains(&step_ns)
+            && bar_open_ns >= rth_open_ns
+            && bar_open_ns < rth_close_ns
+        {
+            return natural_close_ns.min(rth_close_ns);
+        }
+        return natural_close_ns;
+    }
     if step_ns == 86_400_000_000_000
         && let Ok(ts) = jiff::Timestamp::from_nanosecond(i128::from(bar_open_ns))
     {
@@ -353,11 +380,28 @@ pub fn compute_rth_bar_close_ns(bar_type: &BarType, bar_open_ns: u64) -> u64 {
 /// handling RTH-clamped `1h`/`4h`/`1d` bars accurately.
 #[must_use]
 pub fn compute_rth_bar_open_ns(bar_type: &BarType, bar_close_ns: u64) -> u64 {
+    compute_rth_bar_open_ns_with_bounds(bar_type, bar_close_ns, None)
+}
+
+/// Reverses [`compute_rth_bar_close_ns_with_bounds`] using authoritative `:8012 calendar-service`
+/// `(rth_open_ns, rth_close_ns)` bounds when available.
+#[must_use]
+pub fn compute_rth_bar_open_ns_with_bounds(
+    bar_type: &BarType,
+    bar_close_ns: u64,
+    session_bounds: Option<(u64, u64)>,
+) -> u64 {
     let step_ns = timeframe_step_ns(bar_type);
+    let resolved_bounds = session_bounds.or_else(|| {
+        if bar_close_ns > 0 {
+            rth_day_bounds_ns(bar_close_ns.saturating_sub(1))
+        } else {
+            None
+        }
+    });
     if (3_600_000_000_000..=86_400_000_000_000).contains(&step_ns)
         && bar_close_ns > 0
-        && let Some((rth_open_ns, rth_close_ns)) =
-            rth_day_bounds_ns(bar_close_ns.saturating_sub(1))
+        && let Some((rth_open_ns, rth_close_ns)) = resolved_bounds
         && bar_close_ns == rth_close_ns
         && rth_close_ns > rth_open_ns
     {

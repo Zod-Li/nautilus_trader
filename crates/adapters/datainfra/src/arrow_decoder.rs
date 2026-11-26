@@ -274,10 +274,15 @@ pub fn decode_bars_batches(
             let close_f64 = extract_f64_at(close_col, row, primary_close)?;
             let vol_f64 = extract_f64_at(vol_col, row, primary_vol)?;
 
-            let open = f64_to_price(open_f64, options.price_precision, "open")?;
-            let high = f64_to_price(high_f64, options.price_precision, "high")?;
-            let low = f64_to_price(low_f64, options.price_precision, "low")?;
-            let close = f64_to_price(close_f64, options.price_precision, "close")?;
+            let ref_px = low_f64.min(close_f64);
+            let eff_price_prec = crate::stream::resolve_sec_rule_612_price_precision(
+                ref_px,
+                options.price_precision,
+            );
+            let open = f64_to_price(open_f64, eff_price_prec, "open")?;
+            let high = f64_to_price(high_f64, eff_price_prec, "high")?;
+            let low = f64_to_price(low_f64, eff_price_prec, "low")?;
+            let close = f64_to_price(close_f64, eff_price_prec, "close")?;
             let volume = f64_to_quantity(vol_f64, options.size_precision, "volume")?;
 
             let bar = Bar::new_checked(
@@ -385,8 +390,12 @@ pub fn decode_quotes_batches(
                 )));
             }
 
-            let bid_price = f64_to_price(bid_f64, options.price_precision, "bid_price")?;
-            let ask_price = f64_to_price(ask_f64, options.price_precision, "ask_price")?;
+            let eff_price_prec = crate::stream::resolve_sec_rule_612_price_precision(
+                bid_f64.min(ask_f64),
+                options.price_precision,
+            );
+            let bid_price = f64_to_price(bid_f64, eff_price_prec, "bid_price")?;
+            let ask_price = f64_to_price(ask_f64, eff_price_prec, "ask_price")?;
             let bid_size = f64_to_quantity(bid_sz_f64, options.size_precision, "bid_size")?;
             let ask_size = f64_to_quantity(ask_sz_f64, options.size_precision, "ask_size")?;
 

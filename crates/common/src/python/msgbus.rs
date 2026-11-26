@@ -31,8 +31,12 @@ use nautilus_core::{
     UUID4,
     python::{to_pyruntime_err, to_pytype_err, to_pyvalue_err},
 };
-use nautilus_model::identifiers::TraderId;
-use pyo3::{Py, Python, prelude::*, types::PyBytes};
+use nautilus_model::{
+    events::{AccountState, OrderEventAny, PositionEvent},
+    identifiers::TraderId,
+    python::events::{order::order_event_to_pyobject, position::position_event_to_pyobject},
+};
+use pyo3::{IntoPyObjectExt, Py, Python, prelude::*, types::PyBytes};
 use ustr::Ustr;
 
 use crate::{
@@ -826,6 +830,83 @@ pub struct PyMessageBusScope {
     clearing: Cell<bool>,
 }
 
+macro_rules! impl_scoped_typed_subscription {
+    (
+        $sub_fn:ident,
+        $unsub_fn:ident,
+        $sub_doc:literal,
+        $unsub_doc:literal,
+        $variant:ident,
+        $handler_ty:ident,
+        $event_ty:ty,
+        $id_prefix:literal,
+        $api_sub:path,
+        $api_unsub:path
+    ) => {
+        #[doc = $sub_doc]
+        pub fn $sub_fn(
+            &self,
+            py: Python<'_>,
+            topic: &str,
+            handler: Py<PyAny>,
+            priority: u32,
+        ) -> PyResult<()> {
+            let pattern = MStr::<Pattern>::pattern_checked(topic).map_err(to_pyvalue_err)?;
+            let identity = CallableIdentity::new(handler.bind(py))?;
+            self.active_bus()?;
+
+            if self.subscriptions.borrow().iter().any(|sub| {
+                sub.pattern == pattern
+                    && sub.identity == identity
+                    && matches!(sub.handler, ScopedTypedHandler::$variant(_))
+            }) {
+                return Ok(());
+            }
+
+            let id = format!(concat!($id_prefix, ":{}"), UUID4::new()).into();
+            let typed = TypedHandler(
+                Rc::new($handler_ty::with_id(id, handler)) as Rc<dyn Handler<$event_ty>>
+            );
+            $api_sub(pattern, typed.clone(), Some(priority));
+
+            self.subscriptions.borrow_mut().push(ScopedSubscription {
+                pattern,
+                identity,
+                handler: ScopedTypedHandler::$variant(typed),
+            });
+
+            Ok(())
+        }
+
+        #[doc = $unsub_doc]
+        pub fn $unsub_fn(&self, topic: &str, handler: &Bound<'_, PyAny>) -> PyResult<()> {
+            let pattern = MStr::<Pattern>::pattern_checked(topic).map_err(to_pyvalue_err)?;
+            let identity = CallableIdentity::new(handler)?;
+            self.active_bus()?;
+
+            let removed = {
+                let mut subscriptions = self.subscriptions.borrow_mut();
+                subscriptions
+                    .iter()
+                    .position(|sub| {
+                        sub.pattern == pattern
+                            && sub.identity == identity
+                            && matches!(sub.handler, ScopedTypedHandler::$variant(_))
+                    })
+                    .map(|index| subscriptions.remove(index))
+            };
+
+            if let Some(sub) = removed
+                && let ScopedTypedHandler::$variant(h) = sub.handler
+            {
+                $api_unsub(sub.pattern, &h);
+            }
+
+            Ok(())
+        }
+    };
+}
+
 impl PyMessageBusScope {
     pub(crate) fn register(&self) {
         *self.bus.borrow_mut() =
@@ -874,7 +955,11 @@ impl PyMessageBusScope {
             .subscriptions
             .borrow()
             .iter()
-            .any(|sub| sub.pattern == pattern && sub.identity == identity)
+            .any(|sub| {
+                sub.pattern == pattern
+                    && sub.identity == identity
+                    && matches!(sub.handler, ScopedTypedHandler::Any(_))
+            })
         {
             return Ok(());
         }
@@ -888,7 +973,7 @@ impl PyMessageBusScope {
         self.subscriptions.borrow_mut().push(ScopedSubscription {
             pattern,
             identity,
-            handler,
+            handler: ScopedTypedHandler::Any(handler),
         });
 
         Ok(())
@@ -912,16 +997,61 @@ impl PyMessageBusScope {
             let mut subscriptions = self.subscriptions.borrow_mut();
             subscriptions
                 .iter()
-                .position(|sub| sub.pattern == pattern && sub.identity == identity)
+                .position(|sub| {
+                    sub.pattern == pattern
+                        && sub.identity == identity
+                        && matches!(sub.handler, ScopedTypedHandler::Any(_))
+                })
                 .map(|index| subscriptions.remove(index))
         };
 
-        if let Some(sub) = removed {
-            bus.borrow_mut().unsubscribe_any(sub.pattern, &sub.handler);
+        if let Some(sub) = removed
+            && let ScopedTypedHandler::Any(h) = sub.handler
+        {
+            bus.borrow_mut().unsubscribe_any(sub.pattern, &h);
         }
 
         Ok(())
     }
+
+    impl_scoped_typed_subscription!(
+        subscribe_order_events,
+        unsubscribe_order_events,
+        "Subscribes a Python callable to strongly-typed `OrderEventAny` updates on `topic`.",
+        "Removes this component's typed `OrderEventAny` subscription.",
+        OrderEvent,
+        PyOrderEventHandler,
+        OrderEventAny,
+        "python-component-order",
+        msgbus_api::subscribe_order_events,
+        msgbus_api::unsubscribe_order_events
+    );
+
+    impl_scoped_typed_subscription!(
+        subscribe_position_events,
+        unsubscribe_position_events,
+        "Subscribes a Python callable to strongly-typed `PositionEvent` updates on `topic`.",
+        "Removes this component's typed `PositionEvent` subscription.",
+        PositionEvent,
+        PyPositionEventHandler,
+        PositionEvent,
+        "python-component-position",
+        msgbus_api::subscribe_position_events,
+        msgbus_api::unsubscribe_position_events
+    );
+
+    impl_scoped_typed_subscription!(
+        subscribe_account_state,
+        unsubscribe_account_state,
+        "Subscribes a Python callable to strongly-typed `AccountState` updates on `topic`.",
+        "Removes this component's typed `AccountState` subscription.",
+        AccountState,
+        PyAccountStateHandler,
+        AccountState,
+        "python-component-account",
+        msgbus_api::subscribe_account_state,
+        msgbus_api::unsubscribe_account_state
+    );
 
     pub(crate) fn invalidate(&self) {
         *self.bus.borrow_mut() = Weak::new();
@@ -937,7 +1067,18 @@ impl PyMessageBusScope {
         if let Some(bus) = self.bus.borrow().upgrade() {
             let mut bus = bus.borrow_mut();
             for sub in &subscriptions {
-                bus.unsubscribe_any(sub.pattern, &sub.handler);
+                match &sub.handler {
+                    ScopedTypedHandler::Any(h) => bus.unsubscribe_any(sub.pattern, h),
+                    ScopedTypedHandler::OrderEvent(h) => {
+                        bus.router_order_events.unsubscribe(sub.pattern, h);
+                    }
+                    ScopedTypedHandler::PositionEvent(h) => {
+                        bus.router_position_events.unsubscribe(sub.pattern, h);
+                    }
+                    ScopedTypedHandler::AccountState(h) => {
+                        bus.router_account_state.unsubscribe(sub.pattern, h);
+                    }
+                }
             }
         }
 
@@ -968,11 +1109,81 @@ impl PyMessageBusScope {
     }
 }
 
+macro_rules! define_typed_py_handler {
+    ($struct_name:ident, $event_ty:ty, $convert_fn:expr) => {
+        pub struct $struct_name {
+            id: Ustr,
+            callable: Py<PyAny>,
+        }
+
+        impl Debug for $struct_name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.debug_struct(stringify!($struct_name))
+                    .field("id", &self.id)
+                    .finish()
+            }
+        }
+
+        impl $struct_name {
+            pub(crate) fn with_id(id: Ustr, callable: Py<PyAny>) -> Self {
+                Self { id, callable }
+            }
+        }
+
+        impl Handler<$event_ty> for $struct_name {
+            fn id(&self) -> Ustr {
+                self.id
+            }
+
+            fn handle(&self, message: &$event_ty) {
+                Python::attach(|py| match ($convert_fn)(py, message) {
+                    Ok(py_obj) => {
+                        if let Err(e) = self.callable.call1(py, (py_obj,)) {
+                            log::error!("Python typed event handler {} failed: {e}", self.id);
+                        }
+                    }
+                    Err(e) => {
+                        log::error!(
+                            "Failed converting {} for Python handler {}: {e}",
+                            stringify!($event_ty),
+                            self.id
+                        );
+                    }
+                });
+            }
+        }
+    };
+}
+
+define_typed_py_handler!(
+    PyOrderEventHandler,
+    OrderEventAny,
+    |py: Python<'_>, ev: &OrderEventAny| order_event_to_pyobject(py, ev.clone())
+);
+define_typed_py_handler!(
+    PyPositionEventHandler,
+    PositionEvent,
+    |py: Python<'_>, ev: &PositionEvent| position_event_to_pyobject(py, ev.clone())
+);
+define_typed_py_handler!(
+    PyAccountStateHandler,
+    AccountState,
+    |py: Python<'_>, ev: &AccountState| ev.clone().into_py_any(py)
+);
+
+#[derive(Debug)]
+enum ScopedTypedHandler {
+    Any(ShareableMessageHandler),
+    OrderEvent(TypedHandler<OrderEventAny>),
+    PositionEvent(TypedHandler<PositionEvent>),
+    AccountState(TypedHandler<AccountState>),
+}
+
 #[derive(Debug)]
 struct ScopedSubscription {
     pattern: MStr<Pattern>,
     identity: CallableIdentity,
-    handler: ShareableMessageHandler,
+    handler: ScopedTypedHandler,
 }
 
 #[derive(Debug, PartialEq, Eq)]

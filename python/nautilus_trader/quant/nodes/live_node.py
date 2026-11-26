@@ -368,6 +368,7 @@ class SipFeederSubscriptionClient:
         *,
         timeout_secs: float = 5.0,
         max_retries: int = 2,
+        require_configured: bool = False,
     ) -> None:
         resolved = (
             str(base_url).strip()
@@ -377,6 +378,7 @@ class SipFeederSubscriptionClient:
         self._base_url = resolved.rstrip("/")
         self._timeout_secs = max(0.5, float(timeout_secs))
         self._max_retries = max(0, int(max_retries))
+        self._require_configured = bool(require_configured)
 
     @property
     def base_url(self) -> str:
@@ -442,6 +444,10 @@ class SipFeederSubscriptionClient:
             s for s in self.normalize_symbols(remove_symbols) if s not in active_set
         ]
         if not self.is_configured:
+            if self._require_configured:
+                raise RuntimeError(
+                    "SIP_FEEDER_URL is required in live/paper mode (fail-closed)"
+                )
             return {
                 "status": "SKIPPED_UNCONFIGURED",
                 "added": active_list,
@@ -460,6 +466,139 @@ class SipFeederSubscriptionClient:
             "added_view": added_view,
             "removed_view": removed_view,
         }
+
+
+def _record_live_node_critical_alert(
+    dsn: Optional[str],
+    *,
+    event_type: str,
+    title: str,
+    body: str,
+    payload: Mapping[str, Any],
+    dedup_key: str,
+) -> None:
+    dsn_str = str(dsn or "").strip()
+    if not dsn_str.startswith(("postgresql://", "postgres://")):
+        return
+    try:
+        import psycopg2
+
+        with psycopg2.connect(dsn_str, connect_timeout=2) as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO alert_outbox (event_type, severity, source, title, body, payload, dedup_key)
+                VALUES (%s, 'CRITICAL', 'nautilus:live_node', %s, %s, %s::jsonb, %s)
+                """,
+                (event_type, title, body, json.dumps(dict(payload)), dedup_key),
+            )
+    except Exception as exc:
+        logger.error("Failed persisting %s alert into alert_outbox: %s", event_type, exc)
+
+
+def verify_rust_live_node_contract(node: Any) -> Any:
+    """Verify the target runtime node exposes a compiled cache supporting instrument registration.
+
+    Returns `None` if `.cache` is absent or moved out by an active `LiveNode.run_async()` loop.
+    """
+    try:
+        cache_obj = getattr(node, "cache", None)
+    except RuntimeError:
+        return None
+    if cache_obj is None:
+        return None
+    if not callable(getattr(cache_obj, "add_instrument", None)) or not callable(
+        getattr(cache_obj, "instrument", None)
+    ):
+        raise RuntimeError(
+            f"Rust Cache contract violated on {type(cache_obj).__name__}: "
+            "missing callable add_instrument() or instrument()"
+        )
+    return cache_obj
+
+
+def verify_plan_instruments_ready(
+    cache_obj: Any,
+    items: Sequence[PlanItemContract],
+    resolved_instruments: Mapping[str, "ResolvedInstrumentEntry"],
+    *,
+    pg_backend: Optional[Any] = None,
+    dsn: Optional[str] = None,
+    trading_date: Optional[date] = None,
+    venue: str = "ALPACA",
+) -> None:
+    """Register all resolved plan instruments into Rust `PyCache` and read-back verify every item (fail-closed)."""
+    if cache_obj is None:
+        if items or any(getattr(entry, "instrument", None) is not None for entry in resolved_instruments.values()):
+            msg = "LIVE_NODE_INSTRUMENT_CACHE_UNREADY: node.cache is None"
+            if pg_backend is not None and callable(getattr(pg_backend, "set_entry_freeze", None)):
+                pg_backend.set_entry_freeze(True, reason=msg, updated_by="nautilus:readiness_gate")
+            _record_live_node_critical_alert(
+                dsn,
+                event_type="LIVE_NODE_INSTRUMENT_CACHE_UNREADY",
+                title="LiveNode Startup Readiness Gate Failed (cache=None)",
+                body=msg,
+                payload={"trading_date": trading_date.isoformat() if trading_date else None},
+                dedup_key=f"LIVE_NODE_INSTRUMENT_CACHE_UNREADY:{trading_date.isoformat() if trading_date else 'na'}",
+            )
+            raise RuntimeError(msg)
+        return
+
+    try:
+        if not callable(getattr(cache_obj, "add_instrument", None)) or not callable(
+            getattr(cache_obj, "instrument", None)
+        ):
+            raise RuntimeError(
+                f"Rust PyCache contract missing add_instrument/instrument on {type(cache_obj).__name__}"
+            )
+        for entry in resolved_instruments.values():
+            inst = getattr(entry, "instrument", None)
+            if inst is not None:
+                add_currency = getattr(cache_obj, "add_currency", None)
+                quote_ccy = getattr(inst, "quote_currency", None)
+                if callable(add_currency) and quote_ccy is not None:
+                    cache_obj.add_currency(quote_ccy)
+                cache_obj.add_instrument(inst)
+
+        missing_ids: List[str] = []
+        for item in items:
+            sym = str(getattr(item, "symbol", "") or "").strip().upper()
+            if not sym:
+                continue
+            entry = resolved_instruments.get(sym)
+            inst_obj = getattr(entry, "instrument", None) if entry is not None else None
+            inst_id = getattr(inst_obj, "id", None) if inst_obj is not None else InstrumentId.from_str(f"{sym}.{venue}")
+            cached_inst = cache_obj.instrument(inst_id)
+            if cached_inst is None:
+                missing_ids.append(str(inst_id))
+        if missing_ids:
+            raise RuntimeError(
+                f"Instrument read-back verification failed for Cache: missing {missing_ids}"
+            )
+    except Exception as exc:
+        msg = f"LIVE_NODE_INSTRUMENT_CACHE_UNREADY: {exc}"
+        logger.critical("%s", msg, exc_info=True)
+        if pg_backend is not None and callable(getattr(pg_backend, "set_entry_freeze", None)):
+            try:
+                pg_backend.set_entry_freeze(
+                    True,
+                    reason=msg,
+                    updated_by="nautilus:readiness_gate",
+                )
+            except Exception as freeze_exc:
+                logger.error("Failed latching ENTRY_FREEZE after readiness gate failure: %s", freeze_exc)
+        _record_live_node_critical_alert(
+            dsn,
+            event_type="LIVE_NODE_INSTRUMENT_CACHE_UNREADY",
+            title="LiveNode Instrument Cache Readiness Gate Failed",
+            body=msg,
+            payload={
+                "trading_date": trading_date.isoformat() if trading_date else None,
+                "symbols": [str(i.symbol) for i in items],
+                "error": str(exc),
+            },
+            dedup_key=f"LIVE_NODE_INSTRUMENT_CACHE_UNREADY:{trading_date.isoformat() if trading_date else 'na'}",
+        )
+        raise RuntimeError(msg) from exc
 
 
 @dataclass(frozen=True)
@@ -785,6 +924,7 @@ class NautilusLiveNodeAssembler:
         fee_schedule: Optional[IbkrProFeeSchedule] = None,
         instrument_loader: Optional[Callable[..., List[Equity]]] = None,
         resolve_instruments_via_alpaca: Optional[bool] = None,
+        require_sip_feeder_configured: Optional[bool] = None,
     ) -> None:
         resolved_mode = resolve_trading_mode()
         self._dsn = resolve_database_dsn(dsn)
@@ -827,7 +967,12 @@ class NautilusLiveNodeAssembler:
             else bool(historical_bar_loader is not None)
         )
         self._sip_feeder_client = sip_feeder_client or SipFeederSubscriptionClient(
-            base_url=sip_feeder_url
+            base_url=sip_feeder_url,
+            require_configured=(
+                bool(require_sip_feeder_configured)
+                if require_sip_feeder_configured is not None
+                else False
+            ),
         )
         self._system_config = system_config
         self._fee_schedule = fee_schedule or IbkrProFeeSchedule()
@@ -1148,6 +1293,18 @@ class NautilusLiveNodeAssembler:
                     )
                 except Exception:
                     pass
+            _record_live_node_critical_alert(
+                self._dsn,
+                event_type="SIP_FEEDER_SUBSCRIPTION_SYNC_FAILED",
+                title="sip-feeder Subscription Synchronization Failed",
+                body=f"SIP_FEEDER_SUBSCRIPTION_SYNC_FAILED: {exc}",
+                payload={
+                    "active_symbols": list(active_symbols),
+                    "remove_symbols": list(remove_symbols),
+                    "error": str(exc),
+                },
+                dedup_key="SIP_FEEDER_SUBSCRIPTION_SYNC_FAILED:startup",
+            )
             return {
                 "status": "ERROR",
                 "error": str(exc),
@@ -1475,19 +1632,6 @@ class NautilusLiveNodeAssembler:
         telemetry_actor: Optional[PostgresTelemetryActor] = None
         pg_backend: Optional[PostgresPlanGateBackend] = None
         try:
-            cache_obj = getattr(node, "cache", None)
-            if cache_obj is not None and hasattr(cache_obj, "add_instrument"):
-                for entry in resolved_instruments.values():
-                    if entry.instrument is not None:
-                        try:
-                            cache_obj.add_instrument(entry.instrument)
-                        except Exception as cache_exc:
-                            logger.warning(
-                                "Failed adding resolved instrument %s to node cache: %s",
-                                entry.symbol,
-                                cache_exc,
-                            )
-
             env_label = "LIVE" if self._environment == Environment.LIVE else "PAPER"
             pg_backend = (
                 plan_gate_backend
@@ -1497,6 +1641,16 @@ class NautilusLiveNodeAssembler:
                     trading_date=td,
                     market=self._market,
                 )
+            )
+            cache_obj = verify_rust_live_node_contract(node)
+            verify_plan_instruments_ready(
+                cache_obj,
+                active_items,
+                resolved_instruments,
+                pg_backend=pg_backend,
+                dsn=self._dsn,
+                trading_date=td,
+                venue=str(getattr(self._datainfra_config, "default_venue", "ALPACA") or "ALPACA"),
             )
             node.set_pre_trade_risk_gate(pg_backend.as_pre_trade_risk_gate())
 
@@ -1550,6 +1704,10 @@ class NautilusLiveNodeAssembler:
                     persist_to_db=bool(persist_telemetry_to_db),
                     enforce_protective_oco_on_position_events=bool(
                         enforce_protective_oco_on_position_events
+                    ),
+                    kafka_brokers=os.environ.get("KAFKA_BROKERS", "").strip() or None,
+                    kafka_execution_topic=os.environ.get(
+                        "KAFKA_EXECUTION_TOPIC", "exec.nautilus.events"
                     ),
                 ),
                 oco_monitor=oco_monitor,
@@ -1884,6 +2042,9 @@ class DailyPlanReconciler:
         self._owner_thread_id: int = threading.get_ident()
         self._event_loop: Optional[asyncio.AbstractEventLoop] = None
         self._pending_node_strategies: List[BaseArchetypeStrategy] = []
+        self._pending_cache_instruments: List[
+            Tuple[Sequence[PlanItemContract], Mapping[str, ResolvedInstrumentEntry], date]
+        ] = []
         self._deferred_sip_sync_args: Optional[Tuple[List[str], List[str]]] = None
         self._deferred_reload_stop: bool = False
         self._defer_reload_stop_during_reconcile: bool = False
@@ -1906,6 +2067,7 @@ class DailyPlanReconciler:
         self._assembler = None
         self._event_loop = None
         self._pending_node_strategies.clear()
+        self._pending_cache_instruments.clear()
         self._deferred_sip_sync_args = None
         self._deferred_reload_stop = False
         self._defer_reload_stop_during_reconcile = False
@@ -2023,6 +2185,19 @@ class DailyPlanReconciler:
                 except Exception:
                     pass
         if self._is_owner_thread() and self._node is not None:
+            while self._pending_cache_instruments:
+                p_items, p_resolved, p_td = self._pending_cache_instruments.pop(0)
+                cache_obj = self._node_cache or verify_rust_live_node_contract(self._node)
+                if cache_obj is not None:
+                    self._node_cache = cache_obj
+                verify_plan_instruments_ready(
+                    cache_obj,
+                    p_items,
+                    p_resolved,
+                    pg_backend=self._backend,
+                    dsn=getattr(self._assembler, "dsn", None),
+                    trading_date=p_td,
+                )
             while self._pending_node_strategies:
                 pending_strat = self._pending_node_strategies.pop(0)
                 self._mount_strategy_on_node(pending_strat)
@@ -2310,26 +2485,31 @@ class DailyPlanReconciler:
                     trading_date=trading_date,
                 )
 
-            if self._is_owner_thread() and (
-                self._node_cache is not None or self._node is not None
-            ):
-                cache_obj = self._node_cache
-                if cache_obj is None and self._node is not None:
-                    try:
-                        cache_obj = getattr(self._node, "cache", None)
-                    except (AttributeError, RuntimeError):
-                        cache_obj = None
-                if cache_obj is not None and hasattr(cache_obj, "add_instrument"):
-                    for entry in resolved_inst_map.values():
-                        if entry.instrument is not None:
-                            try:
-                                cache_obj.add_instrument(entry.instrument)
-                            except Exception as cache_exc:
-                                logger.warning(
-                                    "Failed adding resolved instrument %s to node cache during rollover: %s",
-                                    entry.symbol,
-                                    cache_exc,
-                                )
+            verifiable_items = [
+                it
+                for it in resolved_items
+                if resolved_inst_map.get(it.symbol) is None
+                or resolved_inst_map[it.symbol].status != "INSTRUMENT_UNRESOLVED"
+            ]
+            needs_cache_verification = bool(resolved_inst_map) or (
+                bool(verifiable_items) and self._assembler is not None
+            )
+            if self._is_owner_thread() and self._node is not None and needs_cache_verification:
+                live_cache = self._node_cache or verify_rust_live_node_contract(self._node)
+                if live_cache is not None:
+                    self._node_cache = live_cache
+                verify_plan_instruments_ready(
+                    live_cache,
+                    verifiable_items,
+                    resolved_inst_map,
+                    pg_backend=self._backend,
+                    dsn=getattr(self._assembler, "dsn", None),
+                    trading_date=trading_date,
+                )
+            elif not self._is_owner_thread() and self._node is not None and needs_cache_verification:
+                self._pending_cache_instruments.append(
+                    (list(verifiable_items), dict(resolved_inst_map), trading_date)
+                )
 
             vetoed_set: Set[str] = {
                 str(s).strip().upper() for s in (vetoed_symbols or ()) if str(s).strip()
@@ -2947,6 +3127,18 @@ class DailyPlanReconciler:
                     )
                 except Exception:
                     pass
+            _record_live_node_critical_alert(
+                getattr(self._assembler, "dsn", None),
+                event_type="SIP_FEEDER_SUBSCRIPTION_SYNC_FAILED",
+                title="sip-feeder Rollover Subscription Synchronization Failed",
+                body=f"SIP_FEEDER_SUBSCRIPTION_SYNC_FAILED: {exc}",
+                payload={
+                    "active_symbols": list(active_syms),
+                    "remove_symbols": list(stale_flat_syms),
+                    "error": str(exc),
+                },
+                dedup_key=f"SIP_FEEDER_SUBSCRIPTION_SYNC_FAILED:rollover:{self._trading_date.isoformat() if self._trading_date else 'na'}",
+            )
             return {
                 "status": "ERROR",
                 "error": str(exc),

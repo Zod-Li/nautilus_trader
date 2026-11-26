@@ -16,6 +16,7 @@ from datetime import date, datetime, timezone
 from decimal import Decimal
 import json
 import logging
+import os
 import queue
 import threading
 import time
@@ -53,9 +54,20 @@ except ImportError:  # pragma: no cover
 from evolution_engine.db.dsn import resolve_database_dsn
 from nautilus_trader.quant.contracts.models import PlanSide
 from nautilus_trader.quant.contracts.repository import PlanContractRepository
+from nautilus_trader.quant.contracts.time_semantics import (
+    BAR_FINALIZATION_GRACE_SECS,
+    compute_wall_clock_expiry_finalize_ns,
+)
 from nautilus_trader.quant.governance.bounded_collections import (
     _BoundedFifoDict,
     _BoundedFifoSet,
+)
+from nautilus_trader.quant.governance.execution_event_bus import (
+    DEFAULT_EXECUTION_EVENT_TOPIC,
+    ExecutionEvent,
+    ExecutionEventPublisher,
+    build_execution_event_publisher,
+    normalize_execution_event_type,
 )
 from nautilus_trader.quant.governance.plan_gate_backend import EXIT_INTENT_TAGS
 
@@ -344,6 +356,7 @@ class ProtectiveOcoMonitor:
         on_entry_freeze_callback: Optional[Callable[[str, str], None]] = None,
         *,
         persist_to_db: bool = True,
+        on_protective_event: Optional[Callable[[ProtectiveOrderCoverage, str], None]] = None,
     ) -> None:
         self._persist_to_db = bool(persist_to_db)
         self._dsn = (
@@ -359,6 +372,9 @@ class ProtectiveOcoMonitor:
             if on_entry_freeze_callback is not None
             else None
         )
+        self._on_protective_event: Optional[
+            Callable[[ProtectiveOrderCoverage, str], None]
+        ] = on_protective_event
         self._entry_freeze_callbacks: List[Any] = []
         self._positions_qty: Dict[str, Decimal] = {}
         self._unapplied_pos_reduction_by_symbol: Dict[str, Decimal] = {}
@@ -901,7 +917,27 @@ class ProtectiveOcoMonitor:
             reason=mismatch_reason,
         )
 
+    def set_protective_event_callback(
+        self,
+        callback: Optional[Callable[[ProtectiveOrderCoverage, str], None]],
+    ) -> None:
+        self._on_protective_event = callback
+
+    def _emit_protective_event(
+        self,
+        coverage: ProtectiveOrderCoverage,
+        event_type: str,
+    ) -> None:
+        cb = getattr(self, "_on_protective_event", None)
+        if not callable(cb):
+            return
+        try:
+            cb(coverage, event_type)
+        except Exception as exc:
+            logger.warning("ProtectiveOcoMonitor event callback failed: %s", exc)
+
     def _persist_protective_order(self, coverage: ProtectiveOrderCoverage) -> None:
+        self._emit_protective_event(coverage, "protective_order_updated")
         if not self._persist_to_db or self._async_writer is None:
             return
 
@@ -970,6 +1006,7 @@ class ProtectiveOcoMonitor:
         uncovered_qty: Decimal,
         reason: str,
     ) -> None:
+        self._emit_protective_event(coverage, "protective_order_missing")
         if not self._persist_to_db or self._async_writer is None:
             return
 
@@ -1091,6 +1128,8 @@ class PostgresTelemetryActorConfig(DataActorConfig):
         persist_to_db: bool = True,
         log_events: bool = True,
         log_commands: bool = True,
+        kafka_brokers: Optional[str] = None,
+        kafka_execution_topic: str = DEFAULT_EXECUTION_EVENT_TOPIC,
     ):
         resolved_id = (
             actor_id
@@ -1117,6 +1156,8 @@ class PostgresTelemetryActorConfig(DataActorConfig):
         persist_to_db: bool = True,
         log_events: bool = True,
         log_commands: bool = True,
+        kafka_brokers: Optional[str] = None,
+        kafka_execution_topic: str = DEFAULT_EXECUTION_EVENT_TOPIC,
     ) -> None:
         self.dsn = dsn
         self.broker = str(broker or "alpaca").strip().lower()
@@ -1128,6 +1169,13 @@ class PostgresTelemetryActorConfig(DataActorConfig):
             enforce_protective_oco_on_position_events
         )
         self.persist_to_db = bool(persist_to_db)
+        self.kafka_brokers = (
+            str(kafka_brokers).strip() if kafka_brokers is not None else None
+        )
+        self.kafka_execution_topic = (
+            str(kafka_execution_topic or DEFAULT_EXECUTION_EVENT_TOPIC).strip()
+            or DEFAULT_EXECUTION_EVENT_TOPIC
+        )
 
 
 _ACTIVE_TELEMETRY_ACTORS: "weakref.WeakSet[PostgresTelemetryActor]" = weakref.WeakSet()
@@ -1172,8 +1220,15 @@ class PostgresTelemetryActor(DataActor):
         plan_gate_backend: Optional[Any] = None,
         plan_repo: Optional[PlanContractRepository] = None,
         cancel_symbol_entries_callback: Optional[Callable[[str], Any]] = None,
+        execution_publisher: Optional[ExecutionEventPublisher] = None,
     ) -> "PostgresTelemetryActor":
-        _ = (oco_monitor, plan_gate_backend, plan_repo, cancel_symbol_entries_callback)
+        _ = (
+            oco_monitor,
+            plan_gate_backend,
+            plan_repo,
+            cancel_symbol_entries_callback,
+            execution_publisher,
+        )
         effective_config = config or PostgresTelemetryActorConfig()
         return super().__new__(cls, effective_config)
 
@@ -1184,6 +1239,7 @@ class PostgresTelemetryActor(DataActor):
         plan_gate_backend: Optional[Any] = None,
         plan_repo: Optional[PlanContractRepository] = None,
         cancel_symbol_entries_callback: Optional[Callable[[str], Any]] = None,
+        execution_publisher: Optional[ExecutionEventPublisher] = None,
     ) -> None:
         effective_config = config or PostgresTelemetryActorConfig()
         super().__init__(effective_config)
@@ -1236,6 +1292,8 @@ class PostgresTelemetryActor(DataActor):
         self._terminated_stop_cids: _BoundedFifoSet = _BoundedFifoSet(4096)
         self._replaced_stop_cids: _BoundedFifoSet = _BoundedFifoSet(4096)
         self._safe_exit_symbols: Set[str] = set()
+        self._pending_oco_verify_qty: Dict[str, Decimal] = {}
+        self._pending_stop_invalidation: Dict[str, Tuple[str, str]] = {}
         self._msgbus_subscriptions: List[Tuple[str, Any]] = []
         self._msgbus_bindings: List[Tuple[Any, str, Any]] = []
         self._subscribed_msgbuses: Set[int] = set()
@@ -1247,6 +1305,71 @@ class PostgresTelemetryActor(DataActor):
         self._cache_identity_bytes: bytes = str(id(self)).encode("utf-8")
         self._async_writer = self._oco_monitor._async_writer
         self._oco_monitor.add_entry_freeze_callback(self._on_oco_entry_freeze)
+        self._oco_monitor.set_protective_event_callback(self._on_oco_protective_event)
+        self._owns_execution_publisher: bool = False
+        if execution_publisher is not None:
+            self._execution_publisher: Optional[ExecutionEventPublisher] = (
+                execution_publisher
+            )
+        elif self._persist_to_db:
+            brokers_cfg = getattr(effective_config, "kafka_brokers", None)
+            topic_cfg = getattr(
+                effective_config,
+                "kafka_execution_topic",
+                DEFAULT_EXECUTION_EVENT_TOPIC,
+            )
+            self._execution_publisher = build_execution_event_publisher(
+                brokers=brokers_cfg,
+                topic=topic_cfg,
+            )
+            self._owns_execution_publisher = self._execution_publisher is not None
+        else:
+            self._execution_publisher = None
+
+    def _emit_execution_event(
+        self,
+        event_type: str,
+        symbol: str,
+        payload: Dict[str, Any],
+        event_id: str = "",
+    ) -> None:
+        pub = getattr(self, "_execution_publisher", None)
+        if pub is None:
+            return
+        try:
+            pub.publish(
+                ExecutionEvent(
+                    event_type=normalize_execution_event_type(event_type),
+                    symbol=symbol,
+                    broker=self._broker,
+                    environment=self._environment,
+                    market=self._market,
+                    payload=payload,
+                    event_id=event_id,
+                )
+            )
+        except Exception as exc:
+            logger.warning("Execution event publish failed (%s): %s", event_type, exc)
+
+    def _on_oco_protective_event(
+        self, coverage: ProtectiveOrderCoverage, event_type: str
+    ) -> None:
+        self._emit_execution_event(
+            event_type=event_type,
+            symbol=coverage.symbol,
+            payload={
+                "symbol": coverage.symbol,
+                "broker_order_id": coverage.broker_order_id,
+                "qty": float(coverage.covered_qty),
+                "stop_price": float(coverage.stop_price),
+                "take_profit_price": (
+                    float(coverage.take_profit_price)
+                    if coverage.take_profit_price is not None
+                    else None
+                ),
+                "status": coverage.status,
+            },
+        )
 
     def _on_oco_entry_freeze(self, symbol: str, reason: str) -> None:
         backend = self._plan_gate_backend
@@ -1299,6 +1422,8 @@ class PostgresTelemetryActor(DataActor):
         self._scheduled_expiry_item_ids.clear()
         self._expiry_targets_by_timer.clear()
         self._pending_expiry_by_symbol.clear()
+        self._pending_oco_verify_qty.clear()
+        self._pending_stop_invalidation.clear()
         if self._is_started:
             self.sync_plan_expiry_timers()
 
@@ -1309,6 +1434,8 @@ class PostgresTelemetryActor(DataActor):
         if not norm_sym:
             return
         self._safe_exit_symbols.add(norm_sym)
+        self._pending_oco_verify_qty.pop(norm_sym, None)
+        self._pending_stop_invalidation.pop(norm_sym, None)
         self._oco_monitor.begin_safe_exit(norm_sym)
         self._refresh_runtime_handles()
         cache = self._safe_cache()
@@ -1580,26 +1707,61 @@ class PostgresTelemetryActor(DataActor):
         if self._safe_is_registered():
             _ACTIVE_TELEMETRY_ACTORS.add(self)
             try:
-                self.subscribe_topic("events.order.*", self.on_order_event)
-                self.subscribe_topic("events.position.*", self.on_position_event)
-                try:
-                    self.subscribe_topic("events.account.*", self.on_account_state)
-                except Exception:
-                    pass
+                self.subscribe_order_events("events.order.*", self.on_order_event)
+                self.subscribe_position_events("events.position.*", self.on_position_event)
+                self.subscribe_account_state("events.account.*", self.on_account_state)
                 subscribed = True
-            except Exception:
-                pass
+            except Exception as exc:
+                reason = f"TELEMETRY_ACTOR_MSGBUS_SUBSCRIBE_FAILED: {exc}"
+                logger.critical("%s", reason, exc_info=True)
+                if self._plan_gate_backend is not None:
+                    freeze_fn = getattr(self._plan_gate_backend, "set_entry_freeze", None)
+                    if callable(freeze_fn):
+                        try:
+                            freeze_fn(
+                                True,
+                                reason=reason,
+                                updated_by="nautilus:telemetry_actor:on_start",
+                            )
+                        except Exception as freeze_exc:
+                            logger.error("Failed tripping ENTRY_FREEZE after msgbus subscribe failure: %s", freeze_exc)
+                self._record_subscribe_failure_alert(reason, exc)
+                raise
         if not subscribed:
-            try:
-                msgbus = getattr(self, "msgbus", None)
-                if msgbus is not None:
-                    self.subscribe_to_message_bus(msgbus)
-            except Exception:
-                pass
+            msgbus = getattr(self, "msgbus", None)
+            if msgbus is not None:
+                self.subscribe_to_message_bus(msgbus)
         self.sync_from_cache()
         self.reconcile_startup_reservations()
         self.sync_plan_expiry_timers()
         self._flush_backend_mutations()
+
+    def _record_subscribe_failure_alert(self, reason: str, exc: Exception) -> None:
+        dsn_str = str(getattr(self, "_dsn", "") or "").strip()
+        if not dsn_str.startswith(("postgresql://", "postgres://")):
+            return
+        try:
+            session_date = self._resolve_session_date()
+            dedup_key = f"telemetry_msgbus_subscribe_failed:{session_date.isoformat()}"
+            with psycopg2.connect(dsn_str, connect_timeout=2) as conn, conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO alert_outbox (
+                        event_type, severity, source, title, body, payload, dedup_key, status
+                    ) VALUES (
+                        'TELEMETRY_ACTOR_MSGBUS_SUBSCRIBE_FAILED', 'CRITICAL', 'nautilus:telemetry_actor',
+                        %s, %s, %s::jsonb, %s, 'PENDING'
+                    )
+                    """,
+                    (
+                        "TelemetryActor Typed MessageBus Subscription Failed",
+                        reason,
+                        json.dumps({"reason": reason, "error": str(exc)}),
+                        dedup_key,
+                    ),
+                )
+        except Exception as alert_exc:
+            logger.error("Failed persisting TELEMETRY_ACTOR_MSGBUS_SUBSCRIBE_FAILED alert: %s", alert_exc)
 
     def _flush_backend_mutations(self) -> int:
         if self._plan_gate_backend is None:
@@ -2051,10 +2213,11 @@ class PostgresTelemetryActor(DataActor):
                 continue
             valid_until = item.risk_envelope.valid_until
             valid_until_ns = int(valid_until.timestamp() * 1_000_000_000)
+            finalize_at_ns = compute_wall_clock_expiry_finalize_ns(valid_until_ns)
             timer_name = f"plan_item_expired_{item_id_str}"
             self._scheduled_expiry_item_ids.add(item_id_str)
             self._expiry_targets_by_timer[timer_name] = (sym, item.item_id, valid_until_ns)
-            if now_ns > 0 and now_ns >= valid_until_ns:
+            if now_ns > 0 and now_ns >= finalize_at_ns:
                 self._expiry_targets_by_timer.pop(timer_name, None)
                 self._handle_plan_item_expiry(sym, item.item_id, valid_until_ns)
             else:
@@ -2066,7 +2229,7 @@ class PostgresTelemetryActor(DataActor):
                 try:
                     clk.set_time_alert_ns(
                         name=timer_name,
-                        alert_time_ns=valid_until_ns,
+                        alert_time_ns=finalize_at_ns,
                         allow_past=True,
                     )
                 except Exception as exc:
@@ -2077,10 +2240,22 @@ class PostgresTelemetryActor(DataActor):
                         exc,
                     )
 
-    def _persist_item_expired(self, item_id: UUID) -> None:
+    def _persist_item_expired(
+        self,
+        item_id: UUID,
+        *,
+        valid_until_ns: Optional[int] = None,
+    ) -> None:
         if not self._persist_to_db or self._async_writer is None:
             return
         plan_repo = self._plan_repo
+        extra_payload: Optional[Dict[str, Any]] = None
+        if valid_until_ns is not None and valid_until_ns > 0:
+            extra_payload = {
+                "valid_until_ns": int(valid_until_ns),
+                "finalize_at_ns": compute_wall_clock_expiry_finalize_ns(int(valid_until_ns)),
+                "grace_secs": BAR_FINALIZATION_GRACE_SECS,
+            }
 
         def _expire_task(cur: Any) -> None:
             if plan_repo is not None:
@@ -2090,6 +2265,7 @@ class PostgresTelemetryActor(DataActor):
                     "EXPIRED",
                     actor="system:telemetry_actor",
                     reason="VALID_UNTIL_EXPIRED",
+                    extra_payload=extra_payload,
                 )
             else:
                 PlanContractRepository.update_item_status_in_tx(
@@ -2098,6 +2274,7 @@ class PostgresTelemetryActor(DataActor):
                     "EXPIRED",
                     actor="system:telemetry_actor",
                     reason="VALID_UNTIL_EXPIRED",
+                    extra_payload=extra_payload,
                 )
 
         self._async_writer.submit(_expire_task)
@@ -2208,7 +2385,7 @@ class PostgresTelemetryActor(DataActor):
             self._schedule_pending_expiry_reconcile(norm_sym)
         else:
             self._pending_expiry_by_symbol.pop(norm_sym, None)
-            self._persist_item_expired(item_id)
+            self._persist_item_expired(item_id, valid_until_ns=valid_until_ns)
 
     def _schedule_pending_expiry_reconcile(self, symbol: str) -> None:
         norm_sym = _normalize_symbol(symbol)
@@ -2270,7 +2447,7 @@ class PostgresTelemetryActor(DataActor):
         if not norm_sym or norm_sym not in self._pending_expiry_by_symbol:
             return
         if self._count_open_entry_leaves_in_cache(norm_sym) == 0:
-            item_id, _ = self._pending_expiry_by_symbol.pop(norm_sym)
+            item_id, vu_ns = self._pending_expiry_by_symbol.pop(norm_sym)
             clk = self._safe_clock()
             if clk is not None:
                 rec_name = f"plan_expiry_reconcile_{norm_sym}"
@@ -2279,7 +2456,7 @@ class PostgresTelemetryActor(DataActor):
                         clk.cancel_timer(rec_name)
                 except Exception:
                     pass
-            self._persist_item_expired(item_id)
+            self._persist_item_expired(item_id, valid_until_ns=vu_ns)
 
     def flush(self, timeout_secs: float = 5.0) -> None:
         self.sync_from_cache()
@@ -2348,28 +2525,40 @@ class PostgresTelemetryActor(DataActor):
         self._opened_position_ids.clear()
 
     def on_stop(self) -> None:
+        pending_syms = sorted(
+            set(self._pending_oco_verify_qty.keys())
+            | set(self._pending_stop_invalidation.keys())
+        )
+        for pend_sym in pending_syms:
+            self._verify_pending_oco_for_symbol(pend_sym)
         self._is_started = False
         _ACTIVE_TELEMETRY_ACTORS.discard(self)
         self._cancel_expiry_timers()
         if self._safe_is_registered():
-            try:
-                self.unsubscribe_topic("events.order.*", self.on_order_event)
-            except Exception:
-                pass
-            try:
-                self.unsubscribe_topic("events.position.*", self.on_position_event)
-            except Exception:
-                pass
-            try:
-                self.unsubscribe_topic("events.account.*", self.on_account_state)
-            except Exception:
-                pass
+            for unsub_fn, topic, handler in (
+                (self.unsubscribe_order_events, "events.order.*", self.on_order_event),
+                (self.unsubscribe_position_events, "events.position.*", self.on_position_event),
+                (self.unsubscribe_account_state, "events.account.*", self.on_account_state),
+            ):
+                try:
+                    unsub_fn(topic, handler)
+                except Exception as exc:
+                    logger.warning("Failed unsubscribing %s on stop: %s", topic, exc)
         self._unsubscribe_message_buses()
         self.flush(timeout_secs=2.0)
+        if getattr(self, "_owns_execution_publisher", False) and getattr(
+            self, "_execution_publisher", None
+        ) is not None:
+            try:
+                self._execution_publisher.close(timeout_secs=2.0)  # type: ignore[union-attr]
+            except Exception as exc:
+                logger.warning("Failed closing execution publisher on stop: %s", exc)
 
     def on_reset(self) -> None:
         self._is_started = False
         _ACTIVE_TELEMETRY_ACTORS.discard(self)
+        self._pending_oco_verify_qty.clear()
+        self._pending_stop_invalidation.clear()
         self._cancel_expiry_timers()
 
     def on_dispose(self) -> None:
@@ -2397,20 +2586,29 @@ class PostgresTelemetryActor(DataActor):
         self._cancel_symbol_entries_callback = None
         self._plan_gate_backend = None
         self._plan_repo = None
+        if getattr(self, "_owns_execution_publisher", False) and getattr(
+            self, "_execution_publisher", None
+        ) is not None:
+            try:
+                self._execution_publisher.close(timeout_secs=2.0)  # type: ignore[union-attr]
+            except Exception:
+                pass
         self._msgbus_subscriptions.clear()
         self._subscribed_msgbuses.clear()
         self._clear_runtime_collections()
 
-    def close(self) -> None:
+    def close(self, *, _from_gc: bool = False) -> None:
         self._is_started = False
         _ACTIVE_TELEMETRY_ACTORS.discard(self)
-        if self._is_owner_thread():
+        if not _from_gc and self._is_owner_thread():
             self.flush(timeout_secs=2.0)
             self._cancel_expiry_timers()
             self._unsubscribe_message_buses()
             self._cached_cache = None
             self._cached_clock = None
         else:
+            self._cached_cache = None
+            self._cached_clock = None
             if self._async_writer is not None:
                 try:
                     self._async_writer.flush(timeout_secs=2.0)
@@ -2429,15 +2627,20 @@ class PostgresTelemetryActor(DataActor):
         self._cancel_symbol_entries_callback = None
         self._plan_gate_backend = None
         self._plan_repo = None
+        if getattr(self, "_owns_execution_publisher", False) and getattr(
+            self, "_execution_publisher", None
+        ) is not None:
+            try:
+                self._execution_publisher.close(timeout_secs=2.0)  # type: ignore[union-attr]
+            except Exception:
+                pass
         self._msgbus_subscriptions.clear()
         self._subscribed_msgbuses.clear()
         self._clear_runtime_collections()
 
     def __del__(self) -> None:
-        if not self._is_owner_thread():
-            return
         try:
-            self.close()
+            self.close(_from_gc=True)
         except Exception:
             pass
 
@@ -2447,8 +2650,108 @@ class PostgresTelemetryActor(DataActor):
     def on_quote(self, quote: Any) -> None:
         _ = quote
 
+    def _schedule_oco_verify_timer(self, symbol: str, qty: Decimal, event_ts_ns: int = 0) -> bool:
+        """Defers protective OCO check by 1ns so same-tick `Strategy.on_order_filled` can submit stops first."""
+        norm_sym = _normalize_symbol(symbol)
+        if not norm_sym:
+            return False
+        clk = self._safe_clock()
+        if clk is None or not hasattr(clk, "set_time_alert_ns"):
+            return False
+        now_ns = int(event_ts_ns or 0)
+        if now_ns <= 0:
+            try:
+                now_ns = int(clk.timestamp_ns() or 0)
+            except Exception:
+                now_ns = 0
+        if now_ns <= 0:
+            return False
+        self._pending_oco_verify_qty[norm_sym] = qty
+        timer_name = f"oco_verify_{norm_sym}"
+        try:
+            if hasattr(clk, "timer_exists") and clk.timer_exists(timer_name):
+                clk.cancel_timer(timer_name)
+        except Exception:
+            pass
+        try:
+            clk.set_time_alert_ns(
+                name=timer_name,
+                alert_time_ns=now_ns + 1,
+                allow_past=True,
+            )
+            return True
+        except Exception:
+            self._pending_oco_verify_qty.pop(norm_sym, None)
+            return False
+
+    def _has_open_reduce_only_exit_for_symbol(self, symbol: str) -> bool:
+        norm_sym = _normalize_symbol(symbol)
+        if not norm_sym:
+            return False
+        cache = self._safe_cache()
+        if cache is None:
+            return False
+        try:
+            open_fn = getattr(cache, "orders_open", None) or getattr(cache, "orders", None)
+            orders = open_fn() if callable(open_fn) else []
+        except Exception:
+            return False
+        for order in orders or []:
+            if _normalize_symbol(getattr(order, "instrument_id", "")) != norm_sym:
+                continue
+            if bool(getattr(order, "is_closed", False)):
+                continue
+            meta = self._cache_order_metadata(order)
+            if _is_protective_stop_meta(meta):
+                continue
+            intent_val = str(meta.get("intent") or "").strip().upper()
+            if bool(meta.get("is_reduce_only", False)) or intent_val in EXIT_INTENT_TAGS:
+                return True
+        return False
+
+    def _verify_pending_oco_for_symbol(self, symbol: str) -> None:
+        norm_sym = _normalize_symbol(symbol)
+        if not norm_sym:
+            return
+        pending_qty = self._pending_oco_verify_qty.pop(norm_sym, None)
+        pending_inv = self._pending_stop_invalidation.pop(norm_sym, None)
+        if pending_qty is None and pending_inv is None:
+            return
+        if self.is_safe_exit_active(norm_sym):
+            return
+        open_qty = self._sync_open_position_qty_from_cache(norm_sym)
+        if open_qty <= Decimal("0"):
+            return
+        self._sync_protective_orders_from_cache(norm_sym)
+        cov = self._oco_monitor.get_coverage(norm_sym)
+        already_covered = (
+            cov is not None
+            and cov.status in ("ACTIVE", "REPLACING")
+            and bool(str(cov.broker_order_id or "").strip())
+            and cov.covered_qty >= open_qty
+            and cov.stop_price > Decimal("0")
+        )
+        if already_covered:
+            self._oco_monitor.verify_position_coverage(symbol=norm_sym, pos_qty=open_qty)
+            self._flush_backend_mutations()
+            return
+        if self._has_open_reduce_only_exit_for_symbol(norm_sym):
+            return
+        if pending_inv is not None:
+            self._oco_monitor.invalidate_protective_order(
+                symbol=norm_sym,
+                broker_order_id=pending_inv[0],
+                reason=pending_inv[1],
+            )
+        else:
+            self._oco_monitor.verify_position_coverage(symbol=norm_sym, pos_qty=open_qty)
+        self._flush_backend_mutations()
+
     def on_time_event(self, event: Any) -> None:
         timer_name = str(getattr(event, "name", "") or "")
+        if timer_name.startswith("oco_verify_"):
+            self._verify_pending_oco_for_symbol(timer_name[len("oco_verify_"):])
+            return
         if timer_name in self._expiry_targets_by_timer:
             sym, item_id, vu_ns = self._expiry_targets_by_timer.pop(timer_name)
             self._handle_plan_item_expiry(sym, item_id, vu_ns)
@@ -2456,7 +2759,7 @@ class PostgresTelemetryActor(DataActor):
         now_ns = int(getattr(event, "ts_event", 0) or (clk.timestamp_ns() if clk else 0) or 0)
         if now_ns > 0 and self._expiry_targets_by_timer:
             for t_name, (sym, item_id, vu_ns) in list(self._expiry_targets_by_timer.items()):
-                if now_ns >= vu_ns:
+                if now_ns >= compute_wall_clock_expiry_finalize_ns(vu_ns):
                     self._expiry_targets_by_timer.pop(t_name, None)
                     self._handle_plan_item_expiry(sym, item_id, vu_ns)
         self.sync_from_cache()
@@ -2767,6 +3070,16 @@ class PostgresTelemetryActor(DataActor):
                 override_reason=reason,
             )
             return
+
+        if (
+            self._is_started
+            and self._safe_is_registered()
+            and self._safe_clock() is not None
+        ):
+            self._pending_stop_invalidation[sym] = (vid or cid, reason)
+            if self._schedule_oco_verify_timer(sym, pos_qty, event_ts_ns=0):
+                return
+            self._pending_stop_invalidation.pop(sym, None)
 
         self._oco_monitor.invalidate_protective_order(
             symbol=sym,
@@ -3198,6 +3511,31 @@ class PostgresTelemetryActor(DataActor):
 
             if self._persist_to_db and self._async_writer is not None:
                 self._async_writer.submit(_task)
+            self._emit_execution_event(
+                event_type="account_updated",
+                symbol="",
+                event_id=event_id,
+                payload={
+                    "event_id": event_id,
+                    "account_id": str(snap.get("account_id") or ""),
+                    "currency": str(snap.get("currency") or "USD"),
+                    "cash_balance": (
+                        float(snap["cash_balance"])
+                        if snap.get("cash_balance") is not None
+                        else None
+                    ),
+                    "equity": (
+                        float(snap["equity"])
+                        if snap.get("equity") is not None
+                        else None
+                    ),
+                    "buying_power": (
+                        float(snap["buying_power"])
+                        if snap.get("buying_power") is not None
+                        else None
+                    ),
+                },
+            )
             if event_id:
                 self._processed_event_ids.add(event_id)
         except Exception as exc:
@@ -4042,6 +4380,27 @@ class PostgresTelemetryActor(DataActor):
 
         if self._persist_to_db and self._async_writer is not None:
             self._async_writer.submit(_task)
+        self._emit_execution_event(
+            event_type="order_filled",
+            symbol=meta_snapshot["symbol"],
+            event_id=event_id,
+            payload={
+                "event_id": event_id,
+                "trade_id": trade_id,
+                "client_order_id": cid,
+                "venue_order_id": vid,
+                "symbol": meta_snapshot["symbol"],
+                "side": meta_snapshot["side"],
+                "order_type": meta_snapshot.get("order_type", "MARKET"),
+                "qty": float(total_qty),
+                "last_qty": float(last_qty),
+                "last_px": float(last_px),
+                "cum_qty": float(cum_qty),
+                "filled_avg_price": float(avg_px),
+                "status": order_status,
+                "strategy_id": meta_snapshot.get("strategy_id", ""),
+            },
+        )
         self._processed_event_ids.add(event_id)
         self._maybe_finalize_pending_expiry(meta["symbol"])
         self._flush_backend_mutations()
@@ -4136,6 +4495,22 @@ class PostgresTelemetryActor(DataActor):
 
         if self._persist_to_db and self._async_writer is not None:
             self._async_writer.submit(_task)
+        self._emit_execution_event(
+            event_type=plan_event_type,
+            symbol=symbol,
+            event_id=event_id,
+            payload={
+                "event_id": event_id,
+                "symbol": symbol,
+                "strategy_id": strategy_id,
+                "position_id": pos_id,
+                "side": side,
+                "qty": float(qty),
+                "avg_entry_price": float(avg_px_open),
+                "realized_pl": float(realized_pnl),
+                "is_closed": qty <= Decimal("0"),
+            },
+        )
         self._processed_event_ids.add(event_id)
 
     def _handle_position_lifecycle_event(
@@ -4183,6 +4558,8 @@ class PostgresTelemetryActor(DataActor):
         )
         self._oco_monitor.record_position_qty_sync(symbol, qty)
         if is_closed:
+            self._pending_oco_verify_qty.pop(symbol, None)
+            self._pending_stop_invalidation.pop(symbol, None)
             self.end_safe_exit(symbol)
             self._oco_monitor._positions_qty[symbol] = Decimal("0")
             if not self._has_open_protective_stop_for_symbol(symbol):
@@ -4195,10 +4572,28 @@ class PostgresTelemetryActor(DataActor):
             ):
                 self._plan_gate_backend.release_closed_position_capacity(symbol)
         elif self.is_safe_exit_active(symbol):
+            self._pending_oco_verify_qty.pop(symbol, None)
+            self._pending_stop_invalidation.pop(symbol, None)
             self._oco_monitor._positions_qty[symbol] = qty
         elif self._enforce_oco_on_pos or self._oco_monitor.get_coverage(symbol) is not None:
             self._sync_protective_orders_from_cache(symbol)
-            self._oco_monitor.verify_position_coverage(symbol=symbol, pos_qty=qty)
+            cov = self._oco_monitor.get_coverage(symbol)
+            already_covered = (
+                cov is not None
+                and cov.status in ("ACTIVE", "REPLACING")
+                and bool(str(cov.broker_order_id or "").strip())
+                and cov.covered_qty >= qty
+                and cov.stop_price > Decimal("0")
+            )
+            if (
+                already_covered
+                or not self._is_started
+                or not self._safe_is_registered()
+                or not self._schedule_oco_verify_timer(symbol, qty, ts_event)
+            ):
+                self._oco_monitor.verify_position_coverage(symbol=symbol, pos_qty=qty)
+            else:
+                self._oco_monitor._positions_qty[symbol] = qty
         else:
             self._oco_monitor._positions_qty[symbol] = qty
         self._flush_backend_mutations()
@@ -4374,6 +4769,25 @@ class PostgresTelemetryActor(DataActor):
 
         if self._persist_to_db and self._async_writer is not None:
             self._async_writer.submit(_task)
+        limit_px = meta_snapshot.get("limit_price")
+        self._emit_execution_event(
+            event_type=plan_event_type,
+            symbol=meta_snapshot["symbol"],
+            event_id=event_id,
+            payload={
+                "event_id": event_id,
+                "client_order_id": meta_snapshot["client_order_id"],
+                "venue_order_id": meta_snapshot.get("venue_order_id", ""),
+                "symbol": meta_snapshot["symbol"],
+                "side": meta_snapshot["side"],
+                "order_type": meta_snapshot.get("order_type", "MARKET"),
+                "qty": float(_to_decimal(meta_snapshot.get("quantity"), "0")),
+                "limit_price": float(limit_px) if limit_px is not None else None,
+                "status": status,
+                "reason": reason,
+                "strategy_id": meta_snapshot.get("strategy_id", ""),
+            },
+        )
         self._processed_event_ids.add(event_id)
 
     _UNSET_SESSION_DATE: Any = object()

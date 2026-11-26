@@ -61,9 +61,28 @@ pub const DEFAULT_DECODER_SIZE_PRECISION: u8 = 0;
 /// Default window retention capacity for [`BarStreamVersionTracker`].
 pub const DEFAULT_VERSION_TRACKER_CAPACITY: usize = 4_096;
 
+/// Canonical wire schema version shared between `sip-feeder` and `nautilus-datainfra`.
+pub const CANONICAL_WIRE_SCHEMA_VERSION: u32 = 1;
+/// SEC Reg NMS Rule 612 sub-dollar threshold in USD.
+pub const SUB_DOLLAR_THRESHOLD_USD: f64 = 1.0;
+/// Decimal precision for sub-dollar equities (`< $1.00`) per SEC Reg NMS Rule 612.
+pub const SUB_DOLLAR_PRICE_PRECISION: u8 = 4;
+
+/// Resolves fixed-point price precision per SEC Reg NMS Rule 612 (`< $1.00` -> `4dp`).
+#[must_use]
+pub fn resolve_sec_rule_612_price_precision(reference_price: f64, base_precision: u8) -> u8 {
+    if reference_price > 0.0 && reference_price < SUB_DOLLAR_THRESHOLD_USD {
+        SUB_DOLLAR_PRICE_PRECISION.max(base_precision)
+    } else {
+        base_precision
+    }
+}
+
 /// Strongly typed wire representation of `sip-feeder` `CanonicalBar` JSON frames.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CanonicalBarWire {
+    /// Wire contract schema version (`>= 1`, required on the wire).
+    pub schema_version: u32,
     /// Market identifier (e.g. `"US"`).
     #[serde(default = "default_market")]
     pub market: String,
@@ -174,6 +193,8 @@ impl CanonicalBarWire {
 /// Strongly typed wire representation of `sip-feeder` `CanonicalQuote` JSON frames.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CanonicalQuoteWire {
+    /// Wire contract schema version (`>= 1`, required on the wire).
+    pub schema_version: u32,
     /// Market identifier (e.g. `"US"`).
     #[serde(default = "default_market")]
     pub market: String,
@@ -262,6 +283,8 @@ impl CanonicalQuoteWire {
 /// Strongly typed wire representation of `sip-feeder` `CanonicalTradingStatus` JSON frames.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CanonicalTradingStatusWire {
+    /// Wire contract schema version (`>= 1`, required on the wire).
+    pub schema_version: u32,
     /// Market identifier (e.g. `"US"`).
     #[serde(default = "default_market")]
     pub market: String,
@@ -486,6 +509,15 @@ pub enum VersionEvaluation {
     },
 }
 
+fn validate_schema_version(schema_version: u32, symbol: &str) -> DataInfraResult<()> {
+    if schema_version == 0 || schema_version > CANONICAL_WIRE_SCHEMA_VERSION {
+        return Err(DataInfraError::ProvenanceViolation(format!(
+            "unsupported canonical wire schema_version={schema_version} for symbol '{symbol}' (supported: 1..={CANONICAL_WIRE_SCHEMA_VERSION})"
+        )));
+    }
+    Ok(())
+}
+
 /// Real-time Kafka payload decoder with built-in synthetic/spike quality guard and version deduplication.
 #[derive(Debug)]
 pub struct CanonicalStreamDecoder {
@@ -510,6 +542,15 @@ impl CanonicalStreamDecoder {
             size_precision,
             version_tracker: BarStreamVersionTracker::new(max_tracked_windows),
         }
+    }
+
+    /// Resolves `(price_precision, size_precision)` per SEC Reg NMS Rule 612 (`< $1.00` -> 4 decimal places).
+    #[must_use]
+    pub fn resolve_precisions(&self, _symbol: &str, reference_price: f64) -> (u8, u8) {
+        (
+            resolve_sec_rule_612_price_precision(reference_price, self.price_precision),
+            self.size_precision,
+        )
     }
 
     /// Returns a reference to the underlying [`BarStreamVersionTracker`].
@@ -538,6 +579,7 @@ impl CanonicalStreamDecoder {
     ///
     /// Returns [`DataInfraError`] if a non-filtered bar has invalid symbol/timeframe or violates OHLCV sanity.
     pub fn decode_bar_wire(&self, wire: &CanonicalBarWire) -> DataInfraResult<StreamDecodeOutcome> {
+        validate_schema_version(wire.schema_version, &wire.symbol)?;
         if wire.is_synthetic {
             return Ok(StreamDecodeOutcome::FilteredSynthetic {
                 symbol: wire.symbol.trim().to_uppercase(),
@@ -567,7 +609,9 @@ impl CanonicalStreamDecoder {
             )));
         }
 
-        let bar = wire.to_nautilus_bar(&self.venue, self.price_precision, self.size_precision)?;
+        let ref_px = wire.low.min(wire.close);
+        let (price_prec, size_prec) = self.resolve_precisions(&wire.symbol, ref_px);
+        let bar = wire.to_nautilus_bar(&self.venue, price_prec, size_prec)?;
         let tf: DataInfraTimeframe = wire.timeframe.parse()?;
         let instrument_id = bar.bar_type.instrument_id();
 
@@ -606,8 +650,10 @@ impl CanonicalStreamDecoder {
         let wire: CanonicalQuoteWire = serde_json::from_slice(payload).map_err(|e| {
             DataInfraError::Transport(format!("failed to deserialize CanonicalQuoteWire JSON: {e}"))
         })?;
-        let quote =
-            wire.to_nautilus_quote(&self.venue, self.price_precision, self.size_precision)?;
+        validate_schema_version(wire.schema_version, &wire.symbol)?;
+        let ref_px = wire.bid_price.min(wire.ask_price);
+        let (price_prec, size_prec) = self.resolve_precisions(&wire.symbol, ref_px);
+        let quote = wire.to_nautilus_quote(&self.venue, price_prec, size_prec)?;
         Ok(StreamDecodeOutcome::Emitted(DataInfraStreamEvent::Quote(
             quote,
         )))
@@ -624,6 +670,7 @@ impl CanonicalStreamDecoder {
                 "failed to deserialize CanonicalTradingStatusWire JSON: {e}"
             ))
         })?;
+        validate_schema_version(wire.schema_version, &wire.symbol)?;
         let status = wire.to_nautilus_status(&self.venue)?;
         Ok(StreamDecodeOutcome::Emitted(
             DataInfraStreamEvent::TradingStatus(status),
@@ -681,6 +728,12 @@ impl KafkaStreamSessionCoordinator {
             connected: Mutex::new(false),
             reconnect_attempts: Mutex::new(0),
         }
+    }
+
+    /// Returns a reference to the underlying [`CanonicalStreamDecoder`].
+    #[must_use]
+    pub const fn decoder(&self) -> &CanonicalStreamDecoder {
+        &self.decoder
     }
 
     /// Marks the stream session as connected and notifies [`StreamLifecycleListener`].

@@ -1227,6 +1227,7 @@ async fn test_datainfra_data_client_connect_fail_closed_subscriptions_requests_a
     // D. Ingest real-time Kafka payloads (`ingest_kafka_payload`):
     //    1) Unsubscribed symbol (MSFT) is decoded but NOT forwarded to DataEvent channel
     let msft_quote_json = br#"{
+        "schema_version": 1,
         "symbol": "MSFT",
         "quote_ts_ms": 1711980001000,
         "ingest_ts_ms": 1711980001005,
@@ -1245,6 +1246,7 @@ async fn test_datainfra_data_client_connect_fail_closed_subscriptions_requests_a
 
     //    2) Subscribed AAPL 1m bar, quote, and LULD_PAUSE status ARE forwarded to DataEvent channel
     let aapl_bar_json = br#"{
+        "schema_version": 1,
         "symbol": "AAPL",
         "timeframe": "1m",
         "bar_ts": 1777896660,
@@ -1269,6 +1271,7 @@ async fn test_datainfra_data_client_connect_fail_closed_subscriptions_requests_a
         .expect("ingest subscribed AAPL 1m bar");
 
     let aapl_quote_json = br#"{
+        "schema_version": 1,
         "symbol": "AAPL",
         "quote_ts_ms": 1777896721000,
         "ingest_ts_ms": 1777896721010,
@@ -1285,6 +1288,7 @@ async fn test_datainfra_data_client_connect_fail_closed_subscriptions_requests_a
         .expect("ingest subscribed AAPL quote");
 
     let aapl_status_json = br#"{
+        "schema_version": 1,
         "symbol": "AAPL",
         "status_ts_ms": 1777896722000,
         "ingest_ts_ms": 1777896722005,
@@ -1766,47 +1770,47 @@ async fn test_datainfra_data_client_ephemeral_tcp_kafka_broker_e2e_async_streami
             // 1. Normal AAPL 1m bar (topic-prefixed wire format)
             format!(
                 "{TOPIC_SIP_BARS_1M}\t{}\n",
-                r#"{"symbol":"AAPL","timeframe":"1m","bar_ts":1777896600,"open":185.00,"high":185.90,"low":184.80,"close":185.50,"volume":42000.0,"vwap":185.35,"trade_count":310,"version":1,"is_synthetic":false,"is_correction":false,"is_suspect_spike":false,"session":"REGULAR","provider":"alpaca_sip","source_ts_ms":1777896660000,"ingest_ts_ms":1777896660020}"#
+                r#"{"schema_version":1,"symbol":"AAPL","timeframe":"1m","bar_ts":1777896600,"open":185.00,"high":185.90,"low":184.80,"close":185.50,"volume":42000.0,"vwap":185.35,"trade_count":310,"version":1,"is_synthetic":false,"is_correction":false,"is_suspect_spike":false,"session":"REGULAR","provider":"alpaca_sip","source_ts_ms":1777896660000,"ingest_ts_ms":1777896660020}"#
             ),
             // 2. Synthetic +3s zero-volume placeholder bar (must be filtered out)
             format!(
                 "{TOPIC_SIP_BARS_1M}\t{}\n",
-                r#"{"symbol":"AAPL","timeframe":"1m","bar_ts":1777896660,"open":185.50,"high":185.50,"low":185.50,"close":185.50,"volume":0.0,"version":1,"is_synthetic":true,"is_correction":false,"is_suspect_spike":false,"session":"REGULAR","provider":"alpaca_sip","source_ts_ms":1777896723000,"ingest_ts_ms":1777896723005}"#
+                r#"{"schema_version":1,"symbol":"AAPL","timeframe":"1m","bar_ts":1777896660,"open":185.50,"high":185.50,"low":185.50,"close":185.50,"volume":0.0,"version":1,"is_synthetic":true,"is_correction":false,"is_suspect_spike":false,"session":"REGULAR","provider":"alpaca_sip","source_ts_ms":1777896723000,"ingest_ts_ms":1777896723005}"#
             ),
             // 3. Suspect price spike bar (must be filtered out)
             format!(
                 "{TOPIC_SIP_BARS_1M}\t{}\n",
-                r#"{"symbol":"AAPL","timeframe":"1m","bar_ts":1777896660,"open":185.50,"high":299.99,"low":185.50,"close":299.99,"volume":100.0,"version":1,"is_synthetic":false,"is_correction":false,"is_suspect_spike":true,"session":"REGULAR","provider":"alpaca_sip","source_ts_ms":1777896724000,"ingest_ts_ms":1777896724005}"#
+                r#"{"schema_version":1,"symbol":"AAPL","timeframe":"1m","bar_ts":1777896660,"open":185.50,"high":299.99,"low":185.50,"close":299.99,"volume":100.0,"version":1,"is_synthetic":false,"is_correction":false,"is_suspect_spike":true,"session":"REGULAR","provider":"alpaca_sip","source_ts_ms":1777896724000,"ingest_ts_ms":1777896724005}"#
             ),
             // 4. Duplicate v1 bar at 1777896600 (must be suppressed)
             format!(
                 "{TOPIC_SIP_BARS_1M}\t{}\n",
-                r#"{"symbol":"AAPL","timeframe":"1m","bar_ts":1777896600,"open":185.00,"high":185.90,"low":184.80,"close":185.50,"volume":42000.0,"version":1,"is_synthetic":false,"is_correction":false,"is_suspect_spike":false,"session":"REGULAR","provider":"alpaca_sip","source_ts_ms":1777896660000,"ingest_ts_ms":1777896660020}"#
+                r#"{"schema_version":1,"symbol":"AAPL","timeframe":"1m","bar_ts":1777896600,"open":185.00,"high":185.90,"low":184.80,"close":185.50,"volume":42000.0,"version":1,"is_synthetic":false,"is_correction":false,"is_suspect_spike":false,"session":"REGULAR","provider":"alpaca_sip","source_ts_ms":1777896660000,"ingest_ts_ms":1777896660020}"#
             ),
             // 5. Version-upgraded v2 late correction bar at 1777896600 (KafkaBrokerEnvelope wire format)
             format!(
                 "{}\n",
-                r#"{"topic":"md.sip.bars.1m","payload":{"symbol":"AAPL","timeframe":"1m","bar_ts":1777896600,"open":185.00,"high":186.40,"low":184.80,"close":186.10,"volume":45500.0,"vwap":185.60,"trade_count":340,"version":2,"is_synthetic":false,"is_correction":true,"is_suspect_spike":false,"session":"REGULAR","provider":"alpaca_sip","source_ts_ms":1777896665000,"ingest_ts_ms":1777896665010}}"#
+                r#"{"topic":"md.sip.bars.1m","payload":{"schema_version":1,"symbol":"AAPL","timeframe":"1m","bar_ts":1777896600,"open":185.00,"high":186.40,"low":184.80,"close":186.10,"volume":45500.0,"vwap":185.60,"trade_count":340,"version":2,"is_synthetic":false,"is_correction":true,"is_suspect_spike":false,"session":"REGULAR","provider":"alpaca_sip","source_ts_ms":1777896665000,"ingest_ts_ms":1777896665010}}"#
             ),
             // 6. Real v1 bar at 1777896660 (direct CanonicalWireFrame format)
             format!(
                 "{}\n",
-                r#"{"symbol":"AAPL","timeframe":"1m","bar_ts":1777896660,"open":186.10,"high":186.90,"low":186.00,"close":186.75,"volume":38100.0,"vwap":186.50,"trade_count":290,"version":1,"is_synthetic":false,"is_correction":false,"is_suspect_spike":false,"session":"REGULAR","provider":"alpaca_sip","source_ts_ms":1777896725000,"ingest_ts_ms":1777896725015}"#
+                r#"{"schema_version":1,"symbol":"AAPL","timeframe":"1m","bar_ts":1777896660,"open":186.10,"high":186.90,"low":186.00,"close":186.75,"volume":38100.0,"vwap":186.50,"trade_count":290,"version":1,"is_synthetic":false,"is_correction":false,"is_suspect_spike":false,"session":"REGULAR","provider":"alpaca_sip","source_ts_ms":1777896725000,"ingest_ts_ms":1777896725015}"#
             ),
             // 7. Unsubscribed MSFT 1m bar (buffered in pending_events until MSFT is subscribed)
             format!(
                 "{TOPIC_SIP_BARS_1M}\t{}\n",
-                r#"{"symbol":"MSFT","timeframe":"1m","bar_ts":1777896600,"open":420.00,"high":421.00,"low":419.50,"close":420.50,"volume":19000.0,"version":1,"is_synthetic":false,"is_correction":false,"is_suspect_spike":false,"session":"REGULAR","provider":"alpaca_sip","source_ts_ms":1777896660000,"ingest_ts_ms":1777896660030}"#
+                r#"{"schema_version":1,"symbol":"MSFT","timeframe":"1m","bar_ts":1777896600,"open":420.00,"high":421.00,"low":419.50,"close":420.50,"volume":19000.0,"version":1,"is_synthetic":false,"is_correction":false,"is_suspect_spike":false,"session":"REGULAR","provider":"alpaca_sip","source_ts_ms":1777896660000,"ingest_ts_ms":1777896660030}"#
             ),
             // 8. CanonicalQuote for AAPL on `md.sip.quotes`
             format!(
                 "{TOPIC_SIP_QUOTES}\t{}\n",
-                r#"{"symbol":"AAPL","quote_ts_ms":1777896726000,"ingest_ts_ms":1777896726005,"bid_price":186.70,"bid_size":500.0,"ask_price":186.75,"ask_size":700.0,"mid_price":186.725,"spread_bps":2.68,"provider":"alpaca_sip"}"#
+                r#"{"schema_version":1,"symbol":"AAPL","quote_ts_ms":1777896726000,"ingest_ts_ms":1777896726005,"bid_price":186.70,"bid_size":500.0,"ask_price":186.75,"ask_size":700.0,"mid_price":186.725,"spread_bps":2.68,"provider":"alpaca_sip"}"#
             ),
             // 9. CanonicalTradingStatus for AAPL on `md.sip.statuses`
             format!(
                 "{TOPIC_SIP_STATUSES}\t{}\n",
-                r#"{"symbol":"AAPL","status_ts_ms":1777896727000,"ingest_ts_ms":1777896727004,"state":"LULD_PAUSE","reason_code":"LULD_T5","provider":"alpaca_sip"}"#
+                r#"{"schema_version":1,"symbol":"AAPL","status_ts_ms":1777896727000,"ingest_ts_ms":1777896727004,"state":"LULD_PAUSE","reason_code":"LULD_T5","provider":"alpaca_sip"}"#
             ),
         ];
 

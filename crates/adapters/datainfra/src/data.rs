@@ -60,7 +60,7 @@ use parking_lot::{Mutex, RwLock};
 use tokio::{sync::watch, task::JoinHandle};
 
 use crate::{
-    arrow_decoder::{PriceAdjustmentMode, f64_to_quantity},
+    arrow_decoder::{PriceAdjustmentMode, f64_to_price, f64_to_quantity},
     calendar::CalendarSessionGate,
     catalog::block_on_catalog_future,
     clickhouse::{
@@ -72,7 +72,8 @@ use crate::{
     instrument::DataInfraEquityMetadata,
     kafka::{KafkaPayloadSource, TcpKafkaPayloadSource},
     mapping::{
-        compute_rth_bar_open_ns, from_bar_type, from_instrument_id, timeframe_step_ns,
+        DataInfraTimeframe, compute_rth_bar_open_ns, compute_rth_bar_open_ns_with_bounds,
+        from_bar_type, from_instrument_id, timeframe_step_ns,
     },
     stream::{
         CanonicalStreamDecoder, DEFAULT_DECODER_PRICE_PRECISION, DEFAULT_DECODER_SIZE_PRECISION,
@@ -109,10 +110,20 @@ fn rth_day_bounds_ns(bar_open_ns: u64) -> Option<(u64, u64)> {
     crate::mapping::rth_day_bounds_ns(bar_open_ns)
 }
 
+#[cfg(test)]
 fn compute_bucket_bounds_ns(target_bar_type: BarType, bar_open_ns: u64) -> (u64, u64) {
+    compute_bucket_bounds_ns_with_bounds(target_bar_type, bar_open_ns, None)
+}
+
+fn compute_bucket_bounds_ns_with_bounds(
+    target_bar_type: BarType,
+    bar_open_ns: u64,
+    session_bounds: Option<(u64, u64)>,
+) -> (u64, u64) {
     let step_ns = timeframe_step_ns(&target_bar_type);
     if step_ns >= 3_600_000_000_000
-        && let Some((rth_open_ns, rth_close_ns)) = rth_day_bounds_ns(bar_open_ns)
+        && let Some((rth_open_ns, rth_close_ns)) =
+            session_bounds.or_else(|| rth_day_bounds_ns(bar_open_ns))
     {
         if step_ns >= 86_400_000_000_000 {
             let bucket_open_ns = rth_open_ns;
@@ -146,6 +157,7 @@ struct LiveBarRollupBucket {
     emitted: bool,
     last_emitted_bar: Option<Bar>,
     prev_bucket_open_ns: u64,
+    prev_flush_close_ns: u64,
     prev_minutes: BTreeMap<u64, Bar>,
     prev_last_emitted_bar: Option<Bar>,
 }
@@ -159,12 +171,34 @@ impl LiveBarRollupBucket {
             && a.volume == b.volume
     }
 
+    fn seed_historical_1m_bar(
+        &mut self,
+        target_bar_type: BarType,
+        bar: &Bar,
+        session_bounds: Option<(u64, u64)>,
+    ) {
+        let bar_open_ns = bar.ts_event.as_u64().saturating_sub(M1_STEP_NS);
+        let (bucket_open_ns, flush_close_ns) =
+            compute_bucket_bounds_ns_with_bounds(target_bar_type, bar_open_ns, session_bounds);
+        if self.bucket_open_ns == 0 || bucket_open_ns > self.bucket_open_ns {
+            self.bucket_open_ns = bucket_open_ns;
+            self.flush_close_ns = flush_close_ns;
+            self.minutes.clear();
+            self.emitted = false;
+            self.last_emitted_bar = None;
+        }
+        if bucket_open_ns == self.bucket_open_ns {
+            self.minutes.entry(bar_open_ns).or_insert(*bar);
+        }
+    }
+
     fn build_aggregated_from_map(
         minutes: &BTreeMap<u64, Bar>,
         bucket_open_ns: u64,
         target_bar_type: BarType,
-        _step_ns: u64,
+        step_ns: u64,
         latest_init_ns: u64,
+        flush_close_ns: u64,
     ) -> DataInfraResult<Option<Bar>> {
         let Some((&first_open_ns, first_bar)) = minutes.iter().next() else {
             return Ok(None);
@@ -173,22 +207,35 @@ impl LiveBarRollupBucket {
             .iter()
             .next_back()
             .unwrap_or((&first_open_ns, first_bar));
-        let open = first_bar.open;
-        let close = last_bar.close;
-        let mut high = first_bar.high;
-        let mut low = first_bar.low;
+        let max_price_prec = minutes
+            .values()
+            .map(|b| {
+                b.open
+                    .precision
+                    .max(b.high.precision)
+                    .max(b.low.precision)
+                    .max(b.close.precision)
+            })
+            .max()
+            .unwrap_or(first_bar.open.precision);
+        let open = f64_to_price(first_bar.open.as_f64(), max_price_prec, "open")?;
+        let close = f64_to_price(last_bar.close.as_f64(), max_price_prec, "close")?;
+        let mut high_f64 = first_bar.high.as_f64();
+        let mut low_f64 = first_bar.low.as_f64();
         let mut total_vol = 0.0_f64;
         for b in minutes.values() {
-            if b.high > high {
-                high = b.high;
-            }
-            if b.low < low {
-                low = b.low;
-            }
+            high_f64 = high_f64.max(b.high.as_f64());
+            low_f64 = low_f64.min(b.low.as_f64());
             total_vol += b.volume.as_f64();
         }
+        let high = f64_to_price(high_f64, max_price_prec, "high")?;
+        let low = f64_to_price(low_f64, max_price_prec, "low")?;
         let volume = f64_to_quantity(total_vol, first_bar.volume.precision, "volume")?;
-        let (_, bucket_close_ns) = compute_bucket_bounds_ns(target_bar_type, bucket_open_ns);
+        let bucket_close_ns = if flush_close_ns > 0 {
+            flush_close_ns
+        } else {
+            bucket_open_ns.saturating_add(step_ns)
+        };
         let ts_event = UnixNanos::from(bucket_close_ns);
         let ts_init = UnixNanos::from(bucket_close_ns.max(latest_init_ns));
         let bar = Bar::new_checked(
@@ -221,6 +268,7 @@ impl LiveBarRollupBucket {
             target_bar_type,
             step_ns,
             latest_init_ns,
+            self.flush_close_ns,
         )
     }
 
@@ -249,10 +297,16 @@ impl LiveBarRollupBucket {
         Ok(None)
     }
 
-    fn ingest_1m_bar(&mut self, target_bar_type: BarType, bar: &Bar) -> DataInfraResult<Vec<Bar>> {
+    fn ingest_1m_bar(
+        &mut self,
+        target_bar_type: BarType,
+        bar: &Bar,
+        session_bounds: Option<(u64, u64)>,
+    ) -> DataInfraResult<Vec<Bar>> {
         let step_ns = timeframe_step_ns(&target_bar_type);
         let bar_open_ns = bar.ts_event.as_u64().saturating_sub(M1_STEP_NS);
-        let (bucket_open_ns, flush_close_ns) = compute_bucket_bounds_ns(target_bar_type, bar_open_ns);
+        let (bucket_open_ns, flush_close_ns) =
+            compute_bucket_bounds_ns_with_bounds(target_bar_type, bar_open_ns, session_bounds);
         let mut emitted_bars = Vec::new();
 
         if self.bucket_open_ns != 0 && bucket_open_ns > self.bucket_open_ns {
@@ -264,6 +318,7 @@ impl LiveBarRollupBucket {
                 emitted_bars.push(prev_bar);
             }
             self.prev_bucket_open_ns = self.bucket_open_ns;
+            self.prev_flush_close_ns = self.flush_close_ns;
             self.prev_minutes = std::mem::take(&mut self.minutes);
             self.prev_last_emitted_bar = self.last_emitted_bar.take();
             self.bucket_open_ns = bucket_open_ns;
@@ -278,6 +333,7 @@ impl LiveBarRollupBucket {
                     target_bar_type,
                     step_ns,
                     bar.ts_init.as_u64(),
+                    self.prev_flush_close_ns,
                 )? && self
                     .prev_last_emitted_bar
                     .as_ref()
@@ -357,12 +413,33 @@ impl SubscriptionRegistry {
             .collect()
     }
 
-    fn ingest_rollup_bar(&self, target_bar_type: BarType, bar: &Bar) -> DataInfraResult<Vec<Bar>> {
+    fn ingest_rollup_bar(
+        &self,
+        target_bar_type: BarType,
+        bar: &Bar,
+        session_bounds: Option<(u64, u64)>,
+    ) -> DataInfraResult<Vec<Bar>> {
         let mut guard = self.rollups.lock();
         guard
             .entry(target_bar_type)
             .or_default()
-            .ingest_1m_bar(target_bar_type, bar)
+            .ingest_1m_bar(target_bar_type, bar, session_bounds)
+    }
+
+    fn seed_rollup_1m_bars(
+        &self,
+        target_bar_type: BarType,
+        bars: &[Bar],
+        session_bounds: Option<(u64, u64)>,
+    ) {
+        if bars.is_empty() {
+            return;
+        }
+        let mut guard = self.rollups.lock();
+        let bucket = guard.entry(target_bar_type).or_default();
+        for bar in bars {
+            bucket.seed_historical_1m_bar(target_bar_type, bar, session_bounds);
+        }
     }
 
     fn advance_synthetic_watermarks(
@@ -500,6 +577,7 @@ fn dispatch_stream_event(
     subscriptions: &SubscriptionRegistry,
     shared_sender: &RwLock<Option<EventSender<DataEvent>>>,
     buffer_if_unsubscribed: bool,
+    session_bounds: Option<(u64, u64)>,
 ) -> DataInfraResult<bool> {
     match event {
         DataInfraStreamEvent::Bar(bar) | DataInfraStreamEvent::UpdatedBar { bar, .. } => {
@@ -517,7 +595,9 @@ fn dispatch_stream_event(
                 dispatched = true;
             }
             for target_bar_type in rollup_targets {
-                for agg_bar in subscriptions.ingest_rollup_bar(target_bar_type, bar)? {
+                for agg_bar in
+                    subscriptions.ingest_rollup_bar(target_bar_type, bar, session_bounds)?
+                {
                     send_event_via_shared_sender(
                         shared_sender,
                         DataEvent::Data(Data::Bar(agg_bar)),
@@ -794,6 +874,13 @@ impl DataInfraDataClient {
         Ok(outcome)
     }
 
+    fn authoritative_session_bounds(&self) -> Option<(u64, u64)> {
+        self.calendar_gate
+            .cached_status()
+            .and_then(|s| s.rth_open_ns().zip(s.rth_close_ns()))
+            .map(|(o, c)| (o.as_u64(), c.as_u64()))
+    }
+
     /// Forwards a pre-decoded [`DataInfraStreamEvent`] into `DataEngine` if its instrument or
     /// bar type is currently subscribed.
     ///
@@ -804,12 +891,14 @@ impl DataInfraDataClient {
     /// Returns [`DataInfraError::Transport`] if no `DataEvent` sender is bound or the channel is closed,
     /// or [`DataInfraError::CalendarGate`] if a bar falls outside the cached RTH session window.
     pub fn forward_stream_event(&self, event: &DataInfraStreamEvent) -> DataInfraResult<bool> {
+        let session_bounds = self.authoritative_session_bounds();
         if let DataInfraStreamEvent::Bar(bar) | DataInfraStreamEvent::UpdatedBar { bar, .. } = event
             && (self.enforce_calendar_on_connect || self.calendar_gate.cached_status().is_some())
         {
-            let bar_open_ns = UnixNanos::from(compute_rth_bar_open_ns(
+            let bar_open_ns = UnixNanos::from(compute_rth_bar_open_ns_with_bounds(
                 &bar.bar_type,
                 bar.ts_event.as_u64(),
+                session_bounds,
             ));
             if self.calendar_gate.should_refresh_for_bar_open(bar_open_ns) {
                 let gate = self.calendar_gate.clone();
@@ -825,7 +914,13 @@ impl DataInfraDataClient {
                 )));
             }
         }
-        dispatch_stream_event(event, &self.subscriptions, &self.shared_sender, false)
+        dispatch_stream_event(
+            event,
+            &self.subscriptions,
+            &self.shared_sender,
+            false,
+            self.authoritative_session_bounds(),
+        )
     }
 
     fn send_data_event(&self, event: DataEvent) -> DataInfraResult<()> {
@@ -866,14 +961,19 @@ impl DataInfraDataClient {
                                 }
                                 match coordinator.process_kafka_message(&frame.topic, &frame.payload) {
                                     Ok(StreamDecodeOutcome::Emitted(ref event)) => {
+                                        let session_bounds = calendar_gate
+                                            .cached_status()
+                                            .and_then(|s| s.rth_open_ns().zip(s.rth_close_ns()))
+                                            .map(|(o, c)| (o.as_u64(), c.as_u64()));
                                         if let DataInfraStreamEvent::Bar(bar)
                                         | DataInfraStreamEvent::UpdatedBar { bar, .. } = event
                                             && (enforce_calendar || calendar_gate.cached_status().is_some())
                                         {
                                             let bar_open_ns = UnixNanos::from(
-                                                compute_rth_bar_open_ns(
+                                                compute_rth_bar_open_ns_with_bounds(
                                                     &bar.bar_type,
                                                     bar.ts_event.as_u64(),
+                                                    session_bounds,
                                                 ),
                                             );
                                             if calendar_gate.should_refresh_for_bar_open(bar_open_ns) {
@@ -904,11 +1004,16 @@ impl DataInfraDataClient {
                                                 }
                                             }
                                         }
+                                        let refreshed_bounds = calendar_gate
+                                            .cached_status()
+                                            .and_then(|s| s.rth_open_ns().zip(s.rth_close_ns()))
+                                            .map(|(o, c)| (o.as_u64(), c.as_u64()));
                                         if let Err(e) = dispatch_stream_event(
                                             event,
                                             &subscriptions,
                                             &shared_sender,
                                             true,
+                                            refreshed_bounds,
                                         ) {
                                             log::error!("DataInfra background consumer failed to dispatch DataEvent: {e}");
                                         }
@@ -1112,13 +1217,54 @@ impl DataClient for DataInfraDataClient {
     }
 
     fn subscribe_bars(&mut self, cmd: SubscribeBars) -> anyhow::Result<()> {
+        let session_bounds = self.authoritative_session_bounds();
+        let now_ns = self.clock.get_time_ns();
         execute_bar_subscriptions(&cmd.bar_types, |bar_type| {
-            from_bar_type(&bar_type)?;
+            let (symbol, venue, tf) = from_bar_type(&bar_type)?;
             let inst_id = bar_type.instrument_id();
             self.subscribed_bars.insert(bar_type);
             self.subscriptions.bars.write().insert(bar_type);
             self.subscribed_statuses.insert(inst_id);
             self.subscriptions.subscribe_status(inst_id);
+
+            // C1-C: Pre-warm elapsed 1m bars for the current unclosed rollup bucket when subscribing mid-bucket during RTH.
+            if tf != DataInfraTimeframe::M1
+                && let Some((rth_open_ns, rth_close_ns)) = session_bounds
+                && now_ns.as_u64() > rth_open_ns
+                && now_ns.as_u64() < rth_close_ns
+            {
+                let (bucket_open_ns, flush_close_ns) = compute_bucket_bounds_ns_with_bounds(
+                    bar_type,
+                    now_ns.as_u64(),
+                    session_bounds,
+                );
+                if now_ns.as_u64() > bucket_open_ns && now_ns.as_u64() < flush_close_ns {
+                    let req = BarsQueryRequest::new(
+                        vec![symbol],
+                        DataInfraTimeframe::M1,
+                        venue,
+                        PriceAdjustmentMode::Adjusted,
+                    )
+                    .with_time_range(
+                        Some(UnixNanos::from(bucket_open_ns)),
+                        Some(UnixNanos::from(now_ns.as_u64().saturating_sub(1))),
+                    );
+                    let transport = Arc::clone(&self.clickhouse_transport);
+                    match block_on_catalog_future(async move { transport.fetch_bars(&req).await }) {
+                        Ok(hist_1m) if !hist_1m.is_empty() => {
+                            self.subscriptions
+                                .seed_rollup_1m_bars(bar_type, &hist_1m, session_bounds);
+                        }
+                        Ok(_) => {}
+                        Err(err) => {
+                            log::warn!(
+                                "DataInfra mid-bucket 1m pre-warm query skipped for {bar_type}: {err}"
+                            );
+                        }
+                    }
+                }
+            }
+
             let pending = self.subscriptions.drain_matching_bar(&bar_type);
             for ev in &pending {
                 let _ = self.forward_stream_event(ev);
@@ -1392,7 +1538,7 @@ mod tests {
 
         let make_1m_json = |bar_ts: i64, open: f64, high: f64, low: f64, close: f64, vol: f64| {
             format!(
-                r#"{{"symbol":"AAPL","timeframe":"1m","bar_ts":{bar_ts},"open":{open:.2},"high":{high:.2},"low":{low:.2},"close":{close:.2},"volume":{vol:.1},"version":1,"is_synthetic":false,"is_correction":false,"is_suspect_spike":false,"session":"REGULAR","provider":"alpaca_sip","source_ts_ms":{0},"ingest_ts_ms":{0}}}"#,
+                r#"{{"schema_version":1,"symbol":"AAPL","timeframe":"1m","bar_ts":{bar_ts},"open":{open:.2},"high":{high:.2},"low":{low:.2},"close":{close:.2},"volume":{vol:.1},"version":1,"is_synthetic":false,"is_correction":false,"is_suspect_spike":false,"session":"REGULAR","provider":"alpaca_sip","source_ts_ms":{0},"ingest_ts_ms":{0}}}"#,
                 (bar_ts + 60) * 1000
             )
         };
@@ -1525,7 +1671,7 @@ mod tests {
                              vol: f64,
                              is_synthetic: bool| {
             format!(
-                r#"{{"symbol":"AAPL","timeframe":"1m","bar_ts":{bar_ts},"open":{open:.2},"high":{high:.2},"low":{low:.2},"close":{close:.2},"volume":{vol:.1},"version":1,"is_synthetic":{is_synthetic},"is_correction":false,"is_suspect_spike":false,"session":"REGULAR","provider":"alpaca_sip","source_ts_ms":{0},"ingest_ts_ms":{0}}}"#,
+                r#"{{"schema_version":1,"symbol":"AAPL","timeframe":"1m","bar_ts":{bar_ts},"open":{open:.2},"high":{high:.2},"low":{low:.2},"close":{close:.2},"volume":{vol:.1},"version":1,"is_synthetic":{is_synthetic},"is_correction":false,"is_suspect_spike":false,"session":"REGULAR","provider":"alpaca_sip","source_ts_ms":{0},"ingest_ts_ms":{0}}}"#,
                 (bar_ts + 60) * 1000
             )
         };
@@ -1652,7 +1798,7 @@ mod tests {
             |bar_ts: i64, open: f64, high: f64, low: f64, close: f64, vol: f64, ver: u32| {
                 let is_corr = ver > 1;
                 format!(
-                    r#"{{"symbol":"AAPL","timeframe":"1m","bar_ts":{bar_ts},"open":{open:.2},"high":{high:.2},"low":{low:.2},"close":{close:.2},"volume":{vol:.1},"version":{ver},"is_synthetic":false,"is_correction":{is_corr},"is_suspect_spike":false,"session":"REGULAR","provider":"alpaca_sip","source_ts_ms":{0},"ingest_ts_ms":{0}}}"#,
+                    r#"{{"schema_version":1,"symbol":"AAPL","timeframe":"1m","bar_ts":{bar_ts},"open":{open:.2},"high":{high:.2},"low":{low:.2},"close":{close:.2},"volume":{vol:.1},"version":{ver},"is_synthetic":false,"is_correction":{is_corr},"is_suspect_spike":false,"session":"REGULAR","provider":"alpaca_sip","source_ts_ms":{0},"ingest_ts_ms":{0}}}"#,
                     (bar_ts + 60) * 1000 + i64::from(ver)
                 )
             };
@@ -1823,7 +1969,7 @@ mod tests {
 
         let make_1m_json = |bar_ts: i64, open: f64, high: f64, low: f64, close: f64, vol: f64| {
             format!(
-                r#"{{"symbol":"AAPL","timeframe":"1m","bar_ts":{bar_ts},"open":{open:.2},"high":{high:.2},"low":{low:.2},"close":{close:.2},"volume":{vol:.1},"version":1,"is_synthetic":false,"is_correction":false,"is_suspect_spike":false,"session":"REGULAR","provider":"alpaca_sip","source_ts_ms":{0},"ingest_ts_ms":{0}}}"#,
+                r#"{{"schema_version":1,"symbol":"AAPL","timeframe":"1m","bar_ts":{bar_ts},"open":{open:.2},"high":{high:.2},"low":{low:.2},"close":{close:.2},"volume":{vol:.1},"version":1,"is_synthetic":false,"is_correction":false,"is_suspect_spike":false,"session":"REGULAR","provider":"alpaca_sip","source_ts_ms":{0},"ingest_ts_ms":{0}}}"#,
                 (bar_ts + 60) * 1000
             )
         };
@@ -1937,7 +2083,7 @@ mod tests {
         assert!(client.subscribed_statuses().contains(&aapl_id));
 
         // Emit a halt status on `md.sip.statuses` for AAPL without ever calling `subscribe_instrument_status`
-        let aapl_halt_json = br#"{"symbol":"AAPL","status_ts_ms":1777903200000,"ingest_ts_ms":1777903200005,"state":"HALTED","reason_code":"LULD_PAUSE","provider":"alpaca_sip"}"#;
+        let aapl_halt_json = br#"{"schema_version":1,"symbol":"AAPL","status_ts_ms":1777903200000,"ingest_ts_ms":1777903200005,"state":"HALTED","reason_code":"LULD_PAUSE","provider":"alpaca_sip"}"#;
         client
             .ingest_kafka_payload(TOPIC_SIP_STATUSES, aapl_halt_json, UnixNanos::default())
             .expect("ingest AAPL halt status");
@@ -1958,7 +2104,7 @@ mod tests {
             .coordinator
             .process_kafka_message(
                 TOPIC_SIP_STATUSES,
-                br#"{"symbol":"NVDA","status_ts_ms":1777903205000,"ingest_ts_ms":1777903205005,"state":"LULD_PAUSE","reason_code":"LULD_T5","provider":"alpaca_sip"}"#,
+                br#"{"schema_version":1,"symbol":"NVDA","status_ts_ms":1777903205000,"ingest_ts_ms":1777903205005,"state":"LULD_PAUSE","reason_code":"LULD_T5","provider":"alpaca_sip"}"#,
             )
             .unwrap();
         let StreamDecodeOutcome::Emitted(nvda_status_ev) = nvda_status_outcome else {
@@ -1970,6 +2116,7 @@ mod tests {
                 &client.subscriptions,
                 &client.shared_sender,
                 true,
+                None,
             )
             .unwrap()
         );

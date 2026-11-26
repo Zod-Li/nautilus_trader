@@ -924,6 +924,7 @@ class PlanContractRepository:
         *,
         actor: str = "system:telemetry_actor",
         reason: str = "",
+        extra_payload: Optional[Mapping[str, Any]] = None,
     ) -> Optional[PlanItemContract]:
         """Atomically transition a `trading_plan_items.status` inside an active transaction.
 
@@ -982,6 +983,7 @@ class PlanContractRepository:
                         "symbol": current_contract.symbol,
                         "old_status": cur_status,
                         "new_status": norm_status,
+                        **(dict(extra_payload) if extra_payload else {}),
                     }
                 ),
             ),

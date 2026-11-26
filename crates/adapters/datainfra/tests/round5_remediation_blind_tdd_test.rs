@@ -371,7 +371,7 @@ async fn test_round5_d4_p1_2_no_1m_rollup_for_1w_while_allowing_intraday_and_1d(
 
     let send_1m = |cli: &mut DataInfraDataClient, bar_ts_sec: i64, close: f64| {
         let payload = format!(
-            r#"{{"symbol":"AAPL","timeframe":"1m","bar_ts":{bar_ts_sec},"open":{close},"high":{high},"low":{low},"close":{close},"volume":1000.0,"vwap":{close},"trade_count":10,"version":1,"is_synthetic":false,"is_correction":false,"is_suspect_spike":false,"session":"REGULAR","provider":"alpaca_sip","source_ts_ms":{src_ms},"ingest_ts_ms":{src_ms}}}"#,
+            r#"{{"schema_version":1,"symbol":"AAPL","timeframe":"1m","bar_ts":{bar_ts_sec},"open":{close},"high":{high},"low":{low},"close":{close},"volume":1000.0,"vwap":{close},"trade_count":10,"version":1,"is_synthetic":false,"is_correction":false,"is_suspect_spike":false,"session":"REGULAR","provider":"alpaca_sip","source_ts_ms":{src_ms},"ingest_ts_ms":{src_ms}}}"#,
             high = close + 0.5,
             low = close - 0.5,
             src_ms = (bar_ts_sec + 60) * 1000,

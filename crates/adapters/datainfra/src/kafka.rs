@@ -523,13 +523,13 @@ mod tests {
 
     #[test]
     fn test_decode_kafka_record_value_validates_raw_and_envelope_frames() {
-        let raw_bar = br#"{"symbol":"AAPL","timeframe":"1m","bar_ts":1700000000,"open":150.0,"high":151.0,"low":149.5,"close":150.5,"volume":1000,"trade_count":10,"vwap":150.25,"bar_version":1,"is_synthetic":false,"is_suspect_spike":false}"#;
+        let raw_bar = br#"{"schema_version":1,"symbol":"AAPL","timeframe":"1m","bar_ts":1700000000,"open":150.0,"high":151.0,"low":149.5,"close":150.5,"volume":1000,"trade_count":10,"vwap":150.25,"bar_version":1,"is_synthetic":false,"is_suspect_spike":false}"#;
         let frame = decode_kafka_record_value(TOPIC_SIP_BARS_1M, 0, raw_bar)
             .expect("valid raw bar JSON should decode");
         assert_eq!(frame.topic, TOPIC_SIP_BARS_1M);
         assert_eq!(frame.payload, raw_bar);
 
-        let envelope = br#"{"topic":"md.sip.quotes","payload":{"symbol":"AAPL","quote_ts_ms":1700000000000,"bid_price":150.0,"bid_size":100,"ask_price":150.1,"ask_size":200}}"#;
+        let envelope = br#"{"topic":"md.sip.quotes","payload":{"schema_version":1,"symbol":"AAPL","quote_ts_ms":1700000000000,"bid_price":150.0,"bid_size":100,"ask_price":150.1,"ask_size":200}}"#;
         let env_frame = decode_kafka_record_value(TOPIC_SIP_BARS_1M, 1, envelope)
             .expect("valid envelope JSON should decode");
         assert_eq!(env_frame.topic, TOPIC_SIP_QUOTES);
